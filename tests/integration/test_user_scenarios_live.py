@@ -181,6 +181,42 @@ class TestLookdevScenario:
         assert hou.node(render["rop_path"]) is not None
         assert hou.node(render["camera_path"]) is not None
 
+    def test_actual_image_render(self, call, tmp_path):
+        """User: 'Render me a frame.' — a real 64x64 mantra render to disk."""
+        geo = call(
+            "nodes.create_node", parent_path="/obj", node_type="geo", name="subject"
+        )["node_path"]
+        call("nodes.create_node", parent_path=geo, node_type="sphere")
+        render = call(
+            "workflow.setup_render",
+            renderer="mantra",
+            resolution=[64, 64],
+            samples=1,
+            name="micro",
+        )
+        out = str(tmp_path / "frame.exr").replace("\\", "/")
+        call(
+            "parameters.set_parameter",
+            node_path=render["rop_path"],
+            parm_name="vm_picture",
+            value=out,
+        )
+        result = call(
+            "rendering.start_render",
+            node_path=render["rop_path"],
+            frame_range=[1, 1],
+            allow_error=True,
+        )
+        data = result.get("data", {})
+        if result["status"] != "success" or not data.get("success", True):
+            reason = str(
+                result.get("error", {}).get("message") or data.get("error")
+            )[:80]
+            pytest.skip(f"mantra render unavailable here: {reason}")
+        assert (tmp_path / "frame.exr").is_file(), (
+            "start_render claimed success but no image was written"
+        )
+
 
 class TestScreenshotScenario:
     """User: 'Show me what it looks like.' — headless behavior must be a

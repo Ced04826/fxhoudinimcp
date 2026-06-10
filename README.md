@@ -287,7 +287,9 @@ Unit tests mock `hou` and run anywhere. The integration suite in
 simulation, animation, lookdev) — and prints per-command timing and
 coverage reports; it is skipped automatically when `hou` is not
 available. `tests/integration/perf_sweep.py` benchmarks handlers on
-large scenes.
+large scenes, and `python tests/integration/bridge_e2e.py` validates the
+full HTTP transport (real hwebserver in hython driven by the MCP
+server's own bridge).
 
 ### How It Works
 

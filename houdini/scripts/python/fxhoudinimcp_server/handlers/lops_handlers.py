@@ -1010,7 +1010,8 @@ def _set_light_properties(
         + "\n".join(set_lines)
     )
 
-    python_node = parent.createNode("python", node_name="set_light_props_auto")
+    # "pythonscript" is the LOP type name; "python" does not exist here.
+    python_node = parent.createNode("pythonscript", node_name="set_light_props_auto")
     python_node.setInput(0, node)
     python_node.parm("python").set(snippet)
     python_node.moveToGoodPosition()

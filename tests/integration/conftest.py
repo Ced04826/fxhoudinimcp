@@ -46,6 +46,10 @@ else:
 # (command, milliseconds) for every dispatched call, across the session.
 _OP_TIMINGS: list[tuple[str, float]] = []
 
+# Smoke-mode (allow_error) calls that actually failed: their success path
+# is still unverified. Reported in the session summary.
+_SMOKE_ERRORS: dict[str, str] = {}
+
 
 @pytest.fixture(autouse=True)
 def fresh_scene():
@@ -80,6 +84,9 @@ def call():
                 assert error.get("code") != "UNKNOWN_COMMAND", error
                 assert str(error.get("message", "")).strip(), (
                     f"{_command} failed with an empty error message: {error}"
+                )
+                _SMOKE_ERRORS.setdefault(
+                    _command, str(error.get("message", ""))[:70]
                 )
             return result
         if expect_error:
@@ -125,3 +132,9 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         terminalreporter.write_line("never called this session:")
         for command in untested:
             terminalreporter.write_line(f"  {command}")
+    if _SMOKE_ERRORS:
+        terminalreporter.write_line(
+            "smoke-mode calls that errored (success path unverified):"
+        )
+        for command, message in sorted(_SMOKE_ERRORS.items()):
+            terminalreporter.write_line(f"  {command}: {message}")

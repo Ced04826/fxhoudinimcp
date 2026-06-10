@@ -67,7 +67,11 @@ class TestTops:
         assert "5" in str(states) or "workitems" in str(states).lower(), states
         call("tops.get_work_item_info", node_path=path, work_item_index=0, allow_error=True)
         call("tops.get_pdg_graph", node_path=topnet, allow_error=True)
-        call("tops.cook_top_node", node_path=path, block=True, allow_error=True)
+        call("tops.cook_top_node", node_path=path, block=True)
+        cooked = call("tops.get_work_item_states", node_path=path)
+        assert "Cooked" in str(cooked) or "success" in str(cooked).lower(), (
+            f"PDG cook claimed done but no cooked work items: {cooked}"
+        )
         call("tops.get_top_scheduler_info", node_path=topnet, allow_error=True)
         call("tops.dirty_work_items", node_path=path)
         call("tops.pause_top_cook", node_path=topnet, allow_error=True)
@@ -465,14 +469,22 @@ class TestLopsModule:
         lights = call("lops.list_lights", node_path=light_node)
         assert lights, lights
         prim_path = light.get("prim_path")
-        if prim_path:
-            call(
-                "lops.set_light_properties",
-                node_path=light_node,
-                prim_path=prim_path,
-                properties={"intensity": 5.0},
-                allow_error=True,
-            )
+        assert prim_path, light
+        updated = call(
+            "lops.set_light_properties",
+            node_path=light_node,
+            prim_path=prim_path,
+            properties={"intensity": 5.0},
+        )
+        intensity = call(
+            "lops.get_usd_attribute",
+            node_path=updated["python_node"],
+            prim_path=prim_path,
+            attr_name="inputs:intensity",
+        )
+        assert "5" in str(intensity.get("value", intensity)), (
+            f"set_light_properties claimed intensity=5.0 but stage says {intensity}"
+        )
 
 
 class TestMopUp:
@@ -573,24 +585,19 @@ class TestMopUp:
             "nodes.create_node", parent_path="/obj", node_type="geo", name="src"
         )["node_path"]
         sphere = call("nodes.create_node", parent_path=geo, node_type="sphere")
-        flip = call(
-            "workflow.setup_flip_sim",
-            source_geo=sphere["node_path"],
-            allow_error=True,
-        )
-        if flip["status"] == "success":
-            for path in flip["data"].get("all_nodes", []):
-                assert hou.node(path) is not None, f"claimed node missing: {path}"
+        flip = call("workflow.setup_flip_sim", source_geo=sphere["node_path"])
+        assert flip["success"] is True
+        for path in flip.get("all_nodes", []):
+            assert hou.node(path) is not None, f"claimed node missing: {path}"
+
         cloth_geo = call(
             "nodes.create_node", parent_path="/obj", node_type="geo", name="cloth"
         )["node_path"]
         call("nodes.create_node", parent_path=cloth_geo, node_type="grid")
-        vellum = call(
-            "workflow.setup_vellum_sim", geo_path=cloth_geo, allow_error=True
-        )
-        if vellum["status"] == "success":
-            for path in vellum["data"].get("all_nodes", []):
-                assert hou.node(path) is not None, f"claimed node missing: {path}"
+        vellum = call("workflow.setup_vellum_sim", geo_path=cloth_geo)
+        assert vellum["success"] is True
+        for path in vellum.get("all_nodes", []):
+            assert hou.node(path) is not None, f"claimed node missing: {path}"
 
 
 class TestAnimationModule:
