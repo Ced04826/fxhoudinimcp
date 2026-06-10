@@ -46,8 +46,41 @@ class TestGeometry:
 
     def test_sample_geometry_count_is_honest(self, call, box):
         data = call("geometry.sample_geometry", node_path=box, sample_count=4)
-        flat = str(data)
-        assert "P" in flat or "position" in flat.lower()
+        assert data["sample_count"] == 4
+        assert len(data["points"]) == 4
+        assert all("P" in row for row in data["points"])
+
+    def test_get_points_pagination_offsets_correctly(self, call, box):
+        data = call("geometry.get_points", node_path=box, start=4, count=10)
+        assert data["total_points"] == 8
+        assert [row["index"] for row in data["points"]] == [4, 5, 6, 7]
+        assert data["has_more"] is False
+        node = hou.node(box)
+        expected = list(node.geometry().point(4).position())
+        assert data["points"][0]["P"] == pytest.approx(expected)
+
+    def test_get_prims_pagination_offsets_correctly(self, call, box):
+        data = call("geometry.get_prims", node_path=box, start=2, count=2)
+        assert data["total_prims"] == 6
+        assert [row["index"] for row in data["prims"]] == [2, 3]
+        assert data["has_more"] is True
+
+    def test_find_nearest_point_finds_exact_corner(self, call, box):
+        data = call(
+            "geometry.find_nearest_point",
+            node_path=box,
+            position=[0.5, 0.5, 0.5],
+        )
+        result = data["results"][0]
+        assert result["position"] == pytest.approx([0.5, 0.5, 0.5])
+        assert result["distance"] == pytest.approx(0.0)
+        corner = hou.node(box).geometry().point(result["index"]).position()
+        assert list(corner) == pytest.approx([0.5, 0.5, 0.5])
+
+    def test_prim_intrinsics_summary_counts_box(self, call, box):
+        data = call("geometry.get_prim_intrinsics", node_path=box)
+        assert data["total_prims"] == 6
+        assert data["summary"], "no intrinsics summarized"
 
 
 class TestVex:
