@@ -13,6 +13,7 @@ from typing import Any, Optional
 from mcp.server.fastmcp import Context
 
 # Internal
+from fxhoudinimcp.config import auto_layout_enabled
 from fxhoudinimcp.server import mcp, _get_bridge
 
 
@@ -363,11 +364,21 @@ async def layout_children(
 ) -> dict:
     """Auto-layout children of a network node.
 
+    Does nothing when auto-layout is disabled via FXHOUDINIMCP_AUTO_LAYOUT=0.
+
     Args:
         ctx: MCP context.
         parent_path: Parent network path.
         spacing: Spacing multiplier between nodes.
     """
+    if not auto_layout_enabled():
+        return {
+            "skipped": True,
+            "reason": (
+                "Auto-layout is disabled (FXHOUDINIMCP_AUTO_LAYOUT=0). "
+                "Leave node positions as they are; do not retry."
+            ),
+        }
     bridge = _get_bridge(ctx)
     params: dict = {"parent_path": parent_path}
     if spacing is not None:

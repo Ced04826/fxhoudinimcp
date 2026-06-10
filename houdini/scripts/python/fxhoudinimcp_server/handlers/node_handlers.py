@@ -10,6 +10,7 @@ from __future__ import annotations
 import hou
 
 # Internal
+from fxhoudinimcp_server.config import auto_layout_enabled, layout_if_enabled
 from fxhoudinimcp_server.dispatcher import register_handler
 
 
@@ -38,7 +39,7 @@ def _focus_network_editor(node: hou.Node) -> None:
     try:
         parent = node.parent()
         if parent is not None:
-            parent.layoutChildren()
+            layout_if_enabled(parent)
         for pane_tab in hou.ui.paneTabs():
             if pane_tab.type() == hou.paneTabType.NetworkEditor:
                 if parent is not None:
@@ -693,6 +694,13 @@ def layout_children(parent_path: str, spacing: float = None) -> dict:
         parent_path: Path to the parent network.
         spacing: Optional spacing multiplier between nodes.
     """
+    if not auto_layout_enabled():
+        return {
+            "success": False,
+            "skipped": True,
+            "reason": "Auto-layout is disabled (FXHOUDINIMCP_AUTO_LAYOUT=0).",
+        }
+
     parent = _get_node(parent_path)
 
     if spacing is not None:

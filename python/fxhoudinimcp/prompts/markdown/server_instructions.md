@@ -142,5 +142,5 @@ When to look: (1) unsure if a node exists, (2) need parameter details, (3) need 
 *   After EVERY create\_wrangle or set\_wrangle\_code, immediately call validate\_vex. Do not proceed until it reports no errors.
 *   build\_sop\_chain wires a whole chain at once. Prefer it over individual create\_node calls for linear SOP chains.
 *   NEVER hardcode tweakable values. Create a controller null ('CTRL') with spare parameters.
-*   Call layout\_children after every batch of nodes, not just at the end.
+*   {layout_guidance}
 *   When a workflow tool exists (setup\_pyro\_sim, setup\_rbd\_sim, etc.), use it instead of building from scratch.
