@@ -842,8 +842,8 @@ def _create_light(
 
     node = parent.createNode(lop_type, node_name=name)
 
-    # Set intensity
-    intensity_parm = node.parm("xn__inputsintensity_i0b")
+    # Set intensity ("inputs:intensity" punycodes to xn__inputsintensity_i0a)
+    intensity_parm = node.parm("xn__inputsintensity_i0a")
     if intensity_parm is None:
         intensity_parm = node.parm("intensity")
     if intensity_parm is not None:
@@ -852,7 +852,7 @@ def _create_light(
     # Set color
     if color is not None and len(color) >= 3:
         for i, suffix in enumerate(["r", "g", "b"]):
-            parm = node.parm(f"xn__inputscolor_{suffix}0b")
+            parm = node.parm(f"xn__inputscolor_zta{suffix}")
             if parm is None:
                 parm = node.parm(f"color{suffix}")
             if parm is not None:
@@ -1097,26 +1097,33 @@ def _create_light_rig(
         )
 
     created_nodes: list[str] = []
+    previous: hou.Node | None = None
 
     for light_def in preset_config:
         lop_type = light_def["type"]
         light_name = light_def.get("name")
         node = parent.createNode(lop_type, node_name=light_name)
 
-        # Set intensity with multiplier
+        # Chain the lights so the last node's stage contains the whole rig.
+        if previous is not None:
+            node.setInput(0, previous)
+        previous = node
+
+        # Set intensity with multiplier. USD light parms are punycoded
+        # ("inputs:intensity" -> xn__inputsintensity_i0a).
         base_intensity = light_def.get("intensity", 1.0)
         final_intensity = base_intensity * intensity_mult
-        intensity_parm = node.parm("xn__inputsintensity_i0b")
+        intensity_parm = node.parm("xn__inputsintensity_i0a")
         if intensity_parm is None:
             intensity_parm = node.parm("intensity")
         if intensity_parm is not None:
             intensity_parm.set(final_intensity)
 
-        # Set color
+        # Set color ("inputs:color" components -> xn__inputscolor_zta{r,g,b})
         light_color = light_def.get("color")
         if light_color:
             for i, suffix in enumerate(["r", "g", "b"]):
-                parm = node.parm(f"xn__inputscolor_{suffix}0b")
+                parm = node.parm(f"xn__inputscolor_zta{suffix}")
                 if parm is None:
                     parm = node.parm(f"color{suffix}")
                 if parm is not None:
