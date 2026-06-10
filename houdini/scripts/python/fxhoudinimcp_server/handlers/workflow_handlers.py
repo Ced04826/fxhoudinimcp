@@ -14,6 +14,7 @@ from typing import Any
 import hou
 
 # Internal
+from fxhoudinimcp_server.config import layout_if_enabled
 from fxhoudinimcp_server.dispatcher import register_handler
 
 
@@ -32,7 +33,7 @@ def _focus_network_editor(node: hou.Node) -> None:
     try:
         parent = node.parent()
         if parent is not None:
-            parent.layoutChildren()
+            layout_if_enabled(parent)
         for pane_tab in hou.ui.paneTabs():
             if pane_tab.type() == hou.paneTabType.NetworkEditor:
                 if parent is not None:
@@ -133,7 +134,7 @@ def _setup_pyro_sim_sop(
     except Exception:
         pass
 
-    geo.layoutChildren()
+    layout_if_enabled(geo)
     _focus_network_editor(filecache)
     print("[workflow] SOP-level Pyro setup complete")
 
@@ -250,8 +251,8 @@ def _setup_pyro_sim_dop(
     except Exception:
         pass
 
-    geo.layoutChildren()
-    dopnet.layoutChildren()
+    layout_if_enabled(geo)
+    layout_if_enabled(dopnet)
     _focus_network_editor(filecache)
     print("[workflow] DOP-level Pyro setup complete")
 
@@ -469,8 +470,8 @@ def _setup_rbd_sim(
 
     # -- Step 10: Layout
     print("[workflow] Laying out nodes")
-    geo.layoutChildren()
-    dopnet.layoutChildren()
+    layout_if_enabled(geo)
+    layout_if_enabled(dopnet)
     _focus_network_editor(filecache)
 
     print(f"[workflow] RBD simulation '{name}' setup complete")
@@ -603,8 +604,8 @@ def _setup_flip_sim(
 
     # -- Step 10: Layout
     print("[workflow] Laying out nodes")
-    geo.layoutChildren()
-    dopnet.layoutChildren()
+    layout_if_enabled(geo)
+    layout_if_enabled(dopnet)
     _focus_network_editor(filecache)
 
     print(f"[workflow] FLIP simulation '{name}' setup complete")
@@ -724,7 +725,7 @@ def _setup_vellum_sim(
 
     # -- Step 6: Layout
     print("[workflow] Laying out nodes")
-    geo.layoutChildren()
+    layout_if_enabled(geo)
     _focus_network_editor(filecache)
 
     print(f"[workflow] Vellum simulation '{name}' ({sim_type}) setup complete")
@@ -815,7 +816,7 @@ def _create_material(
     else:
         raise ValueError(f"Unknown mat_type '{mat_type}'. Must be 'principled' or 'materialx'.")
 
-    mat.layoutChildren()
+    layout_if_enabled(mat)
     _focus_network_editor(shader)
 
     print(f"[workflow] Material '{name}' created at {shader_path}")
@@ -894,7 +895,7 @@ def _assign_material(
     except Exception:
         pass
 
-    sop_parent.layoutChildren()
+    layout_if_enabled(sop_parent)
     _focus_network_editor(mat_sop)
 
     print(f"[workflow] Material assigned: {mat_sop.path()} -> {material_path}")
@@ -981,7 +982,7 @@ def _build_sop_chain(
 
     # Layout
     print("[workflow] Laying out nodes")
-    parent.layoutChildren()
+    layout_if_enabled(parent)
     if prev_node is not None:
         _focus_network_editor(prev_node)
 
@@ -1094,7 +1095,7 @@ def _setup_render(
             break
 
     # Layout
-    out.layoutChildren()
+    layout_if_enabled(out)
     _focus_network_editor(rop)
 
     print(f"[workflow] Render setup '{name}' complete ({renderer})")
