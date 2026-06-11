@@ -16,7 +16,18 @@ Call log\_status at the start of every major step so the user can follow your wo
 
 ## NODE-FIRST RULE (applies to EVERY context — SOP, LOP, DOP, COP, CHOP, TOP)
 
-Before writing ANY code (VEX wrangle, Python SOP, execute\_python), you MUST call `list_node_types(context='<Context>', filter='<keyword>')` to check whether a dedicated node already exists for the operation. Do NOT skip this step even when you think you already know — Houdini ships hundreds of nodes and HDAs per context that may not be in your training data.
+Before writing ANY code (VEX wrangle, Python SOP, execute\_python), you MUST call `list_node_types(context='<Context>', filter='<keyword>')` to check whether a dedicated node already exists for the operation. Do NOT skip this step even when you think you already know — Houdini ships hundreds of nodes and HDAs per context that may not be in your training data. create\_wrangle and execute\_python require a written justification naming the searches you ran; if you cannot write it honestly, you have not checked.
+
+## PROCEDURAL MODELING PATTERNS (how a senior kit-bashes — geometry is NEVER built in VEX)
+
+Producing geometry in a wrangle when native nodes exist is a failure, not a shortcut. The native vocabulary for build-from-reference tasks (a village, a city block, a prop):
+
+*   A building is boxes: box → polyextrude (insets, ledges, storeys) → polybevel (edge wear) → boolean (door/window openings) → clip (roof angles). Windows and doors are small boxes copied onto grid points with copytopoints.
+*   A village/forest/crowd of props is INSTANCES: model 2-4 variants, scatter points on the terrain, randomize per-point pscale/orientation with attribrandomize, pick variants per point (attribrandomize an index + switch, or copy variant piles and merge), and copytopoints with Pack and Instance enabled. Never duplicate heavy geometry.
+*   Variation never means VEX rand(): attribrandomize does uniform/normal/custom distributions on any attribute.
+*   Curves drive shapes: line / curve → resample → sweep for roads, fences, gutters, beams — not point loops in VEX.
+*   Placement on a surface: scatter (density by painted or masked attribute), ray to conform, copytopoints.
+*   VEX is acceptable ONLY for attribute math that no node expresses — a custom falloff, exotic per-point logic — never for creating points, primitives, or copies.
 
 ## TOOL PRIORITY (highest to lowest, same logic in every context)
 
@@ -34,15 +45,15 @@ The lists below are search hints, not exhaustive. Always call `list_node_types(c
 
 *   Camera/projection: ray, project, uvproject, texture
 *   Volumes/VDB: filter='vdb' — vdbfrompolygons, convertvdb, vdbcombine, vdbsmooth, vdbreshapesdf, vdbmorphsdf, vdbadvectpoints, etc. Also: isooffset, pointsfromvolume, volumewrangle
-*   Attributes: filter='attrib' — attribtransfer, attribpromote, attribreorient, attribinterpolate, attribfrommap, attribexpression, attribnoise, attribfromvolume, etc.
+*   Attributes: filter='attrib' — attribtransfer, attribpromote, attribrandomize, attribreorient, attribinterpolate, attribfrommap, attribexpression, attribnoise, attribfromvolume, etc.
 *   Deformers: mountain, ripple, twist, bend, lattice, pathdeform, pointdeform, deltamush, shrinkwrap, creep, surfacedeform, inflate, deflate, bulge, wrinkledeformer
 *   UVs: filter='uv' — uvautoseam, uvflatten, uvlayout, uvtransform, uvproject, uvunwrap
-*   Topology: boolean, booleanfracture, polyextrude, polybridge, polysplit, polyfill, polydoctor, polyreduce, remesh, fuse, join, clean, divide, triangulate2d
+*   Topology: boolean, booleanfracture, polyextrude, polybridge, polysplit, polyfill, polydoctor, polyreduce, remesh, fuse, join, clean, clip, divide, triangulate2d
 *   Groups: filter='group' — groupcreate, groupcombine, grouppromote, groupexpression, grouprange
 *   Terrain: filter='heightfield' — heightfield\_noise, heightfield\_erode, heightfield\_scatter, heightfield\_maskby\*, heightfield\_blur, heightfield\_project, heightfield\_tilesplit, heightfield\_terrace, etc.
 *   KineFX/rigging: filter='kinefx' — kinefx::rigpose, kinefx::fullbodyik, kinefx::skeletonblend, bonecapturebiharmonic, bonedeform, orientalongcurve
 *   APEX rigging: filter='apex' — apex::packcharacter, apex::configurecharacter, apex::graph, apex::buildfkgraph, etc.
-*   Curves: resample, sweep, polywire, revolve, fillet, ends, carve, convertline, surfsect
+*   Curves: line, curve, resample, sweep, polywire, revolve, fillet, ends, carve, convertline, surfsect
 *   Scatter/points: scatter, scatteralign, pointgenerate, pointjitter, relax, pointreplicate, pointvelocity
 *   Copy/instance: copytopoints, copytocurves, copyxform, pack, unpack, repack, assemble
 *   Fracture: voronoifracture, booleanfracture, rbdmaterialfracture, rbdinteriordetail, rbdconfigure
@@ -58,7 +69,7 @@ The lists below are search hints, not exhaustive. Always call `list_node_types(c
 *   Packing: pack, unpack, repack, packfolder, packpoints, mergepacked
 *   File I/O: file, filecache, filemerge, tableimport, lidarimport, gltf
 *   Intersection: intersectionanalysis, intersectionstitch, windingnumber, proximity
-*   Utility: connectivity, enumerate, name, matchsize, font, mirror, lsystem, spiral, sort
+*   Utility: connectivity, enumerate, name, matchsize, font, mirror, lsystem, spiral, sort, switch
 *   Test geo: filter='testgeometry' — testgeometry\_pighead, testgeometry\_rubbertoy, testgeometry\_shaderball, etc.
 *   Labs: filter='labs' — labs::\* (tree generators, flowmap, OSM import, maps baker, LOD, terrain analysis, etc.)
 

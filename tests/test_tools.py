@@ -84,19 +84,42 @@ class TestNodeTools:
 class TestCodeTools:
     @pytest.mark.asyncio
     async def test_execute_python_code_only(self, mock_ctx, mock_bridge):
-        await execute_python(mock_ctx, code="print('hi')")
+        result = await execute_python(
+            mock_ctx,
+            code="print('hi')",
+            justification="no dedicated tool prints to the console",
+        )
         mock_bridge.execute.assert_called_once_with(
             "code.execute_python",
             {"code": "print('hi')"},
         )
+        # The justification is echoed back, never forwarded to Houdini.
+        assert result["justification"]
 
     @pytest.mark.asyncio
     async def test_execute_python_with_return(self, mock_ctx, mock_bridge):
-        await execute_python(mock_ctx, code="x = 1 + 1", return_expression="x")
+        await execute_python(
+            mock_ctx,
+            code="x = 1 + 1",
+            justification="no dedicated tool evaluates arbitrary Python",
+            return_expression="x",
+        )
         mock_bridge.execute.assert_called_once_with(
             "code.execute_python",
             {"code": "x = 1 + 1", "return_expression": "x"},
         )
+
+    @pytest.mark.asyncio
+    async def test_justification_required_in_schemas(self):
+        """The schema must force clients to articulate why VEX/Python."""
+        from fxhoudinimcp.server import mcp
+
+        tools = {t.name: t for t in await mcp.list_tools()}
+        for tool_name in ("execute_python", "create_wrangle"):
+            schema = tools[tool_name].inputSchema
+            assert "justification" in schema["required"], (
+                f"{tool_name} must require a justification"
+            )
 
 
 class TestWorkflowTools:
