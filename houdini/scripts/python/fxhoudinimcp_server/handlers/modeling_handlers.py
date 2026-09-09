@@ -1,21 +1,30 @@
 """Modeling (SOP) handlers for FXHoudini-MCP.
 
-One command so far: ``modeling.get_mesh_report``, the acceptance check a modeler
-runs before trusting a control cage -- face mix, pieces, boundary loops,
-non-manifold edges, degenerate faces, poles and folded quads, in a single call.
+Two commands, both aimed at control cages:
 
-Topology comes from a ``.geo`` JSON round trip rather than per-primitive HOM
-calls. Measured on 22.0.368 with a 10 000 quad grid: 32 ms for
-``saveToFile`` + ``json.load`` against 878 ms for walking ``prim.vertices()``.
-The maths below is deliberately free of ``hou`` and ``numpy`` so it can be
-tested without Houdini; only the handler itself touches either.
+``modeling.get_mesh_report``
+    The acceptance check a modeler runs before trusting a cage -- face mix,
+    pieces, boundary loops, non-manifold edges, degenerate faces, poles and
+    folded quads, in a single call. Topology comes from a ``.geo`` JSON round
+    trip rather than per-primitive HOM calls. Measured on 22.0.368 with a
+    10 000 quad grid: 32 ms for ``saveToFile`` + ``json.load`` against 878 ms
+    for walking ``prim.vertices()``.
+
+``modeling.edit_points``
+    Batch point shaping through a native Edit SOP, with read-back evidence of
+    where the points actually landed.
+
+The maths and validation below are deliberately free of ``hou`` and ``numpy``
+so they can be tested without Houdini; only the handlers touch either.
 """
 
 from __future__ import annotations
 
 # Built-in
+import array
 import contextlib
 import gc
+import hashlib
 import json
 import math
 import os
@@ -39,6 +48,20 @@ MAX_PRIMS = 500_000
 # A face whose area falls below this fraction of the bounding box area is a
 # sliver a subdivision will turn into a crease or a hole.
 AREA_EPSILON_FACTOR = 1e-12
+
+# An Edit SOP stores its delta as float32, so a requested position and the one
+# that comes back never match exactly. Scaled by the bounding box so the same
+# number works for a 1-unit prop and a 1000-unit building; anything outside it
+# means the edit did not land where it was asked to, which is worth saying.
+POSITION_TOLERANCE_FACTOR = 1e-5
+
+# Below this a point did not move; float32 noise alone reaches roughly 1e-7.
+MOVED_EPSILON = 1e-7
+
+# Where the input fingerprint is parked on the Edit node, and how the matching
+# comment line starts so a later run can replace it instead of stacking up.
+USER_DATA_KEY = "fxmcp_edit_fingerprint"
+COMMENT_MARKER = "[fxmcp edit]"
 
 
 ###### .geo JSON parsing (no hou)
@@ -375,8 +398,8 @@ def folded_quads(
 ###### modeling.get_mesh_report
 
 
-def _get_sop_geo(node_path: str) -> hou.Geometry:
-    """The cooked read-only geometry for a SOP node.
+def _get_sop_node(node_path: str, argument: str) -> hou.Node:
+    """A node that can hand out geometry, or a sentence naming what it is instead.
 
     The ``geometry`` attribute is checked rather than called blind: on anything
     that is not a SOP -- ``/obj`` itself, an object node, a LOP -- calling it
@@ -386,13 +409,17 @@ def _get_sop_geo(node_path: str) -> hou.Geometry:
     node = hou.node(node_path)
     if node is None:
         raise hou.OperationFailed(f"Node not found: {node_path}")
-    reader = getattr(node, "geometry", None)
-    if reader is None:
+    if getattr(node, "geometry", None) is None:
         raise hou.OperationFailed(
             f"{node_path} is a '{node.type().name()}' node, which carries no geometry. "
-            "get_mesh_report reads a SOP, for example /obj/geo1/subdivide1."
+            f"{argument} must name a SOP, for example /obj/geo1/subdivide1."
         )
-    geo = reader()
+    return node
+
+
+def _get_sop_geo(node_path: str) -> hou.Geometry:
+    """The cooked read-only geometry for a SOP node."""
+    geo = _get_sop_node(node_path, "node_path").geometry()
     if geo is None:
         raise hou.OperationFailed(
             f"Node has no geometry: {node_path}. Only SOP nodes carry a mesh."
@@ -672,3 +699,393 @@ def _get_mesh_report(
 
 
 register_handler("modeling.get_mesh_report", _get_mesh_report)
+
+
+###### Point editing: validation and arithmetic (no hou)
+
+
+def _vector3(value: Any, label: str, key: str) -> tuple[float, float, float]:
+    """Three finite numbers, or a sentence naming which entry and which axis."""
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{label} '{key}' must be three numbers [x, y, z], not {value!r}")
+    components: list[float] = []
+    for axis, component in zip("xyz", value, strict=True):
+        if isinstance(component, bool) or not isinstance(component, (int, float)):
+            raise ValueError(
+                f"{label} '{key}' {axis} must be a number, not "
+                f"{type(component).__name__}: {component!r}"
+            )
+        number = float(component)
+        # A NaN or an infinity reaches the geometry intact and quietly ruins it.
+        if not math.isfinite(number):
+            raise ValueError(f"{label} '{key}' {axis} must be a finite number, not {component!r}")
+        components.append(number)
+    return (components[0], components[1], components[2])
+
+
+def validate_moves(moves: Any, point_count: int, group_names: Any) -> list[dict[str, Any]]:
+    """Check every entry before anything is written, and normalise it.
+
+    Nothing here touches the scene, which is the point: a call that names one
+    bad point number must not leave half its moves applied.
+    """
+    if not isinstance(moves, (list, tuple)):
+        raise ValueError(
+            "moves must be a list of entries like [{'point': 0, 'to': [0, 1, 0]}], "
+            f"not {type(moves).__name__}"
+        )
+    if not moves:
+        raise ValueError("moves is empty, so there is nothing to move")
+
+    known_groups = set(group_names)
+    entries: list[dict[str, Any]] = []
+    for index, raw in enumerate(moves):
+        label = f"moves[{index}]"
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"{label} must be a dict like {{'point': 0, 'to': [0, 1, 0]}}, "
+                f"not {type(raw).__name__}"
+            )
+
+        has_point = raw.get("point") is not None
+        has_group = raw.get("group") is not None
+        if has_point and has_group:
+            raise ValueError(f"{label} names both 'point' and 'group'; give exactly one")
+        if not has_point and not has_group:
+            raise ValueError(f"{label} names neither 'point' nor 'group'; give exactly one")
+
+        has_to = raw.get("to") is not None
+        has_delta = raw.get("delta") is not None
+        if has_to and has_delta:
+            raise ValueError(f"{label} gives both 'to' and 'delta'; give exactly one")
+        if not has_to and not has_delta:
+            raise ValueError(f"{label} gives neither 'to' nor 'delta'; give exactly one")
+        if has_group and has_to:
+            raise ValueError(
+                f"{label} uses 'to' with 'group': one absolute position for a whole group "
+                "would stack every point on the same spot. Use 'delta'."
+            )
+
+        entry: dict[str, Any] = {
+            "point": None,
+            "group": None,
+            "mode": "to" if has_to else "delta",
+            "vector": _vector3(
+                raw["to"] if has_to else raw["delta"], label, "to" if has_to else "delta"
+            ),
+        }
+
+        if has_point:
+            number = raw["point"]
+            if isinstance(number, bool) or not isinstance(number, (int, float)):
+                raise ValueError(
+                    f"{label} 'point' must be a whole number, not "
+                    f"{type(number).__name__}: {number!r}"
+                )
+            if isinstance(number, float) and not number.is_integer():
+                raise ValueError(f"{label} 'point' must be a whole number, not {number!r}")
+            number = int(number)
+            if not 0 <= number < point_count:
+                raise ValueError(
+                    f"{label} point {number} is out of range: the input geometry has "
+                    f"{point_count} points, numbered 0 to {point_count - 1}"
+                )
+            entry["point"] = number
+        else:
+            group = raw["group"]
+            if not isinstance(group, str) or not group.strip():
+                raise ValueError(f"{label} 'group' must be a point group name, not {group!r}")
+            group = group.strip()
+            if group not in known_groups:
+                available = sorted(known_groups)
+                raise ValueError(
+                    f"{label} names point group '{group}', which the input geometry does not "
+                    f"have. Point groups: {available if available else 'none'}"
+                )
+            entry["group"] = group
+
+        entries.append(entry)
+    return entries
+
+
+def apply_moves(
+    positions: list[float],
+    entries: list[dict[str, Any]],
+    group_members: dict[str, list[int]],
+) -> tuple[list[float], list[int], dict[int, tuple[float, float, float]]]:
+    """Apply normalised entries to a flat xyz list.
+
+    Returns the new positions, the touched points in the order they were first
+    named, and the absolute position each ``to`` entry asked for -- carried
+    forward through any later delta on the same point, so it stays comparable
+    with what the Edit node reads back.
+    """
+    updated = list(positions)
+    touched: dict[int, None] = {}
+    requested: dict[int, tuple[float, float, float]] = {}
+
+    for entry in entries:
+        if entry["point"] is not None:
+            points = [entry["point"]]
+        else:
+            points = group_members.get(entry["group"], [])
+        vector = entry["vector"]
+
+        for point in points:
+            base = point * 3
+            if entry["mode"] == "to":
+                updated[base] = vector[0]
+                updated[base + 1] = vector[1]
+                updated[base + 2] = vector[2]
+                requested[point] = vector
+            else:
+                updated[base] += vector[0]
+                updated[base + 1] += vector[1]
+                updated[base + 2] += vector[2]
+                if point in requested:
+                    was = requested[point]
+                    requested[point] = (
+                        was[0] + vector[0],
+                        was[1] + vector[1],
+                        was[2] + vector[2],
+                    )
+            touched[point] = None
+
+    return updated, list(touched), requested
+
+
+def geometry_fingerprint(point_count: int, position_bytes: bytes) -> str:
+    """A short stamp of the geometry an edit was written against.
+
+    Point count plus a digest of every position: the two ways upstream geometry
+    can change under a stored delta that indexes points by number.
+    """
+    digest = hashlib.blake2b(position_bytes, digest_size=4).hexdigest()
+    return f"{point_count}@{digest}"
+
+
+def edit_comment_line(moved: int, max_displacement: float, fingerprint: str) -> str:
+    """The one line the node shows in the network editor."""
+    count, _, digest = fingerprint.partition("@")
+    return (
+        f"{COMMENT_MARKER} {moved} points moved, max {max_displacement:.4f}, "
+        f"input {count} pts @{digest}"
+    )
+
+
+def replace_comment_line(comment: str, line: str, marker: str = COMMENT_MARKER) -> str:
+    """Swap the previous marked line for a new one, keeping anything a human wrote."""
+    kept = [row for row in (comment or "").splitlines() if not row.lstrip().startswith(marker)]
+    kept.append(line)
+    return "\n".join(kept).strip("\n")
+
+
+###### modeling.edit_points
+
+
+def _get_edit_node(node_path: str) -> hou.Node:
+    """An existing Edit SOP, or a sentence saying what was found instead."""
+    node = _get_sop_node(node_path, "edit_node")
+    type_name = node.type().name()
+    if type_name != "edit":
+        raise hou.OperationFailed(
+            f"{node_path} is a '{type_name}' SOP, not an 'edit' SOP. edit_node updates an "
+            "existing Edit; pass 'after' instead to create one."
+        )
+    return node
+
+
+def _edit_input(node: hou.Node) -> hou.Node:
+    """Whatever feeds the Edit node's first input."""
+    inputs = node.inputs()
+    source = inputs[0] if inputs else None
+    if source is None:
+        raise hou.OperationFailed(
+            f"{node.path()} has nothing wired into its first input, so it has no points to move."
+        )
+    return source
+
+
+def _edit_points(
+    *,
+    after: str | None = None,
+    edit_node: str | None = None,
+    name: str | None = None,
+    moves: list,
+    expect_points: int | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Move control points through a native Edit SOP and report where they landed."""
+    started = time.perf_counter()
+    after_path = as_text(after, "after").strip()
+    edit_path = as_text(edit_node, "edit_node").strip()
+    node_name = as_text(name, "name").strip()
+
+    if after_path and edit_path:
+        raise ValueError(
+            "Give either 'after' (create a new Edit below that node) or 'edit_node' "
+            "(update an existing one), not both."
+        )
+    if not after_path and not edit_path:
+        raise ValueError(
+            "Give either 'after' (create a new Edit below that node) or 'edit_node' "
+            "(update an existing one)."
+        )
+
+    ###### Phase 1: look at everything, change nothing.
+
+    if after_path:
+        source = _get_sop_node(after_path, "after")
+        target = None
+        if not node_name:
+            raise ValueError(
+                "name is required when creating an Edit with 'after'. Name it for what the "
+                "edit is for, for example 'panel_inner_depth', so the graph stays readable."
+            )
+    else:
+        target = _get_edit_node(edit_path)
+        source = _edit_input(target)
+
+    input_geo = source.geometry()
+    if input_geo is None:
+        raise hou.OperationFailed(f"{source.path()} produced no geometry to edit.")
+
+    point_count = input_geo.intrinsicValue("pointcount")
+    if expect_points is not None:
+        expected = as_int(expect_points, "expect_points")
+        if expected != point_count:
+            raise hou.OperationFailed(
+                f"expect_points is {expected} but {source.path()} has {point_count} points, "
+                "so the point numbers in 'moves' would not mean the points you think. "
+                "Nothing was changed."
+            )
+
+    entries = validate_moves(moves, point_count, [g.name() for g in input_geo.pointGroups()])
+    fingerprint = geometry_fingerprint(point_count, input_geo.pointFloatAttribValuesAsString("P"))
+
+    rebased = False
+    if target is not None:
+        stored = target.userData(USER_DATA_KEY)
+        if stored and stored != fingerprint:
+            if not force:
+                raise hou.OperationFailed(
+                    f"The geometry feeding {target.path()} has changed since this Edit was "
+                    f"written: it was {stored}, it is now {fingerprint}. The stored offsets are "
+                    "keyed by point number, so they no longer describe the same points and "
+                    "nothing was changed. Pass force=True to discard them and start from the "
+                    "current input."
+                )
+            rebased = True
+
+    original = list(input_geo.pointFloatAttribValues("P"))
+    if target is None or rebased:
+        base = original
+    else:
+        # Accumulating onto an existing Edit means starting from what it already
+        # outputs: setPointPositionsFromString replaces the whole delta, so a
+        # patch built on the input positions would silently undo the earlier move.
+        base = list(target.geometry().pointFloatAttribValues("P"))
+        if len(base) != point_count * 3:
+            raise hou.OperationFailed(
+                f"{target.path()} outputs {len(base) // 3} points while its input has "
+                f"{point_count}; an Edit SOP cannot bridge that, so nothing was changed."
+            )
+
+    group_members: dict[str, list[int]] = {}
+    for entry in entries:
+        group = entry["group"]
+        if group is None or group in group_members:
+            continue
+        found = input_geo.findPointGroup(group)
+        group_members[group] = [point.number() for point in found.points()] if found else []
+
+    updated, touched, requested = apply_moves(base, entries, group_members)
+
+    ###### Phase 2: everything is known to be sound, so write.
+
+    created = target is None
+    renamed_from = ""
+    flags_moved = False
+    if created:
+        parent = source.parent()
+        target = parent.createNode("edit", node_name)
+        if target.name() != node_name:
+            renamed_from = node_name
+        target.setInput(0, source, 0)
+        target.moveToGoodPosition()
+        if source.isDisplayFlagSet():
+            # Leaving the display flag upstream hides the very edit just made.
+            target.setDisplayFlag(True)
+            target.setRenderFlag(True)
+            flags_moved = True
+
+    target.geometryDelta().setPointPositionsFromString(array.array("f", updated).tobytes())
+    target.cook(force=True)
+    output = target.geometry().pointFloatAttribValues("P")
+
+    ###### Phase 3: read back what actually happened.
+
+    changed = 0
+    max_displacement = 0.0
+    for point in touched:
+        base_index = point * 3
+        dx = output[base_index] - original[base_index]
+        dy = output[base_index + 1] - original[base_index + 1]
+        dz = output[base_index + 2] - original[base_index + 2]
+        distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if distance > MOVED_EPSILON:
+            changed += 1
+        max_displacement = max(max_displacement, distance)
+
+    diagonal = input_geo.boundingBox().sizevec().length()
+    tolerance = POSITION_TOLERANCE_FACTOR * max(1.0, diagonal)
+    mismatches: list[dict[str, Any]] = []
+    for point, wanted in requested.items():
+        base_index = point * 3
+        actual = (output[base_index], output[base_index + 1], output[base_index + 2])
+        gap = math.sqrt(sum((actual[axis] - wanted[axis]) ** 2 for axis in range(3)))
+        if gap > tolerance:
+            mismatches.append(
+                {
+                    "point": point,
+                    "requested": [round(value, 6) for value in wanted],
+                    "actual": [round(value, 6) for value in actual],
+                }
+            )
+
+    line = edit_comment_line(len(touched), max_displacement, fingerprint)
+    target.setUserData(USER_DATA_KEY, fingerprint)
+    target.setComment(replace_comment_line(target.comment(), line))
+    target.setGenericFlag(hou.nodeFlag.DisplayComment, True)
+
+    report: dict[str, Any] = {
+        "node_path": target.path(),
+        "created": created,
+        "moved": len(touched),
+        "changed": changed,
+        "max_displacement": round(max_displacement, 6),
+        "samples": [
+            {
+                "point": point,
+                "from": [round(original[point * 3 + axis], 6) for axis in range(3)],
+                "to": [round(output[point * 3 + axis], 6) for axis in range(3)],
+            }
+            for point in touched[:3]
+        ],
+        "fingerprint": fingerprint,
+    }
+    if renamed_from:
+        report["renamed_from"] = renamed_from
+    if flags_moved:
+        report["flags_moved"] = True
+    if rebased:
+        report["rebased"] = True
+    if mismatches:
+        report["mismatch_count"] = len(mismatches)
+        report["mismatches"] = mismatches[:10]
+
+    report["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    return report
+
+
+register_handler("modeling.edit_points", _edit_points)

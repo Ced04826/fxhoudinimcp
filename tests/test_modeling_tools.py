@@ -1,8 +1,9 @@
-"""Tests for the modeling tool wrapper and its Houdini-free topology maths.
+"""Tests for the modeling tools and their Houdini-free maths and validation.
 
-The maths half is the reason this file matters: every number in a mesh report
-comes out of functions that never touch ``hou``, so a wrong pole count or a
-missed bow tie is caught here rather than in front of a live Houdini.
+That half is the reason this file matters: every number in a mesh report, and
+every refusal edit_points issues, comes out of functions that never touch
+``hou``, so a wrong pole count or a move that half-applies is caught here rather
+than in front of a live Houdini.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import pytest
 from support import tool_input_schema
 
 # Internal
-from fxhoudinimcp.tools.modeling import get_mesh_report
+from fxhoudinimcp.tools.modeling import edit_points, get_mesh_report
 
 # The handler module imports hou at module scope; the maths below does not use
 # it, so a stub is enough to get at the functions. Same prelude as
@@ -27,15 +28,21 @@ sys.modules.setdefault("hdefereval", MagicMock())
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "houdini", "scripts", "python"))
 
 from fxhoudinimcp_server.handlers.modeling_handlers import (  # noqa: E402
+    COMMENT_MARKER,
+    apply_moves,
     boundary_report,
     build_edge_faces,
     connected_pieces,
     degenerate_faces,
+    edit_comment_line,
     extract_faces,
     find_poles,
     folded_quads,
+    geometry_fingerprint,
     quad_fold_flags,
+    replace_comment_line,
     valence_map,
+    validate_moves,
 )
 
 ###### Fixtures in plain data
@@ -348,3 +355,250 @@ class TestGetMeshReportTool:
         assert set(properties) >= {"node_path", "group", "max_list", "dump_path"}
         assert properties["node_path"]["type"] == "string"
         assert properties["max_list"]["type"] == "integer"
+
+
+###### edit_points: validating an entry list before anything is written
+
+
+class TestValidateMoves:
+    """One bad entry has to stop the whole call, so each reason is checked."""
+
+    def _bad(self, moves, match, point_count=9, groups=("top",)):
+        with pytest.raises(ValueError, match=match):
+            validate_moves(moves, point_count, groups)
+
+    def test_accepts_and_normalises_the_three_shapes(self):
+        entries = validate_moves(
+            [
+                {"point": 0, "to": [1, 2, 3]},
+                {"point": 8, "delta": [0, 0.5, 0]},
+                {"group": "top", "delta": [0, 1, 0]},
+            ],
+            9,
+            ["top"],
+        )
+        assert [(e["point"], e["group"], e["mode"]) for e in entries] == [
+            (0, None, "to"),
+            (8, None, "delta"),
+            (None, "top", "delta"),
+        ]
+        # Integers arrive from JSON; the arithmetic downstream wants floats.
+        assert entries[0]["vector"] == (1.0, 2.0, 3.0)
+
+    def test_moves_must_be_a_non_empty_list(self):
+        self._bad({"point": 0}, "moves must be a list")
+        self._bad([], "nothing to move")
+
+    def test_entry_must_be_a_dict(self):
+        self._bad([[0, 1, 2]], r"moves\[0\] must be a dict")
+
+    def test_point_and_group_are_exclusive(self):
+        self._bad([{"point": 0, "group": "top", "delta": [0, 1, 0]}], r"moves\[0\] names both")
+        self._bad([{"delta": [0, 1, 0]}], r"moves\[0\] names neither")
+
+    def test_to_and_delta_are_exclusive(self):
+        self._bad([{"point": 0, "to": [0, 1, 0], "delta": [0, 1, 0]}], r"moves\[0\] gives both")
+        self._bad([{"point": 0}], r"moves\[0\] gives neither")
+
+    def test_to_on_a_group_is_refused(self):
+        self._bad([{"group": "top", "to": [0, 1, 0]}], "stack every point on the same spot")
+
+    def test_point_must_be_a_whole_number_in_range(self):
+        self._bad([{"point": 99, "delta": [0, 1, 0]}], "point 99 is out of range")
+        self._bad([{"point": -1, "delta": [0, 1, 0]}], "out of range")
+        self._bad([{"point": 1.5, "delta": [0, 1, 0]}], "must be a whole number")
+        self._bad([{"point": "0", "delta": [0, 1, 0]}], "must be a whole number")
+        # True is an int to Python, which is not a defensible point number.
+        self._bad([{"point": True, "delta": [0, 1, 0]}], "must be a whole number")
+
+    def test_the_index_of_the_bad_entry_is_named(self):
+        self._bad(
+            [{"point": 0, "delta": [0, 1, 0]}, {"point": 0, "delta": [0, 1, 0]}, {"point": 99}],
+            r"moves\[2\]",
+        )
+
+    def test_unknown_group_lists_the_real_ones(self):
+        with pytest.raises(ValueError, match="'nope'") as caught:
+            validate_moves([{"group": "nope", "delta": [0, 1, 0]}], 9, ["base", "top"])
+        assert "['base', 'top']" in str(caught.value)
+
+    def test_group_error_says_none_when_there_are_none(self):
+        with pytest.raises(ValueError, match="none") as caught:
+            validate_moves([{"group": "top", "delta": [0, 1, 0]}], 9, [])
+        assert "none" in str(caught.value)
+
+    def test_vectors_need_three_finite_numbers(self):
+        self._bad([{"point": 0, "delta": [0, 1]}], "three numbers")
+        self._bad([{"point": 0, "delta": "up"}], "three numbers")
+        self._bad([{"point": 0, "delta": [0, "1", 0]}], "y must be a number")
+        self._bad([{"point": 0, "delta": [0, float("nan"), 0]}], "finite")
+        self._bad([{"point": 0, "to": [float("inf"), 0, 0]}], "finite")
+
+
+class TestApplyMoves:
+    """Nine points on a line at x = 0..8, so a wrong index is obvious."""
+
+    def _positions(self):
+        return [float(value) for point in range(9) for value in (point, 0.0, 0.0)]
+
+    def _entries(self, moves, groups=("top",)):
+        return validate_moves(moves, 9, groups)
+
+    def test_absolute_move(self):
+        updated, touched, requested = apply_moves(
+            self._positions(), self._entries([{"point": 2, "to": [0, 5, 0]}]), {}
+        )
+        assert updated[6:9] == [0.0, 5.0, 0.0]
+        assert touched == [2]
+        assert requested == {2: (0.0, 5.0, 0.0)}
+        assert updated[0:3] == [0.0, 0.0, 0.0]  # nothing else moved
+
+    def test_relative_move(self):
+        updated, touched, requested = apply_moves(
+            self._positions(), self._entries([{"point": 2, "delta": [0, 5, 0]}]), {}
+        )
+        assert updated[6:9] == [2.0, 5.0, 0.0]
+        assert touched == [2]
+        assert requested == {}  # a delta asks for no particular position
+
+    def test_group_delta_touches_every_member(self):
+        updated, touched, _requested = apply_moves(
+            self._positions(),
+            self._entries([{"group": "top", "delta": [0, 1, 0]}]),
+            {"top": [6, 7, 8]},
+        )
+        assert touched == [6, 7, 8]
+        assert [updated[point * 3 + 1] for point in (6, 7, 8)] == [1.0, 1.0, 1.0]
+        assert updated[5 * 3 + 1] == 0.0
+
+    def test_an_empty_group_touches_nothing(self):
+        updated, touched, _requested = apply_moves(
+            self._positions(), self._entries([{"group": "top", "delta": [0, 1, 0]}]), {"top": []}
+        )
+        assert touched == []
+        assert updated == self._positions()
+
+    def test_touched_keeps_first_touch_order_without_repeats(self):
+        _updated, touched, _requested = apply_moves(
+            self._positions(),
+            self._entries(
+                [
+                    {"point": 5, "delta": [0, 1, 0]},
+                    {"point": 1, "delta": [0, 1, 0]},
+                    {"point": 5, "delta": [0, 1, 0]},
+                ]
+            ),
+            {},
+        )
+        assert touched == [5, 1]
+
+    def test_a_delta_after_a_to_carries_the_request_with_it(self):
+        """Otherwise the read-back check would compare against a stale target."""
+        updated, _touched, requested = apply_moves(
+            self._positions(),
+            self._entries([{"point": 3, "to": [0, 1, 0]}, {"point": 3, "delta": [0, 2, 0]}]),
+            {},
+        )
+        assert updated[9:12] == [0.0, 3.0, 0.0]
+        assert requested == {3: (0.0, 3.0, 0.0)}
+
+    def test_the_input_list_is_not_modified(self):
+        original = self._positions()
+        apply_moves(original, self._entries([{"point": 0, "to": [9, 9, 9]}]), {})
+        assert original == self._positions()
+
+
+class TestFingerprintAndComment:
+    def test_fingerprint_is_count_and_digest(self):
+        stamp = geometry_fingerprint(9, b"\x00" * 108)
+        count, at, digest = stamp.partition("@")
+        assert (count, at) == ("9", "@")
+        assert len(digest) == 8  # blake2b with digest_size=4
+
+    def test_fingerprint_follows_both_kinds_of_change(self):
+        base = geometry_fingerprint(9, b"\x00" * 108)
+        assert geometry_fingerprint(10, b"\x00" * 108) != base  # count changed
+        assert geometry_fingerprint(9, b"\x01" + b"\x00" * 107) != base  # a point moved
+
+    def test_comment_line_reads_as_a_sentence(self):
+        line = edit_comment_line(3, 0.5, "9@a1b2c3d4")
+        assert line == f"{COMMENT_MARKER} 3 points moved, max 0.5000, input 9 pts @a1b2c3d4"
+
+    def test_comment_replaces_the_previous_marked_line(self):
+        first = edit_comment_line(1, 0.25, "9@aaaaaaaa")
+        second = edit_comment_line(3, 0.5, "9@bbbbbbbb")
+        after_first = replace_comment_line("", first)
+        after_second = replace_comment_line(after_first, second)
+        assert after_second == second
+        assert after_second.count(COMMENT_MARKER) == 1
+
+    def test_a_human_comment_survives(self):
+        existing = "control cage for the north facade"
+        result = replace_comment_line(existing, edit_comment_line(2, 1.0, "9@aaaaaaaa"))
+        assert result.splitlines()[0] == existing
+        assert result.splitlines()[1].startswith(COMMENT_MARKER)
+
+
+class TestEditPointsTool:
+    @pytest.mark.asyncio
+    async def test_create_mode_delegates(self, mock_ctx, mock_bridge):
+        mock_bridge.execute.return_value = {"created": True}
+        moves = [{"point": 0, "to": [0, 1, 0]}]
+        result = await edit_points(
+            mock_ctx, moves=moves, after="/obj/geo1/grid1", name="lift_corner"
+        )
+        mock_bridge.execute.assert_called_once_with(
+            "modeling.edit_points",
+            {
+                "moves": moves,
+                "force": False,
+                "after": "/obj/geo1/grid1",
+                "name": "lift_corner",
+            },
+        )
+        assert result == {"created": True}
+
+    @pytest.mark.asyncio
+    async def test_update_mode_passes_every_given_argument(self, mock_ctx, mock_bridge):
+        moves = [{"group": "top", "delta": [0, 0.25, 0]}]
+        await edit_points(
+            mock_ctx,
+            moves=moves,
+            edit_node="/obj/geo1/edit1",
+            expect_points=9,
+            force=True,
+        )
+        mock_bridge.execute.assert_called_once_with(
+            "modeling.edit_points",
+            {
+                "moves": moves,
+                "force": True,
+                "edit_node": "/obj/geo1/edit1",
+                "expect_points": 9,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_optional_arguments_stay_out_of_the_payload(self, mock_ctx, mock_bridge):
+        """A literal None for 'after' would read as a node path to the handler."""
+        await edit_points(mock_ctx, moves=[{"point": 0, "delta": [0, 1, 0]}], after="/obj/geo1/g")
+        _command, params = mock_bridge.execute.call_args.args
+        assert set(params) == {"moves", "force", "after"}
+
+    @pytest.mark.asyncio
+    async def test_schema_types_every_parameter(self):
+        from fxhoudinimcp.server import mcp
+
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        schema = tool_input_schema(tools["edit_points"])
+        properties = schema["properties"]
+        assert set(properties) >= {
+            "moves",
+            "after",
+            "edit_node",
+            "name",
+            "expect_points",
+            "force",
+        }
+        assert properties["moves"]["type"] == "array"
+        assert properties["force"]["type"] == "boolean"

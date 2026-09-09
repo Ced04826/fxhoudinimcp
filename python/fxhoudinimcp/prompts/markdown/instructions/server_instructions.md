@@ -1,4 +1,4 @@
-MCP server for SideFX Houdini with 189 tools across 24 categories.
+MCP server for SideFX Houdini with 190 tools across 24 categories.
 
 ## SENIOR ARTIST DISCIPLINE — work like a Houdini veteran, not a script kid
 
