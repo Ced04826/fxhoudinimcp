@@ -1,4 +1,4 @@
-"""MCP tools for polygon modeling checks."""
+"""MCP tools for polygon modeling checks and control-point edits."""
 
 from __future__ import annotations
 
@@ -43,3 +43,43 @@ async def get_mesh_report(
     if dump_path is not None:
         params["dump_path"] = dump_path
     return await bridge.execute("modeling.get_mesh_report", params)
+
+
+@mcp.tool()
+async def edit_points(
+    ctx: Context,
+    moves: list[dict[str, Any]],
+    after: str | None = None,
+    edit_node: str | None = None,
+    name: str | None = None,
+    expect_points: int | None = None,
+    force: bool = False,
+) -> dict:
+    """Move points of a SOP through an Edit node in one call.
+
+    Entries: {"point": n, "to"|"delta": [x,y,z]} or {"group": g, "delta": ...}.
+    Coordinates are SOP-local. The receipt gives read-back positions, not
+    requested ones. It refuses, changing nothing, if the input changed.
+
+    Args:
+        moves: Point or group moves (above).
+        after: SOP to create the Edit below.
+        edit_node: Existing Edit SOP to update.
+        name: Name for the new Edit (with after).
+        expect_points: Refuse unless input has this count.
+        force: Rebase onto a changed input.
+    """
+    bridge = _get_bridge(ctx)
+    params: dict[str, Any] = {
+        "moves": moves,
+        "force": force,
+    }
+    if after is not None:
+        params["after"] = after
+    if edit_node is not None:
+        params["edit_node"] = edit_node
+    if name is not None:
+        params["name"] = name
+    if expect_points is not None:
+        params["expect_points"] = expect_points
+    return await bridge.execute("modeling.edit_points", params)
