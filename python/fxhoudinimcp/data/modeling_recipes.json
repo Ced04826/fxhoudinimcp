@@ -14,10 +14,9 @@
       },
       "target": "Generator, no input group; tx/ty/tz move the box centre, sizex/sizey/sizez set extent.",
       "output_groups": [],
-      "notes": "divisions takes any integer and stays all-quad. bevel_crease_mode is a toggle, not a menu.",
+      "notes": "divisions takes any integer and stays all-quad, with the bevel built in. bevel_crease_mode is a toggle, not a menu. A native box only gives a divided quad surface with type=polymesh; type=poly plus dodivs yields a lattice of open polylines.",
       "native_parms": {
-        "box": {},
-        "subdivide": {"algorithm": "osdbilinear", "iterations": 1},
+        "box": {"type": "polymesh", "dodivs": 1, "divrate": [3, 3, 3]},
         "polybevel::3.0": {"group": "", "grouptype": "guess", "offset": 0.08, "filletshape": "round", "divisions": 2}
       }
     },
