@@ -16,6 +16,7 @@ import pytest
 # Internal
 from fxhoudinimcp.prompts.workflows import (
     debug_scene,
+    direct_modeling_workflow,
     hda_development,
     pdg_pipeline,
     procedural_modeling_workflow,
@@ -46,8 +47,12 @@ class TestPromptTemplates:
             (lambda: pdg_pipeline("wedge 10 variants"), "wedge 10 variants"),
             (lambda: hda_development("a rock generator"), "rock generator"),
             (lambda: debug_scene("slow cooking"), "slow cooking"),
+            (
+                lambda: direct_modeling_workflow("a seat bracket cage", "/obj/geo1/ref"),
+                "seat bracket cage",
+            ),
         ],
-        ids=["procedural", "usd", "simulation", "pdg", "hda", "debug"],
+        ids=["procedural", "usd", "simulation", "pdg", "hda", "debug", "direct_modeling"],
     )
     def test_prompt_renders_completely(self, render, marker):
         text = render()

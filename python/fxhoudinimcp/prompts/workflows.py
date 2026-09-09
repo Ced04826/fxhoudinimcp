@@ -58,6 +58,30 @@ def procedural_modeling_workflow(
 
 
 @mcp.prompt()
+def direct_modeling_workflow(
+    description: str,
+    reference: str = "none",
+) -> str:
+    """Guide for direct polygon modeling: cages, reference rebuilds, retopology.
+
+    Distinct from procedural_modeling_workflow (kit-bashing from primitives):
+    this is the contract for hand-shaped quad meshes driven through the
+    modeling tools (get_mesh_report, edit_points, compare_geometry,
+    render_views, verify_reload, modeling_recipe), with the node choices
+    verified against Houdini 22.0 and the Modeler plugin.
+
+    Args:
+        description: The part to model and what it must match
+        reference: Path of the reference SOP or file, if any
+    """
+    return load_markdown(
+        "workflows/model_direct.md",
+        description=description,
+        reference=reference or "none",
+    )
+
+
+@mcp.prompt()
 def usd_scene_assembly(
     scene_description: str,
 ) -> str:

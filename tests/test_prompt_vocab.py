@@ -71,6 +71,7 @@ _FILE_CONTEXTS = {
     "anim.md": ["Sop", "Chop"],
     "ml.md": ["Sop", "Top"],
     "troubleshooting.md": ["Sop", "Lop", "Dop"],
+    "model_direct.md": ["Sop"],
 }
 
 
