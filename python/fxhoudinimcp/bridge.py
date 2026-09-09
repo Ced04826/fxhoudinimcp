@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 INLINE_RPC_LIMIT = 1500
 TUNNEL_DIRECTORY = "fxhoudinimcp"
 
+# Characters that do not survive the inline query path. hwebserver decodes the
+# query string a second time after the transport already has, so a literal "+"
+# arrives as a space and a "%" followed by two hex digits is re-expanded: on
+# 22.0.368 the code ``x = 1 + 2`` reached execute_python as ``x = 1   2`` and a
+# ``+=`` in a wrangle silently became ``=``. The file tunnel is read verbatim,
+# so any payload containing these goes through it regardless of size.
+_INLINE_UNSAFE = ("+", "%")
+
 
 def _rpc_payload(func_name: str, **kwargs: Any) -> str:
     """Build the compact JSON payload understood by ``/fxapi``."""
@@ -38,7 +46,8 @@ def _rpc_payload(func_name: str, **kwargs: Any) -> str:
 
 def _rpc_query(payload: str) -> tuple[dict[str, str], Path | None]:
     """Return query parameters and an optional single-use payload file."""
-    if len(urlencode({"json": payload})) <= INLINE_RPC_LIMIT:
+    inline_safe = not any(ch in payload for ch in _INLINE_UNSAFE)
+    if inline_safe and len(urlencode({"json": payload})) <= INLINE_RPC_LIMIT:
         return {"json": payload}, None
 
     directory = Path(tempfile.gettempdir()) / TUNNEL_DIRECTORY
