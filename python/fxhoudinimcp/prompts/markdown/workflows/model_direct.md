@@ -35,9 +35,9 @@ Reference: {reference}
 ## One step, one round trip
 
 1. Design the step. The table below decides the node. For parameter names and
-   menu tokens use `get_node_card`; once you know which node you want, pass
-   `include_help=False` with a `parm_filter` and the card costs a few hundred
-   characters instead of several thousand.
+   menu tokens use `get_node_card` with a `parm_filter`: it leaves out the
+   shipped help by default, so the card costs a few hundred characters. Ask for
+   `include_help=True` only when the names leave you stuck.
 2. Three or more nodes: one `build_network` call; `dry_run=True` first for an
    unfamiliar type.
 3. Point moves: `edit_points` — `after` creates an intent-named Edit,
