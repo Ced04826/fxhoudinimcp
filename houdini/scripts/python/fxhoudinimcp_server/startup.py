@@ -10,7 +10,6 @@ import json
 import os
 import threading
 import time
-import urllib.parse
 import urllib.request
 
 _server_started = False
@@ -19,12 +18,14 @@ _port = 8100
 # True while an auto-start readiness check is still in flight on a worker
 # thread, so a menu click during startup does not start a second server.
 _starting = False
+_server_thread = None
+_last_run_error = None
 
 # Ceiling for the readiness poll. A healthy start answers in well under a
 # second, since mcp.health needs nothing from the main thread; the old 3s was
 # tight only because the health endpoint used to deadlock against this very
 # loop. Generous now that auto-start no longer waits on the main thread.
-_READINESS_TIMEOUT = 15.0
+_READINESS_TIMEOUT = 30.0
 
 # How many ports to try from the configured base. A second Houdini used to fail
 # outright with "port 8100 is owned by another Houdini process", leaving that
@@ -34,20 +35,11 @@ _PORT_SEARCH_RANGE = 16
 
 
 def _health_url(port: int) -> str:
-    return f"http://127.0.0.1:{port}/api"
-
-
-def _health_body() -> bytes:
-    return urllib.parse.urlencode({"json": json.dumps(["mcp.health", [], {}])}).encode("utf-8")
+    return f"http://127.0.0.1:{port}/fxapi?json=%5B%22mcp.health%22%2C%5B%5D%2C%7B%7D%5D"
 
 
 def _query_health(port: int, timeout: float = 0.5) -> dict | None:
-    request = urllib.request.Request(
-        _health_url(port),
-        data=_health_body(),
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
+    request = urllib.request.Request(_health_url(port), method="GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read().decode("utf-8")
@@ -163,7 +155,7 @@ def start(
             would stall Houdini's UI; readiness is then confirmed on a worker
             thread and failure is printed rather than raised.
     """
-    global _server_started, _port, _starting
+    global _server_started, _port, _starting, _server_thread, _last_run_error
 
     if _server_started:
         print("[fxhoudinimcp] Server already running")
@@ -183,7 +175,9 @@ def start(
             f"if you pin it."
         )
 
-    # Import handlers to trigger registration via register_handler() calls
+    _last_run_error = None
+
+    # Import handlers to trigger registration via register_handler() calls.
     # Start hwebserver if not already running. In Houdini 20.5+ it may already
     # be running for built-in features; in that case registering the functions
     # above is enough. Either way, prove the HTTP endpoint is reachable before
@@ -191,11 +185,7 @@ def start(
     import hou
     import hwebserver
 
-    # Import hwebserver_app to register the API functions
-    from fxhoudinimcp_server import (
-        handlers,  # noqa: F401
-        hwebserver_app,  # noqa: F401
-    )
+    from fxhoudinimcp_server import handlers  # noqa: F401
 
     if background is None:
         # hwebserver.run() already defaults in_background to isUIAvailable(),
@@ -205,8 +195,37 @@ def start(
         # is what keeps the process alive to serve.
         background = hou.isUIAvailable()
 
-    _bind_localhost_only(hwebserver)
+    if hasattr(hwebserver, "THREAD_SERVER"):
+        # H22 stores registration and server state in threading.local().  A UI
+        # session also owns a built-in server on the main thread, so our routes
+        # must be registered and served by one fresh, dedicated owner thread.
+        # Run in the foreground there: hwebserver must not create yet another
+        # thread whose fresh local Server would have no registered handlers.
+        _starting = True
+        _server_thread = threading.Thread(
+            target=_run_thread_local_server,
+            args=(_port,),
+            name="fxhoudinimcp-hwebserver",
+            daemon=True,
+        )
+        _server_thread.start()
+        if wait:
+            try:
+                _confirm_ready(None)
+            finally:
+                # A slow or failed first start must remain retryable from the
+                # menu.  H22 GUI initialization has been observed completing
+                # just after the old 15 s ceiling.
+                _starting = False
+        else:
+            worker = threading.Thread(target=_confirm_ready_async, args=(None,), daemon=True)
+            worker.start()
+        return
 
+    # Pre-H22 uses process-global registration state.
+    from fxhoudinimcp_server import hwebserver_app  # noqa: F401
+
+    _bind_localhost_only(hwebserver)
     run_error = None
     try:
         hwebserver.run(_port, debug=False, in_background=background)
@@ -239,6 +258,29 @@ def start(
         raise
 
 
+def _run_thread_local_server(port: int) -> None:
+    """Own H22 registration and serving on the same dedicated thread."""
+    global _last_run_error
+    try:
+        import importlib
+        import sys
+
+        import hwebserver
+
+        # The module may have been imported by tests or a manual retry on a
+        # different thread.  Reloading replays every decorator for this
+        # thread's fresh hwebserver.Server.
+        module_name = "fxhoudinimcp_server.hwebserver_app"
+        if module_name in sys.modules:
+            importlib.reload(sys.modules[module_name])
+        else:
+            importlib.import_module(module_name)
+        _bind_localhost_only(hwebserver)
+        hwebserver.run(port, debug=False, in_background=False)
+    except Exception as exc:
+        _last_run_error = exc
+
+
 def _confirm_ready(run_error: Exception | None) -> None:
     """Poll until the server answers as this process, then mark it running.
 
@@ -249,7 +291,8 @@ def _confirm_ready(run_error: Exception | None) -> None:
     health = _wait_for_current_process_health(_port)
     if health is None:
         _server_started = False
-        detail = f": {run_error}" if run_error is not None else ""
+        error = run_error or _last_run_error
+        detail = f": {error}" if error is not None else ""
         raise RuntimeError(f"hwebserver did not answer mcp.health on port {_port}{detail}")
 
     health_pid = health.get("pid")

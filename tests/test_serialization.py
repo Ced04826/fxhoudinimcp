@@ -9,7 +9,7 @@ import sys
 from unittest.mock import MagicMock
 
 # Internal
-from fxhoudinimcp.bridge import _rpc_body
+from fxhoudinimcp.bridge import _rpc_payload
 
 # Mock `hou` before importing Houdini-side helpers
 sys.modules.setdefault("hou", MagicMock())
@@ -22,24 +22,23 @@ from fxhoudinimcp_server.handlers.code_handlers import (  # noqa: E402
 )
 
 
-class TestRpcBody:
+class TestRpcPayload:
     def test_with_kwargs(self):
-        body = _rpc_body("mcp.execute", command="test", params={"a": 1})
-        parsed = json.loads(body["json"])
+        payload = _rpc_payload("mcp.execute", command="test", params={"a": 1})
+        parsed = json.loads(payload)
         assert parsed[0] == "mcp.execute"
         assert parsed[1] == []
         assert parsed[2] == {"command": "test", "params": {"a": 1}}
 
     def test_no_kwargs(self):
-        body = _rpc_body("mcp.health")
-        parsed = json.loads(body["json"])
+        payload = _rpc_payload("mcp.health")
+        parsed = json.loads(payload)
         assert parsed == ["mcp.health", [], {}]
 
-    def test_returns_dict_with_json_key(self):
-        body = _rpc_body("fn")
-        assert isinstance(body, dict)
-        assert "json" in body
-        assert isinstance(body["json"], str)
+    def test_returns_compact_json_string(self):
+        payload = _rpc_payload("fn")
+        assert isinstance(payload, str)
+        assert payload == '["fn",[],{}]'
 
 
 class TestTruncateOutput:

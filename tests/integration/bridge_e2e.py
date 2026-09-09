@@ -65,6 +65,21 @@ async def _exercise(port: int) -> None:
         assert listed["count"] == 1, listed
         print("[e2e] node created and found through the bridge: ok")
 
+        # Force the request direction through the temp-file tunnel.  Houdini
+        # 22 UI sessions stop dispatching when handlers touch request bodies,
+        # and query strings become unreliable at a few KiB, so this is a
+        # distinct transport path rather than just a size stress test.
+        marker = "x" * 5000
+        tunneled = await bridge.execute(
+            "code.execute_python",
+            {
+                "code": f"marker = {marker!r}",
+                "return_expression": "len(marker)",
+            },
+        )
+        assert "5000" in str(tunneled), tunneled
+        print("[e2e] large request crossed the single-use file tunnel: ok")
+
         big = await bridge.execute("nodes.list_node_types", {"context": "Sop", "limit": 5000})
         assert big["total_count"] > 200
         print(f"[e2e] large payload ({big['total_count']} types) serialized: ok")
@@ -123,7 +138,7 @@ def main() -> int:
             if time.time() >= deadline:
                 raise RuntimeError("server never became reachable")
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{port}/api", timeout=0.5)
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/fxapi", timeout=0.5)
                 break
             except urllib.error.HTTPError:
                 break
