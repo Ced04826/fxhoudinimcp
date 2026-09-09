@@ -21,6 +21,7 @@ from fxhoudinimcp.tools import (
     help,  # noqa: F401
     lops,  # noqa: F401
     materials,  # noqa: F401
+    modeling,  # noqa: F401
     nodes,  # noqa: F401
     parameters,  # noqa: F401
     rendering,  # noqa: F401
