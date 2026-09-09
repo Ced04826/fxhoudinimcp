@@ -28,6 +28,7 @@ _HANDLER_MODULES = [
     "rendering_handlers",
     "viewport_handlers",
     "geometry_handlers",
+    "modeling_handlers",
     "lops_handlers",
     "top_handlers",
     "cop_handlers",
