@@ -82,27 +82,28 @@ async def get_node_card(
     node_type: str,
     context: str = "Sop",
     parm_filter: str | None = None,
-    include_help: bool = True,
+    include_help: bool = False,
 ) -> dict:
     """Get the authoritative documentation card for a node type, straight
-    from the running Houdini: real connector labels, real parameter
-    names/defaults/menus, and the node's own shipped help text.
+    from the running Houdini: real connector labels and real parameter
+    names, defaults and menu tokens.
 
     Use this BEFORE setting parameters on a node type you have not used
     in this session — never guess parameter names. Unversioned names
-    resolve to the newest version.
+    resolve to the newest version. Narrow the list with parm_filter.
 
-    When you only need parameter names and menu tokens, pass
-    include_help=False and a parm_filter: the help text alone runs to
-    5 000 characters, and dropping it turns the card into a couple of
-    hundred. Keep the help when you need to know what the node does.
+    The node's shipped help text is NOT included by default, because it
+    alone runs to 5 000 characters and most calls only need the parameter
+    names. Pass include_help=True when the names are not enough — when you
+    are stuck on what the node actually does, what a menu token means, or
+    which of several parameters governs the behaviour you want.
 
     Args:
         node_type: Type name (e.g. "scatter", "rbdbulletsolver").
         context: Category — "Sop", "Lop", "Dop", "Cop", "Chop", "Top",
             "Object", "Driver".
         parm_filter: Substring filter for the parameter list.
-        include_help: Include the node's shipped help text.
+        include_help: Add the node's shipped help text. Off by default.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {
