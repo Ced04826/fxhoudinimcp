@@ -555,7 +555,7 @@ server's own bridge).
 
 ### How It Works
 
-1. **Houdini Plugin** (`houdini/`): Runs inside Houdini's Python environment. Registers `@hwebserver.apiFunction` endpoints that receive JSON commands. Uses `hdefereval.executeInMainThreadWithResult()` to safely execute `hou.*` calls on the main thread.
+1. **Houdini Plugin** (`houdini/`): Runs inside Houdini's Python environment. Registers a body-free `GET /fxapi` URL handler; small JSON commands use the query string and large commands use a single-use local temp file. Uses `hdefereval.executeInMainThreadWithResult()` to safely execute `hou.*` calls on the main thread. On H22, route registration and serving share one dedicated owner thread because `hwebserver` state is thread-local.
 
 2. **MCP Server** (`python/fxhoudinimcp/`): A standalone Python process using FastMCP. Exposes 188 tools, 8 resources, and 9 prompts via the MCP protocol. Forwards tool calls to Houdini over HTTP.
 

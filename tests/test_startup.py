@@ -162,7 +162,7 @@ def test_start_declines_while_a_start_is_in_flight(monkeypatch, capsys):
 
 def test_readiness_timeout_is_generous_now_that_it_is_off_thread():
     """Off the main thread the ceiling costs nothing, so do not keep it tight."""
-    assert startup._READINESS_TIMEOUT >= 15.0
+    assert startup._READINESS_TIMEOUT >= 30.0
 
 
 ###### Concurrent Houdini sessions (idea from @husman2012, PR #13)

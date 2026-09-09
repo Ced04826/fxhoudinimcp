@@ -1,11 +1,14 @@
 """hwebserver endpoint registration for the FXHoudini-MCP plugin.
 
-Registers API functions on Houdini's built-in HTTP server that the
+Registers a custom URL handler on Houdini's built-in HTTP server that the
 external MCP server communicates with over HTTP.
 
 Calling convention (JSON-encoded RPC):
-    POST /api
-    Body: json=["mcp.execute", [], {"command": "...", "params": {...}, "request_id": "..."}]
+    GET /fxapi?json=["mcp.execute", [], {"command": "...", ...}]
+
+Large requests use ``?file=...`` and are read once from the guarded
+``%TEMP%/fxhoudinimcp`` directory.  This avoids two Houdini 22 UI bugs: the
+built-in web API shadows ``/api``, and request bodies are not readable.
 
 Responses are JSON-encoded here rather than left to hwebserver, so that a
 value HOM cannot serialise degrades instead of collapsing into an opaque 500.
@@ -16,7 +19,9 @@ from __future__ import annotations
 # Built-in
 import json
 import os
+import tempfile
 import traceback
+from pathlib import Path
 
 # Third-party
 import hwebserver
@@ -26,6 +31,9 @@ from fxhoudinimcp_server import dispatcher
 from fxhoudinimcp_server.serialize import json_default
 
 ###### Registration
+
+TUNNEL_DIRECTORY = "fxhoudinimcp"
+MAX_TUNNEL_BYTES = 64 * 1024 * 1024
 
 
 def _api_function(namespace: str):
@@ -43,6 +51,16 @@ def _api_function(namespace: str):
 
     def decorator(function):
         hwebserver.apiFunction(namespace=namespace)(function)
+        return function
+
+    return decorator
+
+
+def _url_handler(path: str):
+    """Register a URL handler without losing the decorated function."""
+
+    def decorator(function):
+        hwebserver.urlHandler(path)(function)
         return function
 
     return decorator
@@ -71,6 +89,34 @@ def _json_response(payload: dict) -> hwebserver.Response:
             }
         )
     return hwebserver.Response(body.encode("utf-8"), 200, "application/json")
+
+
+def _query_value(request, name: str) -> str | None:
+    value = request.GET().get(name)
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    return value if isinstance(value, str) else None
+
+
+def _read_tunnel_file(filename: str) -> str:
+    """Read and delete a payload file, refusing paths outside our temp root."""
+    root = (Path(tempfile.gettempdir()) / TUNNEL_DIRECTORY).resolve()
+    path = Path(filename).resolve(strict=True)
+    if os.path.commonpath((str(root), str(path))) != str(root):
+        raise ValueError("Payload file is outside the fxhoudinimcp temp directory")
+    if path.suffix != ".json" or not path.name.startswith("rpc-"):
+        raise ValueError("Payload file name is not an fxhoudinimcp RPC file")
+    try:
+        size = path.stat().st_size
+        if size > MAX_TUNNEL_BYTES:
+            raise ValueError(f"Payload file exceeds {MAX_TUNNEL_BYTES} bytes")
+        return path.read_text(encoding="utf-8")
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _rpc_error(code: str, message: str) -> hwebserver.Response:
+    return _json_response({"status": "error", "error": {"code": code, "message": message}})
 
 
 ###### Endpoints
@@ -129,3 +175,37 @@ def session_info(request):
 def list_commands(request):
     """List all registered command names for introspection."""
     return {"commands": dispatcher.list_commands()}
+
+
+@_url_handler("/fxapi")
+def fxapi(request):
+    """Body-free RPC endpoint compatible with graphical Houdini 22 sessions."""
+    inline = _query_value(request, "json")
+    filename = _query_value(request, "file")
+    if bool(inline) == bool(filename):
+        return _rpc_error("INVALID_REQUEST", "Provide exactly one of 'json' or 'file'")
+
+    try:
+        raw = inline if inline is not None else _read_tunnel_file(filename)
+        call = json.loads(raw)
+        if not isinstance(call, list) or len(call) != 3:
+            raise ValueError("RPC payload must be [function, args, kwargs]")
+        function_name, args, kwargs = call
+        if not isinstance(function_name, str):
+            raise ValueError("RPC function name must be a string")
+        if not isinstance(args, list) or not isinstance(kwargs, dict):
+            raise ValueError("RPC args and kwargs must be a list and object")
+
+        functions = {
+            "mcp.execute": execute,
+            "mcp.health": health,
+            "mcp.session_info": session_info,
+            "mcp.list_commands": list_commands,
+        }
+        function = functions.get(function_name)
+        if function is None:
+            return _rpc_error("UNKNOWN_RPC_FUNCTION", f"Unknown RPC function: {function_name}")
+        result = function(request, *args, **kwargs)
+        return result if isinstance(result, hwebserver.Response) else _json_response(result)
+    except Exception as exc:
+        return _rpc_error("INVALID_REQUEST", f"{type(exc).__name__}: {exc}")

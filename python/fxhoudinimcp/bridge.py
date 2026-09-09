@@ -1,12 +1,9 @@
 """HTTP bridge connecting the MCP server to Houdini's hwebserver.
 
-Houdini's hwebserver uses an RPC-style calling convention:
-
-    POST /api
-    Content-Type: application/x-www-form-urlencoded
-    Body: json=["namespace.function", [positional_args], {keyword_args}]
-
-The server returns the function's return value JSON-encoded.
+Houdini 22 UI sessions reserve ``/api`` and cannot reliably read request
+bodies.  The plugin therefore exposes a body-free RPC endpoint at ``/fxapi``:
+small JSON payloads travel in the query string and larger payloads travel via
+a single-use file in the local temporary directory.
 """
 
 from __future__ import annotations
@@ -14,8 +11,12 @@ from __future__ import annotations
 # Built-in
 import json
 import logging
+import os
+import tempfile
 import uuid
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 # Third-party
 import httpx
@@ -26,9 +27,31 @@ from fxhoudinimcp.errors import ConnectionError, HoudiniCommandError
 logger = logging.getLogger(__name__)
 
 
-def _rpc_body(func_name: str, **kwargs: Any) -> dict[str, str]:
-    """Build form data for an hwebserver JSON-encoded RPC call."""
-    return {"json": json.dumps([func_name, [], kwargs])}
+INLINE_RPC_LIMIT = 1500
+TUNNEL_DIRECTORY = "fxhoudinimcp"
+
+
+def _rpc_payload(func_name: str, **kwargs: Any) -> str:
+    """Build the compact JSON payload understood by ``/fxapi``."""
+    return json.dumps([func_name, [], kwargs], separators=(",", ":"))
+
+
+def _rpc_query(payload: str) -> tuple[dict[str, str], Path | None]:
+    """Return query parameters and an optional single-use payload file."""
+    if len(urlencode({"json": payload})) <= INLINE_RPC_LIMIT:
+        return {"json": payload}, None
+
+    directory = Path(tempfile.gettempdir()) / TUNNEL_DIRECTORY
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, filename = tempfile.mkstemp(prefix="rpc-", suffix=".json", dir=directory)
+    path = Path(filename)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            stream.write(payload)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return {"file": str(path)}, path
 
 
 # Matches the plugin's own search range: a second Houdini moves itself to the
@@ -55,8 +78,8 @@ async def find_servers(
     async with httpx.AsyncClient(timeout=timeout) as client:
         for port in range(base, base + max_tries):
             try:
-                response = await client.post(
-                    f"http://{host}:{port}/api", data=_rpc_body("mcp.health")
+                response = await client.get(
+                    f"http://{host}:{port}/fxapi", params={"json": _rpc_payload("mcp.health")}
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -70,8 +93,8 @@ async def find_servers(
 class HoudiniBridge:
     """Manages HTTP communication between the MCP server and Houdini's hwebserver.
 
-    Houdini's hwebserver exposes @apiFunction endpoints via a single /api URL.
-    Calls are dispatched by function name inside the JSON-encoded body.
+    Calls use the plugin's ``/fxapi`` URL handler so they also work in H22 UI
+    sessions, where Houdini shadows the built-in ``/api`` endpoint.
     """
 
     def __init__(self, host: str = "localhost", port: int = 8100, timeout: float = 60.0):
@@ -81,7 +104,7 @@ class HoudiniBridge:
 
     @property
     def _api_url(self) -> str:
-        return f"{self.base_url}/api"
+        return f"{self.base_url}/fxapi"
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -95,12 +118,12 @@ class HoudiniBridge:
         self._client = httpx.AsyncClient(timeout=self.timeout)
         return self._client
 
-    async def _post(
+    async def _request(
         self,
-        data: dict[str, Any],
+        payload: str,
         timeout: float | None = None,
     ) -> httpx.Response:
-        """POST to the bridge, retrying once past a dead pooled connection.
+        """GET from the bridge, retrying once past a dead pooled connection.
 
         Houdini closes its side of the keep-alive connections when it exits,
         so the first request after a Houdini restart reuses a socket that is
@@ -112,13 +135,24 @@ class HoudiniBridge:
         # configured timeout rather than passing None straight through.
         effective = self.timeout if timeout is None else timeout
 
+        params, tunnel_file = _rpc_query(payload)
         client = await self._get_client()
         try:
-            return await client.post(self._api_url, data=data, timeout=effective)
-        except httpx.RemoteProtocolError:
-            logger.info("Stale connection to Houdini; reconnecting.")
-            client = await self._reset_client()
-            return await client.post(self._api_url, data=data, timeout=effective)
+            try:
+                return await client.get(self._api_url, params=params, timeout=effective)
+            except httpx.RemoteProtocolError:
+                logger.info("Stale connection to Houdini; reconnecting.")
+                # A file removed by the server may already have executed.  Do
+                # not replay that mutation with a now-missing payload.  If the
+                # file still exists, the stale connection died before Houdini
+                # consumed it and one reconnect is safe.
+                if tunnel_file is not None and not tunnel_file.exists():
+                    raise
+                client = await self._reset_client()
+                return await client.get(self._api_url, params=params, timeout=effective)
+        finally:
+            if tunnel_file is not None:
+                tunnel_file.unlink(missing_ok=True)
 
     async def execute(
         self,
@@ -144,8 +178,8 @@ class HoudiniBridge:
         logger.info("→ Houdini: %s", command)
 
         try:
-            response = await self._post(
-                _rpc_body(
+            response = await self._request(
+                _rpc_payload(
                     "mcp.execute",
                     command=command,
                     params=params or {},
@@ -217,7 +251,7 @@ class HoudiniBridge:
             Dict with status, pid and houdini_version.
         """
         try:
-            response = await self._post(_rpc_body("mcp.health"))
+            response = await self._request(_rpc_payload("mcp.health"))
             response.raise_for_status()
             return response.json()
         except httpx.TransportError as e:
@@ -239,7 +273,7 @@ class HoudiniBridge:
         dispatcher is missing commands.
         """
         try:
-            response = await self._post(_rpc_body("mcp.list_commands"))
+            response = await self._request(_rpc_payload("mcp.list_commands"))
             response.raise_for_status()
             payload = response.json()
         except httpx.TransportError as e:
