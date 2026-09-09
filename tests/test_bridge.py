@@ -46,6 +46,24 @@ class TestRPCTransport:
             if path is not None:
                 path.unlink(missing_ok=True)
 
+    @pytest.mark.parametrize("code", ["x = 1 + 2", "s = '%2B'", "@P += @N * 0.1;"])
+    def test_plus_and_percent_never_travel_inline(self, code):
+        """hwebserver decodes the query string twice, so ``+`` arrives as a space.
+
+        Verified on 22.0.368: the one-line ``x = 1 + 2`` reached execute_python as
+        ``x = 1   2``. Payloads carrying these characters must take the file
+        tunnel, which is read verbatim, however short they are.
+        """
+        payload = _rpc_payload("mcp.execute", command="code.execute_python", params={"code": code})
+        params, path = _rpc_query(payload)
+        try:
+            assert path is not None, "payload with '+' or '%' went inline"
+            assert params == {"file": str(path)}
+            assert json.loads(path.read_text(encoding="utf-8"))[2]["params"]["code"] == code
+        finally:
+            if path is not None:
+                path.unlink(missing_ok=True)
+
 
 class TestExecute:
     @pytest.fixture
