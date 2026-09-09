@@ -6,6 +6,20 @@ from "the call succeeded".
 Task: {description}
 Reference: {reference}
 
+## Before the first node
+
+1. `get_houdini_connection_status`, then `get_scene_info` for the hip path and
+   version. If Houdini is unreachable, say so and wait: never start or close it
+   yourself.
+2. Ask the user for what you cannot infer, rather than assuming: which part and
+   where its reference lives; whether the deliverable is a game-res mesh, an
+   editable quad working mesh or a SubD control cage; the face budget and error
+   budget; the holes, slots, thicknesses and contact faces that must survive.
+3. Build inside a part-named subnet under the parent the user names. The
+   reference stays on a sibling null, read-only. Never scan all of `/obj`.
+4. Leave alone whatever the user is editing by hand, and take a
+   `get_mesh_report` baseline before touching anything that already exists.
+
 ## Work unit and naming
 
 - One subnet per part (`<PART>_NATIVE_REBUILD`); the reference stays on a
