@@ -1,0 +1,378 @@
+{
+  "verified_on": "22.0.368",
+  "recipes": {
+    "qbox": {
+      "preferred": "modeler::qbox",
+      "alternative": "box",
+      "parms": {
+        "divisions": 2,
+        "sizex": 1.0,
+        "sizey": 1.0,
+        "sizez": 1.0,
+        "bevel_offset": 0.08,
+        "bevel_divisions": 2
+      },
+      "target": "Generator, no input group; tx/ty/tz move the box centre, sizex/sizey/sizez set extent.",
+      "output_groups": [],
+      "notes": "divisions takes any integer and stays all-quad. bevel_crease_mode is a toggle, not a menu.",
+      "native_parms": {
+        "box": {},
+        "subdivide": {"algorithm": "osdbilinear", "iterations": 1},
+        "polybevel::3.0": {"group": "", "grouptype": "guess", "offset": 0.08, "filletshape": "round", "divisions": 2}
+      }
+    },
+
+    "extrude_faces": {
+      "preferred": "polyextrude::2.0",
+      "alternative": "modeler::extrude",
+      "parms": {
+        "group": "top",
+        "dist": 0.3,
+        "inset": 0.1,
+        "outputfrontgrp": 1,
+        "outputsidegrp": 1,
+        "outputback": 0,
+        "preservegroups": 1
+      },
+      "target": "group is a primitive group; accepts an upstream group name or an inline list like \"0 3-5\".",
+      "output_groups": ["extrudeFront", "extrudeBack", "extrudeSide", "extrudeFrontSeam", "extrudeBackSeam"],
+      "notes": "Output identical to modeler::extrude (same P hash). Division parm is divs here, divisions on the modeler node.",
+      "native_parms": null
+    },
+
+    "insert_loop": {
+      "preferred": "modeler::loop_slice",
+      "alternative": "polysplit::2.0",
+      "parms": {
+        "group": "p0-1",
+        "loops": 1,
+        "mode": 0,
+        "outputgroup": 1,
+        "groupname": "loop_cut"
+      },
+      "target": "group is an edge group; give ONE edge the new loop should cross, as \"p<a>-<b>\" or an upstream edge group name.",
+      "output_groups": ["loop_cut"],
+      "notes": "mode 0 ignores dist/ratio; modes 1 and 2 insert two loops at once. For a single loop at an arbitrary ratio use polysplit edgepercent.",
+      "native_parms": {
+        "splitloc": "p0-1",
+        "pathtype": "quadcut",
+        "numloops": 1,
+        "edgepercenttoggle": 1,
+        "edgepercent": 0.25,
+        "grouptoggle": 1,
+        "groupname": "splitPathGroup"
+      }
+    },
+
+    "connect": {
+      "preferred": "modeler::connect",
+      "alternative": "polysplit::2.0",
+      "parms": {
+        "group": "p0-1 p4-5 p8-9 p12-13",
+        "grouptype": "edge",
+        "divisions": 1,
+        "outputgroup": 1,
+        "groupname": "connect"
+      },
+      "target": "grouptype token edge|point|primitive. Edge mode: list the ring edges to cut across (inline or group name). Point mode: two points on one face.",
+      "output_groups": ["connect"],
+      "notes": "Edge-ring mode stays all-quad. Non-adjacent points or edges give a silent no-op or n-gons, so re-read the prim count.",
+      "native_parms": {
+        "pathtype": "shortest",
+        "splitloc": "p0-1:0 p4-5:1",
+        "grouptoggle": 1,
+        "groupname": "splitPathGroup"
+      }
+    },
+
+    "bridge": {
+      "preferred": "polybridge",
+      "alternative": "modeler::bridge",
+      "parms": {
+        "srcgroup": "p0-1 p1-2 p2-3 p3-4 p4-5 p5-6 p6-7 p0-7",
+        "dstgroup": "p24-25 p25-26 p26-27 p27-28 p28-29 p29-30 p30-31 p24-31",
+        "divisions": 3,
+        "usemeshprimgroup": 1,
+        "meshprimgroup": "bridgemeshprims"
+      },
+      "target": "srcgroup/dstgroup are edge groups naming the two boundary loops; inline \"p<a>-<b>\" lists work.",
+      "output_groups": ["bridgemeshprims", "bridgespinepts", "pairlinkedges"],
+      "notes": "Output identical to modeler::bridge (same counts). Output group toggles default to off on the native node.",
+      "native_parms": null
+    },
+
+    "fill_hole": {
+      "preferred": "polyfill",
+      "alternative": null,
+      "parms": {
+        "group": "p6-7 p7-8 p8-12 p12-17 p16-17 p15-16 p11-15 p6-11",
+        "fillmode": "quads",
+        "completeloops": 1,
+        "patchgrouptoggle": 1,
+        "patchgroup": "patch"
+      },
+      "target": "group is the edge group of the hole boundary; inline \"p<a>-<b>\" list or an upstream edge group name.",
+      "output_groups": ["patch", "loopgroup"],
+      "notes": "fillmode tokens none|tris|trifan|quadfan|quads|gridquads. modeler::fill_quads cannot do this, it silently ignores edge and point groups.",
+      "native_parms": null
+    },
+
+    "requad_ngon": {
+      "preferred": "modeler::fill_quads",
+      "alternative": "polyfill",
+      "parms": {
+        "group": "12",
+        "grouptype": "primitive",
+        "mode": "4",
+        "outputgroup": 1,
+        "groupname": "fill_quads"
+      },
+      "target": "group is a PRIMITIVE group of the faces to be replaced by a quad patch; boundary point count must be a multiple of 4.",
+      "output_groups": ["fill_quads"],
+      "notes": "mode tokens \"5\" grid, \"4\" quads, \"3\" fan. Edge or point grouptype is a silent no-op.",
+      "native_parms": {"group": "<hole edge group>", "fillmode": "quads"}
+    },
+
+    "bevel_edges": {
+      "preferred": "polybevel::3.0",
+      "alternative": "modeler::bevel",
+      "parms": {
+        "group": "",
+        "grouptype": "guess",
+        "offset": 0.1,
+        "filletshape": "round",
+        "divisions": 2,
+        "useptfilletgroup": 1,
+        "ptfilletgroup": "pointfilletpolys",
+        "useoffsetedges": 1,
+        "offsetedges": "offsetedges"
+      },
+      "target": "group is an edge group (inline \"p<a>-<b>\" or a name); empty group plus ignoreflatedges=1 means only sharp edges get beveled.",
+      "output_groups": ["pointfilletpolys", "offsetedges"],
+      "notes": "filletshape tokens none|solid|crease|chamfer|round. Output identical to modeler::bevel (same P hash), and the native node has fewer parms.",
+      "native_parms": null
+    },
+
+    "shell": {
+      "preferred": "modeler::thickness",
+      "alternative": "polyextrude::2.0",
+      "parms": {
+        "group": "",
+        "thickness": 0.1,
+        "divisions": 1,
+        "center": 0,
+        "outputgroup": 1,
+        "groupname": "thickness"
+      },
+      "target": "group is a primitive group; empty means all faces. Default value is the string \"!_3d_hidden_primitives\".",
+      "output_groups": ["thickness"],
+      "notes": "Same P hash as the native recipe. Use the native node when you need extrudeBack and extrudeSide as separate groups.",
+      "native_parms": {"group": "", "dist": 0.1, "outputback": 1, "outputbackgrp": 1, "outputsidegrp": 1}
+    },
+
+    "slide_edges": {
+      "preferred": "modeler::slide_edges",
+      "alternative": null,
+      "parms": {
+        "group": "p16-17 p17-18 p18-19 p19-20 p20-21 p21-22 p22-23 p16-23",
+        "type": "0",
+        "slide": 0.5,
+        "dist": 0.0
+      },
+      "target": "group is the edge loop to slide, inline \"p<a>-<b>\" list or an upstream edge group name.",
+      "output_groups": [],
+      "notes": "No native parametric equivalent. Even at slide=0 the P array changes, so never use it as an identity node.",
+      "native_parms": null
+    },
+
+    "edge_flow": {
+      "preferred": "modeler::edge_flow",
+      "alternative": null,
+      "parms": {
+        "group": "offsetedges",
+        "curvature": 1.0,
+        "tension": 1.0
+      },
+      "target": "group must be a real edge group, typically the loop written by polybevel offsetedges.",
+      "output_groups": [],
+      "notes": "Empty group or \"*\" is a silent no-op that leaves the P hash unchanged. No native equivalent.",
+      "native_parms": null
+    },
+
+    "relax": {
+      "preferred": "smooth",
+      "alternative": "modeler::relax",
+      "parms": {
+        "group": "",
+        "strength": 10.0,
+        "method": 0,
+        "contrainedboundary": 2
+      },
+      "target": "group is a point group; empty means all points.",
+      "output_groups": [],
+      "notes": "modeler::relax has stepsize defaulting to 0, which makes it a silent no-op. Its working parms are group \"*\", grouptype \"point\", iterations 10, stepsize 1.0.",
+      "native_parms": null
+    },
+
+    "quad_flow": {
+      "preferred": "modeler::quad_flow",
+      "alternative": null,
+      "parms": {
+        "group": "0 1 2",
+        "outputgroup": 1,
+        "groupname": "quad_flow"
+      },
+      "target": "group is a PRIMITIVE group of exactly three faces meeting at one corner.",
+      "output_groups": ["quad_flow"],
+      "notes": "Any other face selection is a silent no-op. No native equivalent.",
+      "native_parms": null
+    },
+
+    "mirror": {
+      "preferred": "mirror",
+      "alternative": "modeler::symmetrize",
+      "parms": {
+        "group": "",
+        "originx": 0.0, "originy": 0.0, "originz": 0.0,
+        "dirx": 1.0, "diry": 0.0, "dirz": 0.0,
+        "keepOriginal": 1,
+        "consolidatepts": 1,
+        "consolidatetol": 0.0001,
+        "createoutputgroup": 1,
+        "outputgroup": "mirror"
+      },
+      "target": "group is a primitive group; empty means the whole input. Plane is origin plus dir.",
+      "output_groups": ["mirror"],
+      "notes": "For duplicate-and-mirror the two nodes match. To make an existing centred mesh symmetric use modeler::symmetrize instead.",
+      "native_parms": {"modeler::symmetrize": {"group": "", "clip": 0, "originx": 0.0, "dirx": 1.0, "consolidatetol": 0.0001}}
+    },
+
+    "symmetrize": {
+      "preferred": "modeler::symmetrize",
+      "alternative": null,
+      "parms": {
+        "group": "",
+        "clip": 0,
+        "rm_seam": 0,
+        "originx": 0.0, "originy": 0.0, "originz": 0.0,
+        "dirx": 1.0, "diry": 0.0, "dirz": 0.0,
+        "consolidatetol": 0.0001
+      },
+      "target": "group is a primitive group; the plane comes from origin plus dir. Default value is \"!_3d_hidden_primitives\".",
+      "output_groups": [],
+      "notes": "clip=0 keeps the +dir half, mirrors it and welds the seam. clip=1 outputs only the clipped half.",
+      "native_parms": null
+    },
+
+    "mirror_group": {
+      "preferred": "modeler::mirror_group",
+      "alternative": null,
+      "parms": {
+        "group": "0",
+        "grouptype": "0",
+        "sym_originx": 0.0, "sym_originy": 0.0, "sym_originz": 0.0,
+        "sym_dirx": 1.0, "sym_diry": 0.0, "sym_dirz": 0.0,
+        "sym_tol": 0.0001,
+        "groupname": "mirror_group"
+      },
+      "target": "group is the source selection; grouptype tokens \"0\" points, \"1\" edges, \"2\" primitives. sym_dirx/y/z default to all zero, always set the plane.",
+      "output_groups": ["mirror_group"],
+      "notes": "Geometry is untouched, only a group is written, and only for source components on the +dir side. Writes no group at all when nothing matches, so always re-read.",
+      "native_parms": null
+    },
+
+    "crease_subd_preview": {
+      "preferred": "modeler::crease",
+      "alternative": "crease",
+      "parms": {
+        "group": "p0-1 p1-3",
+        "crease": 5.0,
+        "do_preview": 1,
+        "preview_divisions": 2
+      },
+      "target": "group is an edge group; inline \"p<a>-<b>\" list or an upstream edge group name.",
+      "output_groups": [],
+      "notes": "Writes the same creaseweight vertex attribute as the native crease SOP; downstream subdivide gives an identical P hash.",
+      "native_parms": {
+        "crease": {"group": "p0-1 p1-3", "crease": 5.0, "creaseattrib": "creaseweight"},
+        "subdivide": {"algorithm": "osdcc", "iterations": 2}
+      }
+    },
+
+    "preview_subd": {
+      "preferred": "modeler::preview_subd",
+      "alternative": "subdivide",
+      "parms": {"divs": 2, "isolines": 0, "sharp_corners": 0},
+      "target": "No group; operates on the whole input.",
+      "output_groups": [],
+      "notes": "Emits real geometry, byte-identical to subdivide osdcc at the same iteration count.",
+      "native_parms": {"algorithm": "osdcc", "iterations": 2}
+    },
+
+    "subdivide_level1": {
+      "preferred": "subdivide",
+      "alternative": "modeler::preview_subd",
+      "parms": {"algorithm": "osdcc", "iterations": 1},
+      "target": "The primitive group parm is named subdivide, not group; creases is a separate edge group field.",
+      "output_groups": ["creases (only when outputcrease is set to 1)"],
+      "notes": "algorithm tokens houdini|mantra|osdcc|osdloop|osdbilinear. Use osdbilinear for linear splitting that keeps the silhouette.",
+      "native_parms": null
+    },
+
+    "clean_edges": {
+      "preferred": "modeler::clean_edges",
+      "alternative": "dissolve::2.0",
+      "parms": {"group": "*", "minedgeangle": 0.5, "reminlinepts": 1},
+      "target": "group is an edge group; \"*\" or empty both mean every edge.",
+      "output_groups": [],
+      "notes": "Dissolves coplanar edges in one node. The native route needs groupcreate plus dissolve and the groupbase trap below.",
+      "native_parms": {
+        "groupcreate": {"groupname": "flat", "grouptype": "edge", "groupbase": 0, "groupedges": 1, "domaxedgeangle": 1, "maxedgeangle": 1.0},
+        "dissolve::2.0": {"group": "flat", "reminlinepts": 1, "remunusedpts": 1}
+      }
+    },
+
+    "dissolve": {
+      "preferred": "dissolve::2.0",
+      "alternative": "modeler::clean_edges",
+      "parms": {"group": "flat", "reminlinepts": 1, "remunusedpts": 1, "invertsel": 0, "bridge": 0},
+      "target": "group is an edge group name or an inline \"p<a>-<b>\" list.",
+      "output_groups": [],
+      "notes": "Deterministic. Pair with groupcreate for angle-based selection and remember to set groupbase to 0 there.",
+      "native_parms": null
+    },
+
+    "group_sharp_edges": {
+      "preferred": "modeler::group_sharp_edges",
+      "alternative": "groupcreate",
+      "parms": {"group": "", "minedgeangle": 31.0, "unshared": 0, "outputgroup": 1, "groupname": "sharp_edges"},
+      "target": "Scans the whole input unless group restricts it; writes an edge group.",
+      "output_groups": ["sharp_edges"],
+      "notes": "outputgroup defaults to 0, which cooks fine but writes no group at all. Set it to 1.",
+      "native_parms": {"groupname": "sharp", "grouptype": "edge", "groupbase": 0, "groupedges": 1, "dominedgeangle": 1, "minedgeangle": 31.0}
+    },
+
+    "polydoctor_check": {
+      "preferred": "polydoctor",
+      "alternative": null,
+      "parms": {
+        "group": "",
+        "illformed": "mark",
+        "manyedges": "mark",
+        "nonconvex": "mark",
+        "overlapping": "mark",
+        "intersect": "mark",
+        "disconnectpt": "mark",
+        "nonmanifoldpt": "mark",
+        "thickness": 0,
+        "fixwindings": 0,
+        "deletesmallmanifolds": 0,
+        "creategrps": 1
+      },
+      "target": "group is a primitive group; empty means the whole input.",
+      "output_groups": ["valid_poly_grp", "repaired_poly_grp", "valid_pt_grp", "modified_pt_grp"],
+      "notes": "Every detection parm is an ignore|mark|repair menu; mark reports without editing geometry. creategrps=1 is what writes those four groups (the node appends _grp to the parm values).",
+      "native_parms": null
+    }
+  }
+}
