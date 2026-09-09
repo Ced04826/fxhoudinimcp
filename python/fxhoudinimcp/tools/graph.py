@@ -82,6 +82,7 @@ async def get_node_card(
     node_type: str,
     context: str = "Sop",
     parm_filter: str | None = None,
+    include_help: bool = True,
 ) -> dict:
     """Get the authoritative documentation card for a node type, straight
     from the running Houdini: real connector labels, real parameter
@@ -91,14 +92,24 @@ async def get_node_card(
     in this session — never guess parameter names. Unversioned names
     resolve to the newest version.
 
+    When you only need parameter names and menu tokens, pass
+    include_help=False and a parm_filter: the help text alone runs to
+    5 000 characters, and dropping it turns the card into a couple of
+    hundred. Keep the help when you need to know what the node does.
+
     Args:
         node_type: Type name (e.g. "scatter", "rbdbulletsolver").
         context: Category — "Sop", "Lop", "Dop", "Cop", "Chop", "Top",
             "Object", "Driver".
         parm_filter: Substring filter for the parameter list.
+        include_help: Include the node's shipped help text.
     """
     bridge = _get_bridge(ctx)
-    params: dict[str, Any] = {"node_type": node_type, "context": context}
+    params: dict[str, Any] = {
+        "node_type": node_type,
+        "context": context,
+        "include_help": include_help,
+    }
     if parm_filter is not None:
         params["parm_filter"] = parm_filter
     return await bridge.execute("graph.get_node_card", params)

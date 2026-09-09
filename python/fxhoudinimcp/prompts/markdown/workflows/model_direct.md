@@ -20,9 +20,10 @@ Reference: {reference}
 
 ## One step, one round trip
 
-1. Design the step. For a node you have not used, `modeling_recipe(op)` gives
-   the verified minimal parameters (about 300 tokens); only when no recipe
-   exists use `get_node_card` with `parm_filter`.
+1. Design the step. The table below decides the node. For parameter names and
+   menu tokens use `get_node_card`; once you know which node you want, pass
+   `include_help=False` with a `parm_filter` and the card costs a few hundred
+   characters instead of several thousand.
 2. Three or more nodes: one `build_network` call; `dry_run=True` first for an
    unfamiliar type.
 3. Point moves: `edit_points` — `after` creates an intent-named Edit,
@@ -31,33 +32,35 @@ Reference: {reference}
 4. Immediately `get_mesh_report(node)`; after a topology operation also
    `compare_geometry(before, after)` to see exactly which points and prims are
    new (tag `i@sourcept = @ptnum` upstream when you need provenance).
-5. At each finished shape, `render_views([cage, subd_l1], out_dir)`: fixed
-   views, same shading, files on disk; read an image only when deciding.
-6. Before freezing a stage, `verify_reload(node)` at tolerance 1e-5.
+5. At each finished shape, look at the viewport: wireframe on the cage,
+   shaded on the subdivided result. There is no fixed-view capture tool; say
+   which node and which shading an image shows.
 
 Call count decides how long the user waits, not node count. Merge calls, put
 long lists in `dump_path`, never page through `get_points` to "look".
 
 ## Node choice (verified on 22.0.368, Modeler installed)
 
-- Divided box with fillet: `modeler::qbox` (recipe `qbox`).
-- Face extrude with inset and output groups: `polyextrude::2.0`
-  (`extrude_faces`).
-- Insert loop: `modeler::loop_slice` (`insert_loop`); a single loop at an
-  arbitrary ratio: `polysplit::2.0` with `edgepercent`.
-- Connect a ring or two points on one face: `modeler::connect` (`connect`).
-- Bridge two boundary loops: `polybridge` (`bridge`).
-- Fill a hole: `polyfill` with explicit corners (`fill_hole`); requad an ngon
-  from a PRIM group: `modeler::fill_quads` (`requad_ngon`).
-- Bevel: `polybevel::3.0` (`bevel_edges`). Shell: `modeler::thickness`
-  (`shell`).
+- Divided box with fillet: `modeler::qbox`. A native box only gives divided
+  faces with `type` polymesh, and needs a `polybevel` after it.
+- Face extrude with inset and output groups: `polyextrude::2.0`.
+- Insert loop: `modeler::loop_slice`, which accepts an upstream edge group
+  name; a single loop at an arbitrary ratio: `polysplit::2.0` with
+  `edgepercent`, whose `splitloc` only takes literal `p<a>-<b>` strings.
+- Connect a ring or two points on one face: `modeler::connect`.
+- Bridge two boundary loops: `polybridge`.
+- Fill a hole: `polyfill` with explicit corners; requad an ngon from a PRIM
+  group: `modeler::fill_quads`.
+- Bevel: `polybevel::3.0`. Shell: `modeler::thickness`.
 - Slide edges, edge flow, corner flow: `modeler::slide_edges`, `edge_flow`,
   `quad_flow`. Relax: `smooth`. Mirror / symmetrize: `mirror`,
   `modeler::symmetrize`.
-- Crease + SubD: `crease` + `subdivide` (`osdcc`, `subdivide_level1`).
+- Crease + SubD: `crease` + `subdivide` with `osdcc`.
 - Cleanup: `modeler::clean_edges`, `dissolve::2.0`.
-- Self-intersection: `polydoctor` with all seven detections set to `mark`
-  (`polydoctor_check`), proven on a known intersecting pair first.
+- Self-intersection: `polydoctor` with `illformed`, `manyedges`, `nonconvex`,
+  `overlapping`, `intersect`, `disconnectpt` and `nonmanifoldpt` all set to
+  `mark`, `thickness` 0, repairs off, `creategrps` 1. One detection alone
+  under-reports. Prove it on a known intersecting pair first.
 
 Unusable from parameters: `modeler::draw_patch`, `draw_cards`, PolyPen and
 every viewer state, `modeler::extrude`'s `to_regular_node`.
@@ -79,8 +82,8 @@ only produces divided faces with `type` polymesh.
    the cage holds its shape at one level of `subdivide` (`osdcc`). More
    levels never fix a wrong cage.
 3. Self-intersection: `polydoctor` per the recipe, positive control first.
-4. Visual and reload: `render_views` front, left, top, iso for cage and level
-   1; `verify_reload` within tolerance.
+4. Visual: fixed viewpoint, same shading, cage and level 1 both seen. Front
+   for proportion, side for depth, three-quarter for highlights and end caps.
 
 Counts passing is not edge flow passing. A check you did not run is reported
 as not run, never as passed.
@@ -96,8 +99,8 @@ points do not guarantee the subdivided surface fits; judge on level 1.
 ## Save discipline
 
 Never save the hip yourself. New branches may exist only in the session; say
-so in the handoff. Freeze a stage with the cpio from `verify_reload` plus a
-bgeo. Never overwrite an Edit the user made by hand: `get_mesh_report` before,
-`compare_geometry` after.
+so in the handoff. Freeze a stage as a cpio plus a bgeo. Never overwrite an
+Edit the user made by hand: `get_mesh_report` before, `compare_geometry`
+after.
 
 {network_housekeeping}

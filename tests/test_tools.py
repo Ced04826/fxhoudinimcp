@@ -280,3 +280,32 @@ class TestEvidenceTools:
                 "patterns": ["flame", "wind"],
             },
         )
+
+
+class TestNodeCard:
+    """The card is the lookup that replaces guessing at parameter names."""
+
+    @pytest.mark.asyncio
+    async def test_help_is_included_by_default(self, mock_ctx, mock_bridge):
+        from fxhoudinimcp.tools.graph import get_node_card
+
+        mock_bridge.execute.return_value = {"type": "polyfill"}
+        await get_node_card(mock_ctx, node_type="polyfill")
+        mock_bridge.execute.assert_called_once_with(
+            "graph.get_node_card",
+            {"node_type": "polyfill", "context": "Sop", "include_help": True},
+        )
+
+    @pytest.mark.asyncio
+    async def test_help_can_be_dropped_for_a_cheap_parameter_lookup(self, mock_ctx, mock_bridge):
+        """Help alone runs to 5 000 characters, and a caller who already knows
+        which node to use only needs the names and menu tokens."""
+        from fxhoudinimcp.tools.graph import get_node_card
+
+        mock_bridge.execute.return_value = {"type": "polyfill"}
+        await get_node_card(
+            mock_ctx, node_type="polyfill", parm_filter="corner", include_help=False
+        )
+        _command, params = mock_bridge.execute.call_args.args
+        assert params["include_help"] is False
+        assert params["parm_filter"] == "corner"

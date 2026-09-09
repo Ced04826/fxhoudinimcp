@@ -1,18 +1,14 @@
 """Modeling (SOP) handlers for FXHoudini-MCP.
 
-Two commands, both aimed at control cages:
-
 ``modeling.get_mesh_report``
-    The acceptance check a modeler runs before trusting a cage -- face mix,
-    pieces, boundary loops, non-manifold edges, degenerate faces, poles and
-    folded quads, in a single call. Topology comes from a ``.geo`` JSON round
-    trip rather than per-primitive HOM calls. Measured on 22.0.368 with a
-    10 000 quad grid: 32 ms for ``saveToFile`` + ``json.load`` against 878 ms
-    for walking ``prim.vertices()``.
+    Cage acceptance: face mix, pieces, boundary, non-manifold, degenerates,
+    poles, folded quads. Topology from a ``.geo`` JSON round trip.
 
 ``modeling.edit_points``
-    Batch point shaping through a native Edit SOP, with read-back evidence of
-    where the points actually landed.
+    Batch point shaping through a native Edit SOP, with read-back evidence.
+
+``modeling.compare_geometry``
+    Topology, positions, and optional ``sourcept`` / ``sourceprim`` provenance.
 
 The maths and validation below are deliberately free of ``hou`` and ``numpy``
 so they can be tested without Houdini; only the handlers touch either.
@@ -62,8 +58,6 @@ MOVED_EPSILON = 1e-7
 # comment line starts so a later run can replace it instead of stacking up.
 USER_DATA_KEY = "fxmcp_edit_fingerprint"
 COMMENT_MARKER = "[fxmcp edit]"
-
-
 ###### .geo JSON parsing (no hou)
 #
 # Layouts observed on Houdini 22.0.368, all verified live:
@@ -412,6 +406,14 @@ def _get_sop_node(node_path: str, argument: str) -> hou.Node:
     if getattr(node, "geometry", None) is None:
         raise hou.OperationFailed(
             f"{node_path} is a '{node.type().name()}' node, which carries no geometry. "
+            f"{argument} must name a SOP, for example /obj/geo1/subdivide1."
+        )
+    # A geo object also has geometry() -- it returns the display SOP -- so the
+    # attribute check above is not enough to refuse /obj/geo1 itself.
+    if node.type().category() != hou.sopNodeTypeCategory():
+        raise hou.OperationFailed(
+            f"{node_path} is a '{node.type().name()}' node in the "
+            f"{node.type().category().name()} context, not a SOP. "
             f"{argument} must name a SOP, for example /obj/geo1/subdivide1."
         )
     return node
@@ -1089,3 +1091,333 @@ def _edit_points(
 
 
 register_handler("modeling.edit_points", _edit_points)
+
+
+###### Comparison maths (no hou)
+
+
+def _as_float(value: object, name: str) -> float:
+    """A finite number, or a sentence naming the argument."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{name} must be a number, not {type(value).__name__}: {value!r}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{name} must be a number, not {type(value).__name__}: {value!r}"
+        ) from None
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite number, not {value!r}")
+    return number
+
+
+def topology_report(
+    a_faces: list[tuple[int, list[int]]],
+    b_faces: list[tuple[int, list[int]]],
+    a_point_count: int,
+    b_point_count: int,
+    a_prim_count: int,
+    b_prim_count: int,
+) -> dict[str, Any]:
+    """Identical only when counts match and face point lists agree in order."""
+    first_mismatch: dict[str, Any] | None = None
+    shared = min(len(a_faces), len(b_faces))
+    for index in range(shared):
+        a_prim, a_pts = a_faces[index]
+        _b_prim, b_pts = b_faces[index]
+        if list(a_pts) != list(b_pts):
+            first_mismatch = {"prim": a_prim, "a": list(a_pts), "b": list(b_pts)}
+            break
+    if first_mismatch is None and len(a_faces) != len(b_faces):
+        if len(a_faces) > len(b_faces):
+            prim, pts = a_faces[shared]
+            first_mismatch = {"prim": prim, "a": list(pts), "b": []}
+        else:
+            prim, pts = b_faces[shared]
+            first_mismatch = {"prim": prim, "a": [], "b": list(pts)}
+
+    identical = (
+        a_point_count == b_point_count
+        and a_prim_count == b_prim_count
+        and len(a_faces) == len(b_faces)
+        and first_mismatch is None
+    )
+    if identical:
+        return {"identical": True, "points": a_point_count, "prims": a_prim_count}
+    report: dict[str, Any] = {
+        "identical": False,
+        "points": {"a": a_point_count, "b": b_point_count},
+        "prims": {"a": a_prim_count, "b": b_prim_count},
+    }
+    if first_mismatch is not None:
+        report["first_mismatch"] = first_mismatch
+    return report
+
+
+def position_report(
+    a_positions: list[float],
+    b_positions: list[float],
+    tolerance: float,
+    max_list: int,
+) -> dict[str, Any]:
+    """Point-number deltas. Caller guarantees equal point counts."""
+    count = min(len(a_positions), len(b_positions)) // 3
+    if count <= 0:
+        return {"max_delta": 0.0, "mean_delta": 0.0, "over_tolerance": 0}
+
+    max_delta = 0.0
+    total = 0.0
+    over = 0
+    worst: list[tuple[float, int]] = []
+    for point in range(count):
+        base = point * 3
+        dx = a_positions[base] - b_positions[base]
+        dy = a_positions[base + 1] - b_positions[base + 1]
+        dz = a_positions[base + 2] - b_positions[base + 2]
+        delta = math.sqrt(dx * dx + dy * dy + dz * dz)
+        total += delta
+        if delta > max_delta:
+            max_delta = delta
+        if delta > tolerance:
+            over += 1
+            worst.append((delta, point))
+
+    report: dict[str, Any] = {
+        "max_delta": round(max_delta, 6),
+        "mean_delta": round(total / count, 6),
+        "over_tolerance": over,
+    }
+    if worst and max_list:
+        worst.sort(reverse=True)
+        report["worst"] = [
+            {"point": index, "delta": round(delta, 6)} for delta, index in worst[:max_list]
+        ]
+    return report
+
+
+def classify_provenance(
+    source_ids: list[int], source_count: int
+) -> tuple[int, int, int, list[int], list[tuple[int, int]]]:
+    """Walk b-element source ids against a's count.
+
+    -1 or out of range is new. A source already claimed by an earlier b
+    element is also new: PolyExtrude copies ``sourcept`` / ``sourceprim`` from
+    the source vertex or face onto the elements it creates, so the extra copy
+    is the new point or side face, not a second original.
+    """
+    claimed: set[int] = set()
+    kept_pairs: list[tuple[int, int]] = []
+    new_ids: list[int] = []
+    for b_index, raw in enumerate(source_ids):
+        src = int(raw)
+        if src < 0 or src >= source_count or src in claimed:
+            new_ids.append(b_index)
+            continue
+        claimed.add(src)
+        kept_pairs.append((b_index, src))
+    removed = source_count - len(claimed)
+    return len(kept_pairs), len(new_ids), removed, new_ids, kept_pairs
+
+
+def provenance_report(
+    *,
+    sourcept: list[int],
+    a_point_count: int,
+    sourceprim: list[int] | None,
+    a_prim_count: int,
+    a_positions: list[float],
+    b_positions: list[float],
+    max_list: int,
+) -> dict[str, Any]:
+    """Map each b element to its a source; extras and sentinels are new."""
+    kept, new, removed, new_points, pairs = classify_provenance(sourcept, a_point_count)
+    report: dict[str, Any] = {"points": {"kept": kept, "new": new, "removed": removed}}
+    if new_points and max_list:
+        report["new_points"] = new_points[:max_list]
+
+    max_delta = 0.0
+    a_limit = len(a_positions) // 3
+    b_limit = len(b_positions) // 3
+    for b_index, a_index in pairs:
+        if b_index >= b_limit or a_index >= a_limit:
+            continue
+        ab, bb = a_index * 3, b_index * 3
+        dx = a_positions[ab] - b_positions[bb]
+        dy = a_positions[ab + 1] - b_positions[bb + 1]
+        dz = a_positions[ab + 2] - b_positions[bb + 2]
+        max_delta = max(max_delta, math.sqrt(dx * dx + dy * dy + dz * dz))
+    if pairs:
+        report["kept_max_delta"] = round(max_delta, 6)
+
+    if sourceprim is not None:
+        p_kept, p_new, p_removed, new_prims, _pairs = classify_provenance(sourceprim, a_prim_count)
+        report["prims"] = {"kept": p_kept, "new": p_new, "removed": p_removed}
+        if new_prims and max_list:
+            report["new_prims"] = new_prims[:max_list]
+    return report
+
+
+def compare_meshes(
+    *,
+    a_faces: list[tuple[int, list[int]]],
+    b_faces: list[tuple[int, list[int]]],
+    a_point_count: int,
+    b_point_count: int,
+    a_prim_count: int,
+    b_prim_count: int,
+    a_positions: list[float],
+    b_positions: list[float],
+    sourcept: list[int] | None = None,
+    sourceprim: list[int] | None = None,
+    tolerance: float = 1e-5,
+    max_list: int = 20,
+) -> dict[str, Any]:
+    """The comparison block: topology, positions and optional provenance."""
+    topology = topology_report(
+        a_faces, b_faces, a_point_count, b_point_count, a_prim_count, b_prim_count
+    )
+    result: dict[str, Any] = {"topology": topology}
+    if a_point_count == b_point_count:
+        positions = position_report(a_positions, b_positions, tolerance, max_list)
+        result["positions"] = positions
+        result["same"] = bool(topology["identical"] and positions["over_tolerance"] == 0)
+    else:
+        result["same"] = False
+    if sourcept is not None:
+        result["provenance"] = provenance_report(
+            sourcept=sourcept,
+            a_point_count=a_point_count,
+            sourceprim=sourceprim,
+            a_prim_count=a_prim_count,
+            a_positions=a_positions,
+            b_positions=b_positions,
+            max_list=max_list,
+        )
+    return result
+
+
+###### modeling.compare_geometry
+
+
+def _int_attrib_values(geo: hou.Geometry, name: str, kind: str) -> list[int] | None:
+    """An int point or prim attribute, or None if it is missing or not int."""
+    if kind == "point":
+        attrib = geo.findPointAttrib(name)
+        reader = geo.pointIntAttribValues
+    else:
+        attrib = geo.findPrimAttrib(name)
+        reader = geo.primIntAttribValues
+    if attrib is None or attrib.dataType() != hou.attribData.Int:
+        return None
+    return list(reader(name))
+
+
+def _geo_snapshot(geo: hou.Geometry) -> dict[str, Any]:
+    """Faces, counts, positions, and provenance attributes from one SOP."""
+    parsed = extract_faces(_load_geo_document(geo))
+    return {
+        "faces": parsed["faces"],
+        "point_count": int(geo.intrinsicValue("pointcount")),
+        "prim_count": int(geo.intrinsicValue("primitivecount")),
+        "positions": list(geo.pointFloatAttribValues("P")),
+        "sourcept": _int_attrib_values(geo, "sourcept", "point"),
+        "sourceprim": _int_attrib_values(geo, "sourceprim", "prim"),
+    }
+
+
+def _compare_snapshots(
+    snap_a: dict[str, Any],
+    snap_b: dict[str, Any],
+    *,
+    tolerance: float,
+    max_list: int,
+) -> dict[str, Any]:
+    return compare_meshes(
+        a_faces=snap_a["faces"],
+        b_faces=snap_b["faces"],
+        a_point_count=snap_a["point_count"],
+        b_point_count=snap_b["point_count"],
+        a_prim_count=snap_a["prim_count"],
+        b_prim_count=snap_b["prim_count"],
+        a_positions=snap_a["positions"],
+        b_positions=snap_b["positions"],
+        sourcept=snap_b["sourcept"],
+        sourceprim=snap_b["sourceprim"],
+        tolerance=tolerance,
+        max_list=max_list,
+    )
+
+
+def _dump_comparison(
+    path: str,
+    snap_a: dict[str, Any],
+    snap_b: dict[str, Any],
+    comparison: dict[str, Any],
+) -> None:
+    payload = {
+        "a_faces": [[prim, pts] for prim, pts in snap_a["faces"]],
+        "b_faces": [[prim, pts] for prim, pts in snap_b["faces"]],
+        "a_point_count": snap_a["point_count"],
+        "b_point_count": snap_b["point_count"],
+        "a_prim_count": snap_a["prim_count"],
+        "b_prim_count": snap_b["prim_count"],
+        "same": comparison.get("same"),
+        "topology": comparison.get("topology"),
+        "positions": comparison.get("positions"),
+        "provenance": comparison.get("provenance"),
+    }
+    _write_dump(path, payload)
+
+
+def _compare_geometry(
+    *,
+    a: str,
+    b: str,
+    tolerance: float = 1e-5,
+    max_list: int = 20,
+    dump_path: str | None = None,
+    **_,
+) -> dict[str, Any]:
+    """Compare two SOP meshes: topology, positions, optional sourcept provenance.
+
+    Tag *before* the op that creates geometry. Attrib Create (point, int,
+    sourcept, default -1) then ``i@sourcept = @ptnum;``; the same for
+    sourceprim on primitives. A wrangle alone defaults new elements to 0,
+    which is a valid source (point 0). PolyExtrude copies the attribute from
+    the source vertex or face onto new elements; those extra copies are
+    reported as new.
+    """
+    started = time.perf_counter()
+    a_path = as_text(a, "a").strip()
+    b_path = as_text(b, "b").strip()
+    if not a_path:
+        raise ValueError("a must name a SOP node, for example /obj/geo1/box1")
+    if not b_path:
+        raise ValueError("b must name a SOP node, for example /obj/geo1/box1")
+    tol = _as_float(tolerance, "tolerance")
+    if tol < 0:
+        raise ValueError(f"tolerance must be >= 0, not {tol}")
+    cap = max(0, min(as_int(max_list, "max_list"), 1000))
+    dump_target = as_text(dump_path, "dump_path").strip()
+
+    geo_a = _get_sop_geo(a_path)
+    geo_b = _get_sop_geo(b_path)
+    snap_a = _geo_snapshot(geo_a)
+    snap_b = _geo_snapshot(geo_b)
+    report = _compare_snapshots(snap_a, snap_b, tolerance=tol, max_list=cap)
+    report["a"] = a_path
+    report["b"] = b_path
+
+    if dump_target:
+        try:
+            _dump_comparison(dump_target, snap_a, snap_b, report)
+        except OSError as exc:
+            report["dump_error"] = f"could not write {dump_target}: {exc}"
+        else:
+            report["dump"] = dump_target
+
+    report["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    return report
+
+
+register_handler("modeling.compare_geometry", _compare_geometry)

@@ -98,6 +98,7 @@
     "materials.get_material_info",
     "materials.list_material_types",
     "materials.list_materials",
+    "modeling.compare_geometry",
     "modeling.edit_points",
     "modeling.get_mesh_report",
     "nodes.connect_nodes",
