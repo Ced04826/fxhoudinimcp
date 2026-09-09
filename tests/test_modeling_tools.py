@@ -18,7 +18,11 @@ import pytest
 from support import tool_input_schema
 
 # Internal
-from fxhoudinimcp.tools.modeling import edit_points, get_mesh_report
+from fxhoudinimcp.tools.modeling import (
+    compare_geometry,
+    edit_points,
+    get_mesh_report,
+)
 
 # The handler module imports hou at module scope; the maths below does not use
 # it, so a stub is enough to get at the functions. Same prelude as
@@ -32,6 +36,8 @@ from fxhoudinimcp_server.handlers.modeling_handlers import (  # noqa: E402
     apply_moves,
     boundary_report,
     build_edge_faces,
+    classify_provenance,
+    compare_meshes,
     connected_pieces,
     degenerate_faces,
     edit_comment_line,
@@ -39,8 +45,11 @@ from fxhoudinimcp_server.handlers.modeling_handlers import (  # noqa: E402
     find_poles,
     folded_quads,
     geometry_fingerprint,
+    position_report,
+    provenance_report,
     quad_fold_flags,
     replace_comment_line,
+    topology_report,
     valence_map,
     validate_moves,
 )
@@ -602,3 +611,135 @@ class TestEditPointsTool:
         }
         assert properties["moves"]["type"] == "array"
         assert properties["force"]["type"] == "boolean"
+
+
+###### compare / reload / views: hou-free maths and wrappers
+
+
+def _flat(positions):
+    return [float(value) for point in positions for value in point]
+
+
+class TestTopologyAndPositions:
+    def test_identical_grid_is_same(self):
+        faces = list(GRID_FACES)
+        pos = _flat(GRID_POSITIONS)
+        report = compare_meshes(
+            a_faces=faces,
+            b_faces=faces,
+            a_point_count=9,
+            b_point_count=9,
+            a_prim_count=4,
+            b_prim_count=4,
+            a_positions=pos,
+            b_positions=pos,
+        )
+        assert report["same"] is True
+        assert report["topology"] == {"identical": True, "points": 9, "prims": 4}
+        assert report["positions"]["max_delta"] == 0.0
+        assert report["positions"]["over_tolerance"] == 0
+        assert "worst" not in report["positions"]
+
+    def test_count_mismatch_names_both_sides(self):
+        report = topology_report(GRID_FACES, GRID_FACES[:1], 9, 4, 4, 1)
+        assert report["identical"] is False
+        assert report["points"] == {"a": 9, "b": 4}
+        assert report["prims"] == {"a": 4, "b": 1}
+        assert report["first_mismatch"]["prim"] == 1
+
+    def test_face_mismatch_names_the_first_prim(self):
+        other = [(0, [0, 1, 4, 3]), (1, [1, 2, 4, 5]), (2, [3, 4, 7, 6]), (3, [4, 5, 8, 7])]
+        report = topology_report(GRID_FACES, other, 9, 9, 4, 4)
+        assert report["first_mismatch"] == {"prim": 1, "a": [1, 2, 5, 4], "b": [1, 2, 4, 5]}
+
+    def test_ty_shift_is_over_tolerance(self):
+        a = _flat(GRID_POSITIONS)
+        b = list(a)
+        for point in range(9):
+            b[point * 3 + 1] += 0.001
+        report = position_report(a, b, 1e-5, 20)
+        assert report["over_tolerance"] == 9
+        assert report["max_delta"] == pytest.approx(0.001, abs=1e-9)
+        assert report["worst"][0]["delta"] == pytest.approx(0.001, abs=1e-9)
+
+    def test_within_tolerance_is_not_over(self):
+        a = _flat(GRID_POSITIONS)
+        b = list(a)
+        b[1] += 1e-6
+        report = position_report(a, b, 1e-5, 20)
+        assert report["over_tolerance"] == 0
+        assert "worst" not in report
+
+
+class TestProvenance:
+    def test_identity_tag_keeps_everyone(self):
+        kept, new, removed, new_ids, pairs = classify_provenance(list(range(9)), 9)
+        assert (kept, new, removed, new_ids) == (9, 0, 0, [])
+        assert pairs[0] == (0, 0)
+
+    def test_minus_one_or_out_of_range_is_new(self):
+        kept, new, removed, new_ids, _pairs = classify_provenance([0, 1, -1, 99], 3)
+        assert (kept, new, removed) == (2, 2, 1)
+        assert new_ids == [2, 3]
+
+    def test_duplicate_source_from_extrude_is_new(self):
+        """PolyExtrude copies sourcept from the extruded vertices onto new points."""
+        sourcept = [0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 4, 3]
+        kept, new, removed, new_ids, _pairs = classify_provenance(sourcept, 9)
+        assert (kept, new, removed) == (9, 4, 0)
+        assert new_ids == [9, 10, 11, 12]
+
+    def test_default_zero_on_new_points_is_a_duplicate_of_point_zero(self):
+        sourcept = [0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0]
+        kept, new, removed, new_ids, _pairs = classify_provenance(sourcept, 9)
+        assert new_ids == [9, 10, 11, 12]
+        assert (kept, new, removed) == (9, 4, 0)
+
+    def test_provenance_report_includes_prims_and_kept_delta(self):
+        a = _flat(GRID_POSITIONS)
+        b = list(a) + [0.0, 0.5, 0.0, 1.0, 0.5, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5, 1.0]
+        sourcept = [0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 4, 3]
+        sourceprim = [1, 2, 3, 0, 0, 0, 0, 0]
+        report = provenance_report(
+            sourcept=sourcept,
+            a_point_count=9,
+            sourceprim=sourceprim,
+            a_prim_count=4,
+            a_positions=a,
+            b_positions=b,
+            max_list=20,
+        )
+        assert report["points"] == {"kept": 9, "new": 4, "removed": 0}
+        assert report["new_points"] == [9, 10, 11, 12]
+        assert report["prims"] == {"kept": 4, "new": 4, "removed": 0}
+        assert report["new_prims"] == [4, 5, 6, 7]
+        assert report["kept_max_delta"] == 0.0
+
+
+class TestCompareGeometryTool:
+    @pytest.mark.asyncio
+    async def test_delegates_with_defaults(self, mock_ctx, mock_bridge):
+        mock_bridge.execute.return_value = {"same": True}
+        result = await compare_geometry(mock_ctx, a="/obj/geo1/a", b="/obj/geo1/b")
+        mock_bridge.execute.assert_called_once_with(
+            "modeling.compare_geometry",
+            {"a": "/obj/geo1/a", "b": "/obj/geo1/b", "tolerance": 1e-5, "max_list": 20},
+        )
+        assert result == {"same": True}
+
+    @pytest.mark.asyncio
+    async def test_optional_dump_path_stays_out(self, mock_ctx, mock_bridge):
+        await compare_geometry(mock_ctx, a="/obj/geo1/a", b="/obj/geo1/b", dump_path=None)
+        _command, params = mock_bridge.execute.call_args.args
+        assert "dump_path" not in params
+
+    @pytest.mark.asyncio
+    async def test_schema_types_every_parameter(self):
+        from fxhoudinimcp.server import mcp
+
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        schema = tool_input_schema(tools["compare_geometry"])
+        properties = schema["properties"]
+        assert set(properties) >= {"a", "b", "tolerance", "max_list", "dump_path"}
+        assert properties["a"]["type"] == "string"
+        assert properties["tolerance"]["type"] == "number"

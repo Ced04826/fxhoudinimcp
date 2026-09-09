@@ -1,4 +1,4 @@
-"""MCP tools for polygon modeling checks and control-point edits."""
+"""MCP tools for polygon modeling checks, comparison, reload proof, and views."""
 
 from __future__ import annotations
 
@@ -83,3 +83,37 @@ async def edit_points(
     if expect_points is not None:
         params["expect_points"] = expect_points
     return await bridge.execute("modeling.edit_points", params)
+
+
+@mcp.tool()
+async def compare_geometry(
+    ctx: Context,
+    a: str,
+    b: str,
+    tolerance: float = 1e-5,
+    max_list: int = 20,
+    dump_path: str | None = None,
+) -> dict:
+    """Compare two SOP meshes: topology, positions, sourcept provenance.
+
+    Topology matches when counts and face point lists agree in order.
+    Positions only when point counts match. sourcept on b maps each element
+    to a; -1, out of range, or a duplicate source is new. dump_path gets JSON.
+
+    Args:
+        a: First SOP path.
+        b: Second SOP path.
+        tolerance: Position delta in scene units.
+        max_list: Cap on mismatch and new-id lists.
+        dump_path: JSON file for the full lists.
+    """
+    bridge = _get_bridge(ctx)
+    params: dict[str, Any] = {
+        "a": a,
+        "b": b,
+        "tolerance": tolerance,
+        "max_list": max_list,
+    }
+    if dump_path is not None:
+        params["dump_path"] = dump_path
+    return await bridge.execute("modeling.compare_geometry", params)
