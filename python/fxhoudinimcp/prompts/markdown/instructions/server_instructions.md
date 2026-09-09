@@ -180,7 +180,8 @@ subject's SideFX manual and naming the pages to read. If the task matches one,
 request it through the MCP prompt rather than reasoning from first principles.
 
 *   `simulation_setup(sim_type)` dispatches per solver: pyro (also smoke, fire, explosion), fluid (flip, liquid, water, whitewater), vellum (cloth, softbody), destruction (rbd, fracture, bullet), mpm (sand, snow). Anything else gets the general dynamics guide.
-*   Named prompts: `procedural_modeling_workflow`, `usd_scene_assembly`, `pdg_pipeline`, `hda_development`, `copernicus_workflow`, `heightfield_terrain`, `debug_scene`.
+*   Named prompts: `direct_modeling_workflow`, `procedural_modeling_workflow`, `usd_scene_assembly`, `pdg_pipeline`, `hda_development`, `copernicus_workflow`, `heightfield_terrain`, `debug_scene`.
+*   Shaping a quad mesh by hand — a SubD control cage, a reference rebuild, a retopology — is `direct_modeling_workflow`, not `procedural_modeling_workflow`, which is for kit-bashing from primitives. Ask for it before the first node: it carries the node choices verified against this Houdini version, the operations that fail silently, and the acceptance order. The tools it drives are `get_mesh_report` (topology health in one call), `edit_points` (batch point moves through a native Edit SOP, with read-back evidence) and `compare_geometry` (what an operation actually created).
 *   `houdini_workflow(topic)` serves any other subject by help-scope name: character, render, shade, crowds, copy, props, dopparticles, io, anim, ocean, grains, muscles, finiteelements, feathers, fur, ml, composite, heightfields_cop.
 
 Two of those guides exist mainly to stop you building on a dead end, so heed them:
