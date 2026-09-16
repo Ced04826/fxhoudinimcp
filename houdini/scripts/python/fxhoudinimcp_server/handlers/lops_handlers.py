@@ -190,15 +190,15 @@ def _usd_value_to_python(val: Any, array_limit: int | None = _ARRAY_SUMMARY_LIMI
             return list(val)
         if isinstance(val, Vt.TokenArray):
             return [str(t) for t in val]
-        # Generic Vt array fallback
+        # Generic Vt array fallback. No cap here: array_limit above already
+        # decides whether a long array is summarised, so reaching this point
+        # means the caller asked for the whole thing. The old 10 000 break made
+        # full=True quietly lie for every array type not enumerated above --
+        # Vt.Vec2fArray (primvars:st) came back with 10 001 of 40 000 elements
+        # while Vt.Vec3fArray came back whole.
         if hasattr(val, "__iter__") and hasattr(val, "__len__"):
             try:
-                result = []
-                for item in val:
-                    result.append(_usd_value_to_python(item))
-                    if len(result) > 10000:
-                        break
-                return result
+                return [_usd_value_to_python(item) for item in val]
             except (TypeError, RuntimeError):
                 pass
     # Primitives
@@ -438,11 +438,16 @@ def _get_usd_attribute(
         return reply
 
     offset = max(0, int(offset))
-    limit = max(0, int(limit))
-    window = [
-        _usd_value_to_python(v, array_limit=None)
-        for v in itertools.islice(value, offset, offset + limit)
-    ]
+    # At least one: limit=0 answered an empty window with has_more true, so a
+    # caller paging until has_more goes false advanced by zero forever.
+    limit = max(1, int(limit))
+    try:
+        # Vt arrays slice natively; islice walked every element up to offset
+        # (60 ms at offset 499 000 on a 500k Vec3fArray, against 0.08 ms here).
+        page = value[offset : offset + limit]
+    except TypeError:  # a sized iterable that does not support slicing
+        page = itertools.islice(value, offset, offset + limit)
+    window = [_usd_value_to_python(v, array_limit=None) for v in page]
     reply["value"] = _array_summary(value)
     reply["slice"] = {
         "offset": offset,

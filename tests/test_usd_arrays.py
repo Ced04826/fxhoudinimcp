@@ -102,3 +102,55 @@ class TestGetUsdAttributeWindows:
         reply = lops._get_usd_attribute(node_path="/stage/x", prim_path="/p", attr_name="extent")
         assert reply["value"] == [1.0, 2.0]
         assert "slice" not in reply
+
+
+class _NoMatch:
+    """Stands in for pxr's Gf/Vt/Sdf namespaces: every attribute is a fresh class.
+
+    isinstance() against these is always false, so a value falls through the
+    enumerated branches to the generic array fallback -- the path that used to
+    truncate, and the one no test could reach while HAS_PXR was false.
+    """
+
+    def __getattr__(self, name):
+        return type(name, (), {})
+
+
+class _FakeVtArray:
+    """Sized and iterable, but not a list or tuple.
+
+    Deliberately not a list: the generic Vt fallback is the only branch that
+    can return this whole, so the assertion below fails loudly if the faked
+    namespaces stop working and HAS_PXR is skipped.
+    """
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    def __len__(self):
+        return len(self._items)
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __getitem__(self, index):
+        return self._items[index]
+
+
+class TestFullMeansFull:
+    def test_an_unenumerated_array_type_is_not_truncated(self, monkeypatch):
+        """Vt.Vec2fArray (primvars:st) came back with 10 001 of 40 000 elements."""
+        monkeypatch.setattr(lops, "HAS_PXR", True)
+        for namespace in ("Gf", "Sdf", "Vt"):
+            monkeypatch.setattr(lops, namespace, _NoMatch(), raising=False)
+
+        value = _FakeVtArray(range(20001))
+        assert lops._usd_value_to_python(value, array_limit=None) == list(range(20001))
+
+    def test_limit_zero_does_not_page_forever(self, monkeypatch):
+        _stage(monkeypatch, list(range(1000)))
+        reply = lops._get_usd_attribute(
+            node_path="/stage/x", prim_path="/p", attr_name="points", offset=0, limit=0
+        )
+        assert reply["slice"]["count"] >= 1
+        assert reply["slice"]["has_more"] is True
