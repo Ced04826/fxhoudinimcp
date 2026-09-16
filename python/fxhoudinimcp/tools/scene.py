@@ -7,6 +7,9 @@ via the HTTP bridge.
 from __future__ import annotations
 
 # Built-in
+from typing import Any
+
+# Built-in
 # Third-party
 from fxhoudinimcp._sdk import Context
 
@@ -143,6 +146,38 @@ async def load_scene(ctx: Context, file_path: str, merge: bool = False) -> dict:
             "merge": merge,
         },
     )
+
+
+@mcp.tool()
+async def merge_hip(
+    ctx: Context,
+    file_path: str,
+    node_paths: list[str] | None = None,
+    overwrite_on_conflict: bool = False,
+) -> dict:
+    """Merge nodes from another hip file into the current scene — a few
+    named nodes, or everything.
+
+    node_paths are absolute (`/obj/building_v3`); a container brings its
+    children. A node that already exists is merged under a new name unless
+    overwrite_on_conflict=True, which overwrites it in place; `conflicts`
+    reports both. `merged_nodes` lists what arrived, `warnings` what
+    Houdini complained about (missing assets, missing parents).
+
+    Args:
+        file_path: The .hip file to merge from (inside the project root).
+        node_paths: Absolute node paths to merge; default everything.
+        overwrite_on_conflict: Overwrite same-named nodes instead of
+            renaming the merged copy.
+    """
+    bridge = _get_bridge(ctx)
+    payload: dict[str, Any] = {
+        "file_path": file_path,
+        "overwrite_on_conflict": overwrite_on_conflict,
+    }
+    if node_paths is not None:
+        payload["node_paths"] = node_paths
+    return await bridge.execute("scene.merge_hip", payload)
 
 
 @mcp.tool()

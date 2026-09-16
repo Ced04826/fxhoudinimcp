@@ -147,6 +147,7 @@
     "scene.get_scene_info",
     "scene.import_file",
     "scene.load_scene",
+    "scene.merge_hip",
     "scene.new_scene",
     "scene.redo",
     "scene.save_scene",
