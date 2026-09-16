@@ -27,6 +27,7 @@ import hou
 from fxhoudinimcp_server.config import layout_if_enabled, place_new_nodes, update_mode_warning
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
+from fxhoudinimcp_server.handlers.node_handlers import _resolve_input_index
 from fxhoudinimcp_server.outputs import license_error
 
 ###### Helpers
@@ -102,16 +103,123 @@ def _is_dynamic_menu(probe: hou.Node, parm: hou.Parm) -> bool:
         return False
 
 
-def _parm_names_for_type(scratch: hou.Node, node_type) -> tuple[set, set, dict, list]:
+def _connectors_of(node: hou.Node) -> dict[str, list[dict[str, Any]]]:
+    """Input and output connectors of a live node, in order, with their names.
+
+    A VOP's inputs are addressed by name (`texcoord`), and their order is not
+    stable across versions; a SOP's are `input1`, `input2` behind labels such
+    as "Spine curve". Both the index and the name are reported so a caller can
+    wire by whichever the verb at hand accepts.
+    """
+    inputs: list[dict[str, Any]] = []
+    with contextlib.suppress(Exception):
+        names = list(node.inputNames())
+        labels = list(node.inputLabels())
+        data_types: list[str] = []
+        with contextlib.suppress(Exception):
+            data_types = list(node.inputDataTypes())
+        for index, name in enumerate(names):
+            entry: dict[str, Any] = {"index": index, "name": name}
+            if index < len(labels):
+                entry["label"] = labels[index]
+            if index < len(data_types):
+                entry["data_type"] = data_types[index]
+            inputs.append(entry)
+    outputs: list[dict[str, Any]] = []
+    with contextlib.suppress(Exception):
+        names = list(node.outputNames())
+        labels = list(node.outputLabels())
+        for index, name in enumerate(names):
+            entry = {"index": index, "name": name}
+            if index < len(labels):
+                entry["label"] = labels[index]
+            outputs.append(entry)
+    return {"inputs": inputs, "outputs": outputs}
+
+
+def _connector_index(connectors: dict | None, input_name: str) -> int | None:
+    """Index of the connector called or labelled *input_name*, or None."""
+    if not connectors:
+        return None
+    for entry in connectors.get("inputs", []):
+        if input_name in (entry.get("name"), entry.get("label")):
+            return int(entry["index"])
+    return None
+
+
+def _connector_hint(connectors: dict | None, input_name: str) -> str:
+    """A did-you-mean over connector names and labels."""
+    if not connectors:
+        return ""
+    candidates = [
+        value
+        for entry in connectors.get("inputs", [])
+        for value in (entry.get("name"), entry.get("label"))
+        if value
+    ]
+    close = get_close_matches(input_name, candidates, n=3, cutoff=0.4)
+    return f" Did you mean: {close}?" if close else f" Inputs: {candidates}"
+
+
+# OBJ-level container whose children belong to each node category. A card is
+# asked for a TYPE, and connector names live only on instances (hou.NodeType
+# has no inputNames), so a probe is made inside a throwaway container and
+# destroyed again. Measured at 1-6 ms per card; karma inside a ropnet is the
+# slow one at 57 ms.
+_SCRATCH_CONTAINERS = {
+    "Sop": "geo",
+    "Object": "subnet",
+    "Vop": "matnet",
+    "Lop": "lopnet",
+    "Dop": "dopnet",
+    "Cop": "copnet",
+    "Chop": "chopnet",
+    "Top": "topnet",
+    "Driver": "ropnet",
+}
+
+
+def _connectors_for_type(category_name: str, node_type) -> dict | None:
+    """Connector names/labels of *node_type*, probed on a throwaway instance.
+
+    None when the category has no known container (nothing to probe in), so a
+    card is never refused over its connectors.
+    """
+    container = _SCRATCH_CONTAINERS.get(category_name)
+    if container is None:
+        return None
+    root = hou.node("/obj")
+    if root is None:
+        return None
+    scratch = None
+    try:
+        scratch = root.createNode(container, "fxhoudinimcp_card_probe")
+        probe = scratch.createNode(node_type.name())
+        return _connectors_of(probe)
+    except Exception:
+        return None
+    finally:
+        with contextlib.suppress(Exception):
+            if scratch is not None:
+                scratch.destroy()
+
+
+def _parm_names_for_type(
+    scratch: hou.Node, node_type, connectors: dict | None = None
+) -> tuple[set, set, dict, list]:
     """Instantiate a type once to learn its parm names, tuple names, menus and
     multiparm instance patterns.
 
     The third element maps a strict-menu parm name to its token list. Only
     menus that reject arbitrary text are recorded (int menus and "normal"
     string menus); a free-text field with a suggestion menu is not a menu.
-    The fourth is what `_instance_patterns` returns.
+    The fourth is what `_instance_patterns` returns. When *connectors* is
+    given, the probe's input/output connectors are written into it too (the
+    same probe answers both questions, and probing is not free).
     """
     probe = scratch.createNode(node_type.name())
+    if connectors is not None:
+        connectors.update(_connectors_of(probe))
     parm_names = {p.name() for p in probe.parms()}
     tuple_names = {pt.name() for pt in probe.parmTuples()}
     menus: dict[str, list[str]] = {}
@@ -240,9 +348,11 @@ def build_network(
             name (str): node name, referenceable by later specs.
             parms (dict): parameter values; lists set whole parm tuples.
             inputs (list): wiring. Entries are either a source string
-                (wired positionally) or {"index", "source",
-                "source_output"}. Sources resolve to spec node names
-                first, then children of parent, then absolute paths.
+                (wired positionally) or {"index" | "input_name", "source",
+                "source_output"}; "input_name" is a connector name or
+                label, as get_node_card lists them, and wins over "index".
+                Sources resolve to spec node names first, then children of
+                parent, then absolute paths.
             flags (dict): display/render/bypass/template booleans.
             color (list[3]) and comment (str): network annotations.
         dry_run: Validate only; never mutates the scene.
@@ -312,12 +422,16 @@ def build_network(
     # bad parm names fail validation, not the build. Runs even when other
     # errors exist: report everything in one pass.
     parm_knowledge: dict[str, tuple[set, set, dict, list]] = {}
+    connector_knowledge: dict[str, dict] = {}
     if resolved_types:
         display_before = parent.displayNode() if hasattr(parent, "displayNode") else None
         render_before = parent.renderNode() if hasattr(parent, "renderNode") else None
         try:
             for type_name, node_type in resolved_types.items():
-                parm_knowledge[type_name] = _parm_names_for_type(parent, node_type)
+                connector_knowledge[type_name] = {}
+                parm_knowledge[type_name] = _parm_names_for_type(
+                    parent, node_type, connector_knowledge[type_name]
+                )
         finally:
             with contextlib.suppress(Exception):
                 if display_before is not None:
@@ -353,10 +467,25 @@ def build_network(
                     )
         node_type = resolved_types.get(spec.get("type"))
         max_inputs = node_type.maxNumInputs() if node_type else 0
+        connectors = connector_knowledge.get(spec.get("type"))
         for input_index, entry in enumerate(spec.get("inputs") or []):
             if isinstance(entry, dict):
                 source = entry.get("source")
-                input_index = int(entry.get("index", input_index))
+                input_name = entry.get("input_name")
+                if input_name:
+                    # A connector named by the caller, as the node card lists
+                    # it. Resolved here so a wrong name fails the dry run,
+                    # not the build.
+                    found = _connector_index(connectors, str(input_name))
+                    if found is None:
+                        errors.append(
+                            f"node {label}: no input named '{input_name}' on "
+                            f"{spec.get('type')}.{_connector_hint(connectors, str(input_name))}"
+                        )
+                        continue
+                    input_index = found
+                else:
+                    input_index = int(entry.get("index", input_index))
             else:
                 source = entry
             if input_index >= max_inputs > 0:
@@ -411,12 +540,15 @@ def build_network(
                     )
                 parm.setExpression(str(expression))
             for input_index, entry in enumerate(spec.get("inputs") or []):
+                input_name = None
                 if isinstance(entry, dict):
                     source_name = entry.get("source")
+                    input_name = entry.get("input_name")
                     input_index = int(entry.get("index", input_index))
                     source_output = int(entry.get("source_output", 0))
                 else:
                     source_name, source_output = entry, 0
+                input_index = _resolve_input_index(node, input_index, input_name)
                 source = (
                     created.get(source_name)
                     or parent.node(str(source_name))
@@ -683,6 +815,10 @@ def get_node_card(
     if help_text and len(help_text) > 5000:
         help_text = help_text[:5000] + "\n[... help truncated]"
 
+    # Connectors, in order, by index AND name: the index of `texcoord` on
+    # mtlximage is 3, and until now there was nowhere to read that.
+    connectors = _connectors_for_type(context, resolved) or {"inputs": [], "outputs": []}
+
     return {
         "type": resolved.name(),
         "label": resolved.description(),
@@ -690,6 +826,8 @@ def get_node_card(
         "min_inputs": resolved.minNumInputs(),
         "max_inputs": resolved.maxNumInputs(),
         "max_outputs": resolved.maxNumOutputs(),
+        "inputs": connectors["inputs"],
+        "outputs": connectors["outputs"],
         "is_generator": resolved.minNumInputs() == 0,
         "parm_count": len(parms),
         "parms_matched": matched,

@@ -38,9 +38,10 @@ async def build_network(
     Each node spec dict supports:
         type (required), name, parms (lists set whole parm tuples),
         inputs (list of source names — earlier spec names, existing
-        children, or absolute paths; or dicts with index/source/
-        source_output), flags (display/render/bypass/template),
-        color [r,g,b], comment.
+        children, or absolute paths; or dicts with index or input_name /
+        source / source_output, where input_name is a connector name or
+        label as get_node_card lists them), flags (display/render/bypass/
+        template), color [r,g,b], comment.
 
     Args:
         parent_path: Network to build inside (e.g. "/obj/geo1").
@@ -86,10 +87,13 @@ async def get_node_card(
     node_type: str,
     context: str = "Sop",
     parm_filter: str | None = None,
+    include_help: bool = True,
 ) -> dict:
     """Get the authoritative documentation card for a node type, straight
-    from the running Houdini: real connector labels, real parameter
-    names/defaults/menus, and the node's own shipped help text.
+    from the running Houdini: connectors in order (`inputs` / `outputs`
+    with index, name and label — the index of `texcoord` on mtlximage
+    lives here), real parameter names/defaults/menus, and the node's own
+    shipped help text.
 
     Use this BEFORE setting parameters on a node type you have not used
     in this session — never guess parameter names. Unversioned names
@@ -100,11 +104,15 @@ async def get_node_card(
         context: Category — "Sop", "Lop", "Dop", "Cop", "Chop", "Top",
             "Object", "Driver".
         parm_filter: Substring filter for the parameter list.
+        include_help: False drops the help text (about 4 KB per card) when
+            only parameter names or connectors are needed.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"node_type": node_type, "context": context}
     if parm_filter is not None:
         params["parm_filter"] = parm_filter
+    if not include_help:
+        params["include_help"] = False
     return await bridge.execute("graph.get_node_card", params)
 
 

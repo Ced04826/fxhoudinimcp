@@ -399,6 +399,10 @@ def _networks_left_unplaced(fn) -> list:
 _PLACEMENT_EXEMPT = {
     # Scratch probe, made in a throwaway network and destroyed again.
     ("_parm_names_for_type", "scratch"),
+    # Same idea for the node card's connector probe: a throwaway container
+    # under /obj, destroyed in the same call.
+    ("_connectors_for_type", "root"),
+    ("_connectors_for_type", "scratch"),
     # The /mat context itself: a root-level manager, which the floor
     # deliberately never moves (moveToGoodPosition relocates /obj).
     ("_create_material_network", "hou.node('/')"),
