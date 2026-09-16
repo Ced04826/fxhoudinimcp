@@ -760,6 +760,87 @@ def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
 register_handler("lops.get_usd_materials", _get_usd_materials)
 
 
+###### lops.get_usd_bound_material
+
+_BINDING_PURPOSES = {"all": "allPurpose", "full": "full", "preview": "preview"}
+
+
+def _binding_source(prim_path: str, rel: Any) -> dict[str, Any]:
+    """Where a resolved binding comes from: the prim, an ancestor, or a collection."""
+    source: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        source["relationship"] = str(rel.GetPath())
+    binding_prim = None
+    with contextlib.suppress(Exception):
+        binding_prim = str(rel.GetPrim().GetPath())
+        source["binding_prim"] = binding_prim
+    name = ""
+    with contextlib.suppress(Exception):
+        name = rel.GetName()
+    if ":collection:" in name:
+        source["kind"] = "collection"
+        source["collection"] = name.split(":collection:", 1)[1]
+    elif binding_prim == prim_path:
+        source["kind"] = "direct"
+    else:
+        source["kind"] = "inherited"
+    with contextlib.suppress(Exception):
+        source["strength"] = str(UsdShade.MaterialBindingAPI.GetMaterialBindingStrength(rel))
+    return source
+
+
+def _get_usd_bound_material(
+    *, node_path: str, prim_paths: Any, purpose: str = "all", **_: Any
+) -> dict[str, Any]:
+    """The material each prim actually renders with, and why.
+
+    get_usd_materials lists direct bindings only; a prim bound through its
+    parent, or through a collection, showed up unbound. This resolves the
+    binding the way the renderer does (ComputeBoundMaterial) and names the
+    source: direct, inherited from which ancestor, or which collection.
+    Batched: pass every prim of interest in one call.
+    """
+    _require_pxr()
+    stage = _get_lop_stage(node_path)
+    token_name = _BINDING_PURPOSES.get(str(purpose).lower())
+    if token_name is None:
+        raise ValueError(f"purpose must be one of {sorted(_BINDING_PURPOSES)}, got {purpose!r}.")
+    token = getattr(UsdShade.Tokens, token_name)
+    if isinstance(prim_paths, str):
+        prim_paths = [prim_paths]
+    if not isinstance(prim_paths, (list, tuple)) or not prim_paths:
+        raise ValueError("prim_paths must be a prim path or a non-empty list of them.")
+
+    bindings: list[dict[str, Any]] = []
+    for raw in prim_paths:
+        prim_path = str(raw)
+        prim = stage.GetPrimAtPath(prim_path)
+        if not prim or not prim.IsValid():
+            bindings.append({"prim": prim_path, "error": "prim not found on this stage"})
+            continue
+        api = UsdShade.MaterialBindingAPI(prim)
+        material, rel = api.ComputeBoundMaterial(token)
+        entry: dict[str, Any] = {"prim": prim_path, "material": None}
+        if material and material.GetPrim().IsValid():
+            entry["material"] = str(material.GetPath())
+            entry["source"] = _binding_source(prim_path, rel)
+        with contextlib.suppress(Exception):
+            direct = str(api.GetDirectBinding().GetMaterialPath())
+            entry["direct_binding"] = direct or None
+        bindings.append(entry)
+
+    return {
+        "node_path": node_path,
+        "purpose": purpose,
+        "count": len(bindings),
+        "bound": sum(1 for b in bindings if b.get("material")),
+        "bindings": bindings,
+    }
+
+
+register_handler("lops.get_usd_bound_material", _get_usd_bound_material)
+
+
 ###### lops.find_usd_prims
 
 

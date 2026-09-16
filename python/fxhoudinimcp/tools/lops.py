@@ -251,6 +251,34 @@ async def set_usd_attribute(
 
 
 @mcp.tool()
+async def get_usd_bound_material(
+    ctx: Context,
+    node_path: str,
+    prim_paths: list[str],
+    purpose: str = "all",
+) -> dict:
+    """The material each prim actually renders with, resolved the way the
+    renderer resolves it (ComputeBoundMaterial), and where the binding comes
+    from: `direct` on the prim, `inherited` from which ancestor, or which
+    `collection`.
+
+    get_usd_materials lists direct bindings only, so a prim bound through
+    its parent or a collection looks unbound there. Batched: pass every
+    prim of interest in one call.
+
+    Args:
+        node_path: LOP node whose stage to read.
+        prim_paths: Prim paths to resolve.
+        purpose: "all" (default), "full" or "preview".
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "lops.get_usd_bound_material",
+        {"node_path": node_path, "prim_paths": prim_paths, "purpose": purpose},
+    )
+
+
+@mcp.tool()
 async def get_usd_materials(ctx: Context, node_path: str) -> dict:
     """List all USD materials on a stage.
 
