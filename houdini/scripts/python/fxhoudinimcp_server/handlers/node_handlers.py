@@ -7,6 +7,7 @@ nodes within Houdini's node graph.
 from __future__ import annotations
 
 import contextlib
+import time
 from difflib import get_close_matches
 from typing import Any
 
@@ -592,6 +593,168 @@ def connect_nodes(
     }
 
 
+###### nodes.change_node_type
+
+
+def _resolve_node_type(category: hou.NodeTypeCategory, type_name: str):
+    """Resolve *type_name* in *category* the way createNode would: the
+    preferred version for an unversioned name, else the exact name, else the
+    newest versioned name."""
+    with contextlib.suppress(Exception):
+        preferred = hou.preferredNodeType(f"{category.name()}/{type_name}")
+        if preferred is not None:
+            return preferred
+    types = category.nodeTypes()
+    if type_name in types:
+        return types[type_name]
+    prefix = type_name + "::"
+    versioned = sorted(key for key in types if key.startswith(prefix))
+    if versioned:
+        return types[versioned[-1]]
+    return None
+
+
+def change_node_type(
+    node_path: str,
+    new_type: str,
+    keep_name: bool = True,
+    keep_parms: bool = True,
+    keep_network_contents: bool = True,
+) -> dict:
+    """Swap a node for another type in place — wires, name, position, flags
+    and (by default) parameter values and network contents kept.
+
+    This is the Type Properties "change type" / asset "upgrade to version"
+    gesture: an HDA instance moved to an installed newer version keeps its
+    edits. Parameters the new type does not have are dropped and named in
+    `parms_dropped`.
+
+    Args:
+        node_path: Node to change.
+        new_type: Type name in the node's own category (unversioned names
+            map to the preferred version, as create_node does).
+        keep_name: Keep the node's name (default True).
+        keep_parms: Carry parameter values over by name (default True).
+        keep_network_contents: Keep the children of a subnet/asset (default
+            True). False resets an asset to its definition's contents.
+    """
+    node = _get_node(node_path)
+    category = node.type().category()
+    resolved = _resolve_node_type(category, new_type)
+    if resolved is None:
+        close = get_close_matches(new_type, list(category.nodeTypes()), n=3, cutoff=0.5)
+        hint = f" Did you mean: {close}?" if close else ""
+        raise ValueError(f"Type '{new_type}' does not exist in {category.name()}.{hint}")
+    old_type = node.type().name()
+    if resolved.name() == old_type:
+        return {
+            "success": True,
+            "node_path": node.path(),
+            "old_type": old_type,
+            "new_type": old_type,
+            "changed": False,
+            "message": f"{node.path()} is already of type {old_type}; nothing changed.",
+        }
+
+    before_parms = {p.name() for p in node.parms()}
+    before_non_default = {p.name() for p in node.parms() if not p.isAtDefault() and not p.isSpare()}
+    try:
+        changed = node.changeNodeType(
+            resolved.name(),
+            keep_name=bool(keep_name),
+            keep_parms=bool(keep_parms),
+            keep_network_contents=bool(keep_network_contents),
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"Could not change {node_path} ({old_type}) to {resolved.name()}: "
+            f"{readable_message(exc)}"
+        ) from exc
+    _focus_network_editor(changed, place_unpositioned=False)
+
+    after_parms = {p.name() for p in changed.parms()}
+    result: dict[str, Any] = {
+        "success": True,
+        "node_path": changed.path(),
+        "old_type": old_type,
+        "new_type": changed.type().name(),
+        "changed": True,
+        "keep_parms": bool(keep_parms),
+        "keep_network_contents": bool(keep_network_contents),
+        # Values that had been set and have no home on the new type: the
+        # only thing the swap can lose without saying so.
+        "parms_dropped": sorted(before_non_default - after_parms),
+        "parms_dropped_count": len(before_parms - after_parms),
+        "inputs": [i.path() if i is not None else None for i in changed.inputs()],
+        "outputs": [o.path() for o in changed.outputs()],
+    }
+    with contextlib.suppress(Exception):
+        result["child_count"] = len(changed.children())
+    with contextlib.suppress(Exception):
+        if changed.type().definition() is not None:
+            result["matches_definition"] = changed.matchesCurrentDefinition()
+    return result
+
+
+###### nodes.press_button
+
+
+def press_button(node_path: str, parm_name: str, arguments: dict | None = None) -> dict:
+    """Press a button parameter and report what the node says afterwards.
+
+    Runs the button's callback exactly as a click would ("Stash Input",
+    "Reload Geometry", an asset's own Build button). The call holds until
+    the callback returns; a callback that opens a dialog would block Houdini's
+    main thread, and with it this bridge.
+
+    Args:
+        node_path: Node that owns the button.
+        parm_name: The button parameter's name.
+        arguments: Optional kwargs handed to the callback script.
+    """
+    node = _get_node(node_path)
+    parm = node.parm(parm_name)
+    if parm is None:
+        names = [p.name() for p in node.parms()]
+        close = get_close_matches(parm_name, names, n=3, cutoff=0.4)
+        buttons = [p.name() for p in node.parms() if p.parmTemplate().type().name() == "Button"]
+        hint = f" Did you mean: {close}?" if close else ""
+        raise ValueError(
+            f"{node.path()} has no parameter '{parm_name}'.{hint} Buttons on this node: {buttons}"
+        )
+    template = parm.parmTemplate()
+    parm_type = template.type().name()
+    started = time.perf_counter()
+    try:
+        if arguments:
+            parm.pressButton(dict(arguments))
+        else:
+            parm.pressButton()
+    except Exception as exc:
+        raise ValueError(
+            f"Callback of {node.path()}/{parm_name} failed: {readable_message(exc)}"
+        ) from exc
+    duration_ms = round((time.perf_counter() - started) * 1000, 1)
+    result: dict[str, Any] = {
+        "success": True,
+        "node_path": node.path(),
+        "parm_name": parm.name(),
+        "parm_type": parm_type,
+        "duration_ms": duration_ms,
+        "errors": list(node.errors()),
+        "warnings": list(node.warnings()),
+    }
+    with contextlib.suppress(Exception):
+        callback = template.scriptCallback()
+        result["callback_present"] = bool(callback)
+    if parm_type != "Button":
+        result["note"] = (
+            f"'{parm_name}' is a {parm_type} parameter, not a Button; its callback "
+            f"script (if any) was triggered the way pressButton does for any parameter."
+        )
+    return result
+
+
 ###### nodes.connect_nodes_batch
 
 
@@ -1019,6 +1182,8 @@ register_handler("nodes.list_children", list_children)
 register_handler("nodes.find_nodes", find_nodes)
 register_handler("nodes.list_node_types", list_node_types)
 register_handler("nodes.connect_nodes", connect_nodes)
+register_handler("nodes.change_node_type", change_node_type)
+register_handler("nodes.press_button", press_button)
 register_handler("nodes.connect_nodes_batch", connect_nodes_batch)
 register_handler("nodes.disconnect_node", disconnect_node)
 register_handler("nodes.reorder_inputs", reorder_inputs)

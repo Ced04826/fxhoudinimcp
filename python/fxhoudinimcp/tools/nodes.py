@@ -230,6 +230,72 @@ async def list_node_types(
 
 
 @mcp.tool()
+async def change_node_type(
+    ctx: Context,
+    node_path: str,
+    new_type: str,
+    keep_name: bool = True,
+    keep_parms: bool = True,
+    keep_network_contents: bool = True,
+) -> dict:
+    """Change a node's type in place, keeping wires, name, position, flags,
+    parameter values and (for subnets/assets) network contents.
+
+    This is how an HDA instance is moved to an installed newer version
+    (`building::2.0`) without losing its edits, and how a placeholder is
+    swapped for the real node. Parameters the new type lacks are dropped and
+    listed in `parms_dropped`. Unversioned names map to the preferred
+    version, as create_node does.
+
+    Args:
+        node_path: Node to change.
+        new_type: Type name in the node's own category.
+        keep_name: Keep the node's name.
+        keep_parms: Carry parameter values over by name.
+        keep_network_contents: Keep a subnet's/asset's children (False resets
+            an asset to its definition's contents).
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "nodes.change_node_type",
+        {
+            "node_path": node_path,
+            "new_type": new_type,
+            "keep_name": keep_name,
+            "keep_parms": keep_parms,
+            "keep_network_contents": keep_network_contents,
+        },
+    )
+
+
+@mcp.tool()
+async def press_button(
+    ctx: Context,
+    node_path: str,
+    parm_name: str,
+    arguments: dict[str, Any] | None = None,
+) -> dict:
+    """Press a button parameter — "Stash Input", "Reload Geometry", an
+    asset's own Build button — and read the node's errors and warnings
+    afterwards.
+
+    The call holds until the callback returns. A callback that opens a
+    dialog blocks Houdini's main thread and this bridge with it; read the
+    button's script first if in doubt.
+
+    Args:
+        node_path: Node that owns the button.
+        parm_name: The button parameter's name.
+        arguments: Optional kwargs handed to the callback script.
+    """
+    bridge = _get_bridge(ctx)
+    payload: dict[str, Any] = {"node_path": node_path, "parm_name": parm_name}
+    if arguments:
+        payload["arguments"] = arguments
+    return await bridge.execute("nodes.press_button", payload)
+
+
+@mcp.tool()
 async def connect_nodes(
     ctx: Context,
     source_path: str,
