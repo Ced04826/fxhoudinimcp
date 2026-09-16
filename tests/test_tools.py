@@ -140,7 +140,12 @@ class TestCodeTools:
         )
         mock_bridge.execute.assert_called_once_with(
             "code.execute_python",
-            {"code": "print('hi')"},
+            {
+                "code": "print('hi')",
+                "max_stdout_chars": 102400,
+                "max_return_chars": 8192,
+                "return_format": "auto",
+            },
         )
         # The justification is echoed back, never forwarded to Houdini.
         assert result["justification"]
@@ -155,7 +160,13 @@ class TestCodeTools:
         )
         mock_bridge.execute.assert_called_once_with(
             "code.execute_python",
-            {"code": "x = 1 + 1", "return_expression": "x"},
+            {
+                "code": "x = 1 + 1",
+                "max_stdout_chars": 102400,
+                "max_return_chars": 8192,
+                "return_format": "auto",
+                "return_expression": "x",
+            },
         )
 
     @pytest.mark.asyncio

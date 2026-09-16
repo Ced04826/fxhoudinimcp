@@ -64,11 +64,10 @@ def direct_modeling_workflow(
 ) -> str:
     """Guide for direct polygon modeling: cages, reference rebuilds, retopology.
 
-    Distinct from procedural_modeling_workflow (kit-bashing from primitives):
-    this is the contract for hand-shaped quad meshes driven through the
-    modeling tools (get_mesh_report, edit_points, compare_geometry,
-    render_views, verify_reload, modeling_recipe), with the node choices
-    verified against Houdini 22.0 and the Modeler plugin.
+    Covers native Boolean/bevel modeling, local SubD, reference rebuilds and
+    retopology with task-scoped geometry, UV and visual checks. Uses
+    get_mesh_report, edit_points and compare_geometry alongside generic node
+    tools. Quad-only topology and export/reload validation are not defaults.
 
     Args:
         description: The part to model and what it must match

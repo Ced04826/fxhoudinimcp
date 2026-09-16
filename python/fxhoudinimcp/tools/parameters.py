@@ -38,18 +38,47 @@ async def get_parameter(ctx: Context, node_path: str, parm_name: str) -> dict:
 
 
 @mcp.tool()
-async def set_parameter(ctx: Context, node_path: str, parm_name: str, value: Value) -> dict:
-    """Set a parameter value.
+async def set_parameter(
+    ctx: Context,
+    node_path: str,
+    parm_name: str,
+    value: Value,
+    expression_policy: str = "preserve",
+    return_values: str = "summary",
+) -> dict:
+    """Set a parameter value and read back what the node now evaluates to.
+
+    A list sets a whole vector parameter ("size", "t"); a scalar on a
+    vector name broadcasts across its components.
+
+    The receipt reports the evaluated value, the raw text behind it, and
+    `matches_requested` when the two disagree — which is how you find out
+    that a parameter you just wrote is still being driven by an expression.
 
     Args:
         node_path: Node path.
         parm_name: Parameter name.
         value: New value (int, float, string, bool, or list).
+        expression_policy: What to do when the parameter is already driven.
+            "preserve" (default) refuses and names the expression rather
+            than overwriting it. "replace" clears the keyframes and
+            expression on the addressed component first, then writes the
+            literal — a channel reference is cleared where it is written
+            and never followed to the parameter it points at.
+        return_values: "summary" (default) compacts values over ~200
+            characters to length/hash/samples, "full" returns them whole,
+            "none" returns names only.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
         "parameters.set_parameter",
-        {"node_path": node_path, "parm_name": parm_name, "value": value},
+        {
+            "node_path": node_path,
+            "parm_name": parm_name,
+            "value": value,
+            "expression_policy": expression_policy,
+            "return_values": return_values,
+        },
     )
 
 
@@ -57,17 +86,36 @@ async def set_parameter(ctx: Context, node_path: str, parm_name: str, value: Val
 
 
 @mcp.tool()
-async def set_parameters(ctx: Context, node_path: str, params: dict[str, Any]) -> dict:
-    """Batch-set multiple parameters on a node.
+async def set_parameters(
+    ctx: Context,
+    node_path: str,
+    params: dict[str, Any],
+    expression_policy: str = "preserve",
+    return_values: str = "summary",
+) -> dict:
+    """Batch-set multiple parameters on a node, with read-back evidence.
+
+    Identical rules to set_parameter, including list values for vector
+    parameters. Per-parameter failures are reported in `errors` and do not
+    stop the rest; `success` is false if any occurred.
 
     Args:
         node_path: Node path.
         params: Mapping of parameter names to values.
+        expression_policy: "preserve" (default) refuses to overwrite an
+            existing expression or keyframes and says which; "replace"
+            clears them on the addressed component first.
+        return_values: "summary" (default), "full", or "none".
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
         "parameters.set_parameters",
-        {"node_path": node_path, "params": params},
+        {
+            "node_path": node_path,
+            "params": params,
+            "expression_policy": expression_policy,
+            "return_values": return_values,
+        },
     )
 
 
