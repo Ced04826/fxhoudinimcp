@@ -209,7 +209,7 @@ def start(
             daemon=True,
         )
         _server_thread.start()
-        if wait:
+        if wait or not background:
             try:
                 _confirm_ready(None)
             finally:
@@ -220,6 +220,13 @@ def start(
         else:
             worker = threading.Thread(target=_confirm_ready_async, args=(None,), daemon=True)
             worker.start()
+        if not background:
+            # THREAD_SERVER is a version probe, not a UI probe: hython 22 lands
+            # here too, and returning would let the script finish and the
+            # process exit with the daemon owner thread. Block on it, as the
+            # pre-H22 foreground run() below blocks, so the process lives on
+            # to serve.
+            _server_thread.join()
         return
 
     # Pre-H22 uses process-global registration state.
