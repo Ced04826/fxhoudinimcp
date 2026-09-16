@@ -43,6 +43,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server import geometry_math as gm
+from fxhoudinimcp_server.config import place_new_node
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import as_int, as_text
 
@@ -1269,7 +1270,7 @@ def _edit_points(
         if target.name() != node_name:
             renamed_from = node_name
         target.setInput(0, source, 0)
-        target.moveToGoodPosition()
+        place_new_node(target)
         if source.isDisplayFlagSet():
             # Leaving the display flag upstream hides the very edit just made.
             target.setDisplayFlag(True)

@@ -31,10 +31,25 @@ from fxhoudinimcp_server.handlers import (  # noqa: E402
 def _tuple_node(name: str, size: int) -> MagicMock:
     node = MagicMock()
     node.path.return_value = "/stage/moon"
-    components = [MagicMock(**{"eval.return_value": 0.5}) for _ in range(size)]
+    # A plain, unlocked, unkeyed value on each component: the write pre-flight
+    # reads expression(), keyframes() and isLocked(), and a bare MagicMock
+    # answers all three with something truthy.
+    components = [
+        MagicMock(
+            **{
+                "eval.return_value": 0.5,
+                "rawValue.return_value": "0.5",
+                "expression.side_effect": RuntimeError("no expression"),
+                "keyframes.return_value": (),
+                "isLocked.return_value": False,
+            }
+        )
+        for _ in range(size)
+    ]
     parm_tuple = MagicMock()
     parm_tuple.__len__.return_value = size
-    parm_tuple.__iter__.return_value = iter(components)
+    parm_tuple.__iter__.side_effect = lambda: iter(components)
+    parm_tuple.components = components
     node.parmTuple.side_effect = lambda n: parm_tuple if n == name else None
     node.parm.side_effect = lambda n: None if n == name else MagicMock()
     node.parms.return_value = []
@@ -49,7 +64,10 @@ def test_batch_set_parameters_sets_a_colour_tuple(monkeypatch):
 
     out = parameter_handlers._set_parameters("/stage/moon", {"xn__inputscolor_zta": [1, 0.8, 0.6]})
 
-    parm_tuple.set.assert_called_once_with([1, 0.8, 0.6])
+    # Written component by component, so a failure can name the component and
+    # report the ones already applied; the tuple as a whole is never set().
+    parm_tuple.set.assert_not_called()
+    assert [c.set.call_args.args[0] for c in parm_tuple.components] == [1, 0.8, 0.6]
     assert out["errors"] == []
     assert out["set"][0]["parm_name"] == "xn__inputscolor_zta"
 
@@ -315,7 +333,7 @@ async def test_no_timeout_sentinel_disables_the_http_deadline(monkeypatch):
     seen = {}
 
     class FakeClient:
-        async def post(self, url, data=None, timeout="unset"):
+        async def get(self, url, params=None, timeout="unset"):
             seen["timeout"] = timeout
             return MagicMock()
 
@@ -323,9 +341,9 @@ async def test_no_timeout_sentinel_disables_the_http_deadline(monkeypatch):
         return FakeClient()
 
     monkeypatch.setattr(b, "_get_client", fake_client)
-    await b._post({}, timeout=bridge_mod.NO_TIMEOUT)
+    await b._request("[]", timeout=bridge_mod.NO_TIMEOUT)
     assert seen["timeout"] is None
-    await b._post({})
+    await b._request("[]")
     assert seen["timeout"] == 7.0
 
 
