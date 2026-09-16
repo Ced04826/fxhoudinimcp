@@ -20,8 +20,10 @@ from support import tool_input_schema
 # Internal
 from fxhoudinimcp.tools.modeling import (
     compare_geometry,
+    compare_surfaces,
     edit_points,
     get_mesh_report,
+    get_uv_report,
 )
 
 # The handler module imports hou at module scope; the maths below does not use
@@ -33,6 +35,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "houdini", "scr
 
 from fxhoudinimcp_server.handlers.modeling_handlers import (  # noqa: E402
     COMMENT_MARKER,
+    SCHEMA_VERSION,
+    _check_schema_version,
+    _quality_selection,
+    _resolved_thresholds,
+    _tolerance_list,
     apply_moves,
     boundary_report,
     build_edge_faces,
@@ -312,6 +319,56 @@ class TestGeoDocumentParsing:
         with pytest.raises(ValueError, match="lists sizes for"):
             extract_faces(document)
 
+    def test_vertex_numbers_come_back_when_asked_for(self):
+        """A vertex attribute like uv is indexed by these, not by point number."""
+        document = self._document(
+            [
+                [
+                    ["type", "Polygon_run"],
+                    ["startvertex", 0, "nprimitives", 4, "nvertices_rle", [4, 4]],
+                ]
+            ],
+            [0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6, 4, 5, 8, 7],
+            9,
+            4,
+        )
+        parsed = extract_faces(document, with_vertices=True)
+        assert parsed["face_vertices"] == [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+            [8, 9, 10, 11],
+            [12, 13, 14, 15],
+        ]
+        assert parsed["vertex_count"] == 16
+        # The point ids of face 1 are its own; the vertex numbers are global.
+        assert parsed["faces"][1] == (1, [1, 2, 5, 4])
+
+    def test_vertex_numbers_stay_out_of_the_way_by_default(self):
+        """They double the memory of the parse, so nothing else pays for them."""
+        document = self._document(
+            [
+                [
+                    ["type", "Polygon_run"],
+                    ["startvertex", 0, "nprimitives", 4, "nvertices_rle", [4, 4]],
+                ]
+            ],
+            [0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6, 4, 5, 8, 7],
+            9,
+            4,
+        )
+        assert extract_faces(document)["face_vertices"] == []
+
+    def test_an_explicit_vertex_list_keeps_its_own_numbering(self):
+        document = self._document(
+            [[["type", "Polygon"], ["vertex", [2, 0, 1], "closed", True]]],
+            [5, 6, 7],
+            8,
+            1,
+        )
+        parsed = extract_faces(document, with_vertices=True)
+        assert parsed["faces"] == [(0, [7, 5, 6])]
+        assert parsed["face_vertices"] == [[2, 0, 1]]
+
 
 ###### The MCP wrapper
 
@@ -355,15 +412,113 @@ class TestGetMeshReportTool:
         assert "dump_path" not in params
 
     @pytest.mark.asyncio
+    async def test_passes_the_quality_arguments_when_given(self, mock_ctx, mock_bridge):
+        await get_mesh_report(
+            mock_ctx,
+            node_path="/obj/geo1/grid1",
+            quality_checks=["corner_angle"],
+            thresholds={"max_corner_angle_deg": 175.0},
+            schema_version=1,
+        )
+        _command, params = mock_bridge.execute.call_args.args
+        assert params["quality_checks"] == ["corner_angle"]
+        assert params["thresholds"] == {"max_corner_angle_deg": 175.0}
+        assert params["schema_version"] == 1
+
+    @pytest.mark.asyncio
     async def test_schema_types_every_parameter(self):
         from fxhoudinimcp.server import mcp
 
         tools = {tool.name: tool for tool in await mcp.list_tools()}
         schema = tool_input_schema(tools["get_mesh_report"])
         properties = schema["properties"]
-        assert set(properties) >= {"node_path", "group", "max_list", "dump_path"}
+        assert set(properties) >= {
+            "node_path",
+            "group",
+            "max_list",
+            "dump_path",
+            "quality_checks",
+            "thresholds",
+            "schema_version",
+        }
         assert properties["node_path"]["type"] == "string"
         assert properties["max_list"]["type"] == "integer"
+
+
+class TestQualityCheckArguments:
+    """The checks are opt-in, so a typo has to be a refusal, not a silent no-op."""
+
+    def test_no_checks_by_default(self):
+        assert _quality_selection(None) == []
+
+    def test_a_single_name_is_accepted_as_itself(self):
+        assert _quality_selection("corner_angle") == ["corner_angle"]
+
+    def test_duplicates_collapse(self):
+        assert _quality_selection(["corner_angle", "corner_angle"]) == ["corner_angle"]
+
+    def test_an_unknown_check_names_the_real_ones(self):
+        with pytest.raises(ValueError, match="corner_angle") as caught:
+            _quality_selection(["corner_angles"])
+        assert "not a check" in str(caught.value)
+
+    def test_a_non_list_is_refused(self):
+        with pytest.raises(ValueError, match="must be a list"):
+            _quality_selection(7)
+
+    def test_thresholds_default_and_override(self):
+        defaults = _resolved_thresholds(None)
+        assert defaults["min_corner_angle_deg"] == 10.0
+        assert defaults["max_corner_angle_deg"] == 170.0
+        assert _resolved_thresholds({"planarity_ratio": 0.05})["planarity_ratio"] == 0.05
+
+    def test_an_unknown_threshold_is_refused(self):
+        with pytest.raises(ValueError, match="no check reads"):
+            _resolved_thresholds({"max_angle": 170})
+
+    def test_a_threshold_band_that_cannot_be_met_is_refused(self):
+        with pytest.raises(ValueError, match="above max_corner_angle_deg"):
+            _resolved_thresholds({"min_corner_angle_deg": 175.0, "max_corner_angle_deg": 5.0})
+
+    def test_a_negative_threshold_is_refused(self):
+        with pytest.raises(ValueError, match=">= 0"):
+            _resolved_thresholds({"planarity_ratio": -1})
+
+    def test_schema_version_passes_when_it_matches_and_refuses_when_it_does_not(self):
+        _check_schema_version(None)
+        _check_schema_version(SCHEMA_VERSION)
+        with pytest.raises(ValueError, match="version"):
+            _check_schema_version(SCHEMA_VERSION + 1)
+
+
+class TestSurfaceTolerances:
+    """An unnamed tolerance is derived from the geometry, and says so."""
+
+    def test_auto_scales_with_the_bounding_box(self):
+        values, source = _tolerance_list(None, 200.0)
+        assert values == [0.2]
+        assert source.startswith("auto") and "0.001" in source
+
+    def test_auto_never_returns_zero_for_a_flat_bbox(self):
+        values, _source = _tolerance_list(None, 0.0)
+        assert values[0] > 0.0
+
+    def test_a_single_number_is_accepted(self):
+        assert _tolerance_list(0.5, 10.0) == ([0.5], "given")
+
+    def test_values_are_sorted_and_deduplicated(self):
+        values, _source = _tolerance_list([0.1, 0.01, 0.1], 10.0)
+        assert values == [0.01, 0.1]
+
+    def test_refusals_name_the_argument(self):
+        with pytest.raises(ValueError, match="tolerances"):
+            _tolerance_list([], 1.0)
+        with pytest.raises(ValueError, match=">= 0"):
+            _tolerance_list([-1.0], 1.0)
+        with pytest.raises(ValueError, match="finite"):
+            _tolerance_list([float("inf")], 1.0)
+        with pytest.raises(ValueError, match="four is the most"):
+            _tolerance_list([1, 2, 3, 4, 5], 1.0)
 
 
 ###### edit_points: validating an entry list before anything is written
@@ -743,3 +898,176 @@ class TestCompareGeometryTool:
         assert set(properties) >= {"a", "b", "tolerance", "max_list", "dump_path"}
         assert properties["a"]["type"] == "string"
         assert properties["tolerance"]["type"] == "number"
+
+
+class TestCompareSurfacesTool:
+    @pytest.mark.asyncio
+    async def test_delegates_with_defaults(self, mock_ctx, mock_bridge):
+        mock_bridge.execute.return_value = {"max_both": 0.0}
+        result = await compare_surfaces(mock_ctx, a="/obj/geo1/a", b="/obj/geo1/b")
+        mock_bridge.execute.assert_called_once_with(
+            "modeling.compare_surfaces",
+            {
+                "a": "/obj/geo1/a",
+                "b": "/obj/geo1/b",
+                "samples": 4000,
+                "seed": 0,
+                "space": "sop",
+                "max_list": 5,
+            },
+        )
+        assert result == {"max_both": 0.0}
+
+    @pytest.mark.asyncio
+    async def test_regions_tolerances_and_space_are_passed_through(self, mock_ctx, mock_bridge):
+        await compare_surfaces(
+            mock_ctx,
+            a="/obj/geo1/a",
+            b="/obj/geo2/b",
+            samples=16000,
+            seed=11,
+            tolerances=[0.001, 0.01],
+            region_group_a="hub",
+            region_group_b="hub",
+            space="world",
+            dump_path="/tmp/surface.json",
+        )
+        _command, params = mock_bridge.execute.call_args.args
+        assert params["tolerances"] == [0.001, 0.01]
+        assert params["region_group_a"] == "hub"
+        assert params["region_group_b"] == "hub"
+        assert params["space"] == "world"
+        assert params["samples"] == 16000
+        assert params["dump_path"] == "/tmp/surface.json"
+
+    @pytest.mark.asyncio
+    async def test_optional_arguments_stay_out_of_the_payload(self, mock_ctx, mock_bridge):
+        """A literal None for a region group would read as a group named None."""
+        await compare_surfaces(mock_ctx, a="/obj/geo1/a", b="/obj/geo1/b")
+        _command, params = mock_bridge.execute.call_args.args
+        assert not {"tolerances", "region_group_a", "region_group_b", "dump_path"} & set(params)
+
+    @pytest.mark.asyncio
+    async def test_schema_types_every_parameter(self):
+        from fxhoudinimcp.server import mcp
+
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        schema = tool_input_schema(tools["compare_surfaces"])
+        properties = schema["properties"]
+        assert set(properties) >= {
+            "a",
+            "b",
+            "samples",
+            "seed",
+            "tolerances",
+            "region_group_a",
+            "region_group_b",
+            "space",
+            "max_list",
+            "dump_path",
+        }
+        assert properties["samples"]["type"] == "integer"
+        assert properties["space"]["type"] == "string"
+
+    @pytest.mark.asyncio
+    async def test_the_description_says_what_it_measures_and_what_it_does_not(self):
+        """Coverage is containment; calling it similarity is what invites a
+        "looks the same" verdict nothing here measures. The triangulation is
+        worth naming too, since it is what makes a=a measure zero."""
+        from fxhoudinimcp.server import mcp
+
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        # Wrapped at the column the file is written in, so compare on words.
+        description = " ".join((tools["compare_surfaces"].description or "").lower().split())
+        assert "one-way containment" in description
+        assert "not similarity and not a verdict" in description
+        assert "divide verb" in description
+
+
+class TestGetUVReportTool:
+    @pytest.mark.asyncio
+    async def test_delegates_with_defaults(self, mock_ctx, mock_bridge):
+        mock_bridge.execute.return_value = {"counts": {"islands": 4}}
+        result = await get_uv_report(mock_ctx, node_path="/obj/geo1/uvlayout1")
+        mock_bridge.execute.assert_called_once_with(
+            "modeling.get_uv_report",
+            {
+                "node_path": "/obj/geo1/uvlayout1",
+                "uv_attribute": "uv",
+                "allow_stacking": False,
+                "max_list": 20,
+            },
+        )
+        assert result == {"counts": {"islands": 4}}
+
+    @pytest.mark.asyncio
+    async def test_every_optional_argument_is_passed_when_given(self, mock_ctx, mock_bridge):
+        await get_uv_report(
+            mock_ctx,
+            node_path="/obj/geo1/uvlayout1",
+            uv_attribute="uv2",
+            group="shell",
+            overlap_area_tolerance=1e-10,
+            allow_stacking=True,
+            stack_tolerance=1e-5,
+            texture_resolution=2048,
+            stretch_threshold=1.5,
+            max_list=5,
+            dump_path="/tmp/uv.json",
+        )
+        _command, params = mock_bridge.execute.call_args.args
+        assert params == {
+            "node_path": "/obj/geo1/uvlayout1",
+            "uv_attribute": "uv2",
+            "allow_stacking": True,
+            "max_list": 5,
+            "group": "shell",
+            "overlap_area_tolerance": 1e-10,
+            "stack_tolerance": 1e-5,
+            "texture_resolution": 2048,
+            "stretch_threshold": 1.5,
+            "dump_path": "/tmp/uv.json",
+        }
+
+    @pytest.mark.asyncio
+    async def test_optional_arguments_stay_out_of_the_payload(self, mock_ctx, mock_bridge):
+        await get_uv_report(mock_ctx, node_path="/obj/geo1/uvlayout1", group=None)
+        _command, params = mock_bridge.execute.call_args.args
+        assert "group" not in params
+        assert "texture_resolution" not in params
+
+    @pytest.mark.asyncio
+    async def test_schema_types_every_parameter(self):
+        from fxhoudinimcp.server import mcp
+
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        schema = tool_input_schema(tools["get_uv_report"])
+        properties = schema["properties"]
+        assert set(properties) >= {
+            "node_path",
+            "uv_attribute",
+            "group",
+            "overlap_area_tolerance",
+            "allow_stacking",
+            "stack_tolerance",
+            "texture_resolution",
+            "stretch_threshold",
+            "max_list",
+            "dump_path",
+        }
+        assert properties["allow_stacking"]["type"] == "boolean"
+        # Optional arguments arrive as anyOf[type, null]; the type still has to
+        # be there, or a client will send a string where a pixel count belongs.
+        optional = {
+            entry.get("type") for entry in properties["texture_resolution"].get("anyOf", [])
+        }
+        assert "integer" in optional
+
+    @pytest.mark.asyncio
+    async def test_the_description_says_what_allow_stacking_cannot_hide(self):
+        from fxhoudinimcp.server import mcp
+
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        description = (tools["get_uv_report"].description or "").lower()
+        assert "cannot hide" in description
+        assert "not a" in description and "union" in description

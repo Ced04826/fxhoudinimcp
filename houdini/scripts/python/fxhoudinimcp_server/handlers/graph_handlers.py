@@ -27,6 +27,13 @@ import hou
 from fxhoudinimcp_server.config import layout_if_enabled, place_new_nodes
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
+from fxhoudinimcp_server.handlers.state_receipt_helpers import (
+    check_parm_value,
+    clip,
+    parse_input_entries,
+    resolve_input_policy,
+    terminal_names,
+)
 from fxhoudinimcp_server.outputs import license_error
 
 ###### Helpers
@@ -102,35 +109,104 @@ def _is_dynamic_menu(probe: hou.Node, parm: hou.Parm) -> bool:
         return False
 
 
-def _parm_names_for_type(scratch: hou.Node, node_type) -> tuple[set, set, dict, list]:
-    """Instantiate a type once to learn its parm names, tuple names, menus and
-    multiparm instance patterns.
+class _TypeKnowledge(tuple):
+    """What one probe of a node type teaches the validation pass.
+
+    A tuple, so `parm_names, tuple_names, menus, instance_patterns = ...` reads
+    as it always did. The per-parameter shapes ride along as an attribute
+    rather than a fifth element because they come off the same probe, and
+    instantiating a second node to learn them would double what validating a
+    type costs the user's scene.
+    """
+
+    def __new__(cls, parm_names, tuple_names, menus, instance_patterns, shapes):
+        self = super().__new__(cls, (parm_names, tuple_names, menus, instance_patterns))
+        self.shapes = shapes
+        return self
+
+
+def _parm_names_for_type(scratch: hou.Node, node_type) -> _TypeKnowledge:
+    """Instantiate a type once to learn its parm names, tuple names, menus,
+    multiparm instance patterns and per-parameter shapes.
 
     The third element maps a strict-menu parm name to its token list. Only
     menus that reject arbitrary text are recorded (int menus and "normal"
     string menus); a free-text field with a suggestion menu is not a menu.
     The fourth is what `_instance_patterns` returns.
+
+    Shapes (`.shapes`) are learned here because names alone caught a
+    misspelling and nothing else, so a spec that named a real three-float
+    parameter and handed it two numbers validated cleanly and then failed
+    during the build -- after other nodes had been created. The component count
+    and template type are knowable from the probe, so they are checked here.
     """
     probe = scratch.createNode(node_type.name())
-    parm_names = {p.name() for p in probe.parms()}
-    tuple_names = {pt.name() for pt in probe.parmTuples()}
-    menus: dict[str, list[str]] = {}
-    for parm in probe.parms():
-        if _is_dynamic_menu(probe, parm):
-            continue
-        with contextlib.suppress(Exception):
-            template = parm.parmTemplate()
-            items = list(parm.menuItems())
-            if items and (
-                template.type() == hou.parmTemplateType.Menu
-                or (
-                    template.type() == hou.parmTemplateType.String
-                    and template.menuType() == hou.menuType.Normal
+    try:
+        parm_names = {p.name() for p in probe.parms()}
+        tuple_names = {pt.name() for pt in probe.parmTuples()}
+        menus: dict[str, list[str]] = {}
+        for parm in probe.parms():
+            if _is_dynamic_menu(probe, parm):
+                continue
+            with contextlib.suppress(Exception):
+                template = parm.parmTemplate()
+                items = list(parm.menuItems())
+                if items and (
+                    template.type() == hou.parmTemplateType.Menu
+                    or (
+                        template.type() == hou.parmTemplateType.String
+                        and template.menuType() == hou.menuType.Normal
+                    )
+                ):
+                    menus[parm.name()] = items
+        shapes: dict[str, dict] = {}
+        for parm_tuple in probe.parmTuples():
+            with contextlib.suppress(Exception):
+                template = parm_tuple.parmTemplate()
+                shapes[parm_tuple.name()] = {
+                    "type": template.type().name(),
+                    "components": len(parm_tuple),
+                    "is_tuple": len(parm_tuple) > 1,
+                }
+        for parm in probe.parms():
+            with contextlib.suppress(Exception):
+                template = parm.parmTemplate()
+                shapes.setdefault(
+                    parm.name(),
+                    {"type": template.type().name(), "components": 1, "is_tuple": False},
                 )
-            ):
-                menus[parm.name()] = items
-    probe.destroy()
-    return parm_names, tuple_names, menus, _instance_patterns(node_type)
+    finally:
+        with contextlib.suppress(Exception):
+            probe.destroy()
+    # A type whose templates cannot be read still validates on names; it just
+    # loses the multiparm exemption rather than taking the whole build down.
+    patterns: list[re.Pattern] = []
+    with contextlib.suppress(Exception):
+        patterns = _instance_patterns(node_type)
+    return _TypeKnowledge(parm_names, tuple_names, menus, patterns, shapes)
+
+
+# Learning a type's parameters means instantiating it, and instantiating it in
+# the user's network runs its creation scripts and disturbs flags and
+# selection. Doing that once per type per session instead of once per call is
+# the difference between a quiet validation and one that churns the scene.
+# Keyed on the type's definition timestamp as well, so re-saving an HDA does
+# not leave a stale answer behind.
+_TYPE_KNOWLEDGE: dict[tuple, _TypeKnowledge] = {}
+
+
+def _type_cache_key(category: hou.NodeTypeCategory, node_type) -> tuple:
+    stamp = None
+    with contextlib.suppress(Exception):
+        definition = node_type.definition()
+        if definition is not None:
+            stamp = definition.modificationTime()
+    return (category.name(), node_type.name(), stamp)
+
+
+def _type_knowledge(scratch: hou.Node, node_type) -> _TypeKnowledge:
+    """What one probe of *node_type* teaches, for the validation pass."""
+    return _parm_names_for_type(scratch, node_type)
 
 
 def _menu_error(parm_name: str, value: Any, tokens: list[str]) -> str | None:
@@ -179,16 +255,88 @@ def _apply_parm(node: hou.Node, name: str, value: Any) -> None:
         raise ValueError(f"parameter '{name}' not found")
 
 
-def _node_report(node: hou.Node) -> dict[str, Any]:
+def _actual_inputs(node: hou.Node) -> list[dict[str, Any]]:
+    """The connections the node really has, read back off the node.
+
+    Not the ones the spec asked for: the two differ whenever a creation
+    callback has an opinion, and the whole reason a caller asks for this is to
+    find out that they differ.
+    """
+    rows: list[dict[str, Any]] = []
+    try:
+        connections = node.inputConnections()
+    except Exception:  # noqa: BLE001 - not every node type has inputs
+        return rows
+    for connection in connections:
+        with contextlib.suppress(Exception):
+            source = connection.inputNode()
+            rows.append(
+                {
+                    "index": connection.inputIndex(),
+                    "source": source.path() if source is not None else None,
+                    "source_output": connection.outputIndex(),
+                }
+            )
+    return rows
+
+
+def _network_flags(parent: hou.Node) -> dict[str, Any]:
+    """The display node, render node and selection, for putting back afterwards."""
+    state: dict[str, Any] = {"display": None, "render": None, "selected": ()}
+    with contextlib.suppress(Exception):
+        state["display"] = parent.displayNode() if hasattr(parent, "displayNode") else None
+    with contextlib.suppress(Exception):
+        state["render"] = parent.renderNode() if hasattr(parent, "renderNode") else None
+    with contextlib.suppress(Exception):
+        state["selected"] = tuple(hou.selectedNodes())
+    return state
+
+
+def _restore_network_flags(state: dict[str, Any]) -> None:
+    """Put back what *state* recorded, skipping anything that has since gone."""
+    with contextlib.suppress(Exception):
+        if state.get("display") is not None:
+            state["display"].setDisplayFlag(True)
+    with contextlib.suppress(Exception):
+        if state.get("render") is not None:
+            state["render"].setRenderFlag(True)
+    # Per node: one of them having been destroyed in the meantime must not
+    # cost the others their selection.
+    for position, node in enumerate(state.get("selected") or ()):
+        with contextlib.suppress(Exception):
+            node.setSelected(True, clear_all_selected_first=position == 0)
+
+
+# A node's error can be a whole VEX compile listing, and a build reports one
+# per created node. Bounded per message and per node, with the count kept.
+_ERROR_CHARS = 400
+_ERROR_LINES = 5
+
+
+def _bounded_messages(messages: list) -> tuple:
+    """(the first few, clipped, total count) for a node's errors or warnings."""
+    shown = [clip(str(message), _ERROR_CHARS) for message in messages[:_ERROR_LINES]]
+    return shown, len(messages)
+
+
+def _node_report(node: hou.Node, inputs: bool = False) -> dict[str, Any]:
+    errors, error_count = _bounded_messages(list(node.errors()))
+    warnings, warning_count = _bounded_messages(list(node.warnings()))
     report: dict[str, Any] = {
         "name": node.name(),
         "path": node.path(),
         "type": node.type().name(),
-        "errors": list(node.errors()),
-        "warnings": list(node.warnings()),
+        "errors": errors,
+        "warnings": warnings,
     }
+    if error_count > len(errors):
+        report["error_count"] = error_count
+    if warning_count > len(warnings):
+        report["warning_count"] = warning_count
     with contextlib.suppress(Exception):
         report["bypassed"] = node.isBypassed()
+    if inputs:
+        report["inputs"] = _actual_inputs(node)
     return report
 
 
@@ -212,7 +360,123 @@ def _geometry_summary(node: hou.Node) -> dict[str, Any] | None:
     }
 
 
-###### graph.build_network
+###### graph.build_network -- the "exact" input policy
+#
+# Two passes, deliberately separate. The first mutates: it disconnects what the
+# spec did not ask for and re-connects what a callback moved, once, and lets a
+# refusal propagate so the build rolls back. The second only looks: it reads
+# every connection back off the nodes and compares the whole mapping -- index,
+# source path, source output -- against what was requested. Nothing here
+# retries, and nothing here decides a thing is wired because setInput did not
+# raise.
+
+
+def _requested_map(parsed: list) -> dict[int, tuple]:
+    """{index: (source path, source output)} for one spec, as wired."""
+    return {
+        entry["index"]: (entry.get("source_path") or entry["source"], entry["source_output"])
+        for entry in parsed
+    }
+
+
+def _enforce_exact_inputs(nodes: list, built: list, parsed_inputs: list) -> list:
+    """Make each node's inputs the ones its spec asked for. Raises on refusal."""
+    enforced: list[dict[str, Any]] = []
+    for spec, node, parsed in zip(nodes, built, parsed_inputs, strict=True):
+        # An absent "inputs" key is not a claim about inputs, so "exact" has
+        # nothing to enforce on it. An empty list is such a claim.
+        if spec.get("inputs") is None:
+            continue
+        wanted = _requested_map(parsed)
+        for connection in _actual_inputs(node):
+            index = connection["index"]
+            if index not in wanted:
+                try:
+                    node.setInput(index, None)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"{node.path()}: input {index} is connected to "
+                        f"{connection['source']} and the spec did not ask for "
+                        f"it, but disconnecting it failed: {readable_message(exc)}"
+                    ) from exc
+                enforced.append(
+                    {
+                        "path": node.path(),
+                        "index": index,
+                        "disconnected": connection["source"],
+                    }
+                )
+                continue
+            source_path, source_output = wanted[index]
+            if connection["source"] == source_path and connection["source_output"] == source_output:
+                continue
+            # A creation or parameter callback moved a connection this build
+            # already made. One corrective pass, then the read-back decides.
+            source = hou.node(str(source_path))
+            if source is None:
+                raise RuntimeError(
+                    f"{node.path()}: input {index} should come from "
+                    f"{source_path}, which no longer exists"
+                )
+            try:
+                node.setInput(index, source, source_output)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{node.path()}: input {index} was moved to "
+                    f"{connection['source']} and could not be set back to "
+                    f"{source_path}: {readable_message(exc)}"
+                ) from exc
+            enforced.append(
+                {
+                    "path": node.path(),
+                    "index": index,
+                    "rewired_from": connection["source"],
+                    "to": source_path,
+                }
+            )
+    return enforced
+
+
+def _input_mismatches(nodes: list, built: list, parsed_inputs: list) -> list:
+    """Every way the wiring still differs from the spec, read off the nodes."""
+    mismatches: list[dict[str, Any]] = []
+    for spec, node, parsed in zip(nodes, built, parsed_inputs, strict=True):
+        if spec.get("inputs") is None:
+            continue
+        wanted = _requested_map(parsed)
+        actual = {row["index"]: (row["source"], row["source_output"]) for row in _actual_inputs(node)}
+        for index, (source_path, source_output) in sorted(wanted.items()):
+            if index not in actual:
+                mismatches.append(
+                    {"path": node.path(), "index": index, "expected": source_path, "actual": None}
+                )
+            elif actual[index] != (source_path, source_output):
+                mismatches.append(
+                    {
+                        "path": node.path(),
+                        "index": index,
+                        "expected": source_path,
+                        "expected_output": source_output,
+                        "actual": actual[index][0],
+                        "actual_output": actual[index][1],
+                    }
+                )
+        for index in sorted(set(actual) - set(wanted)):
+            mismatches.append(
+                {
+                    "path": node.path(),
+                    "index": index,
+                    "expected": None,
+                    "actual": actual[index][0],
+                }
+            )
+    return mismatches
+
+
+# How many built nodes one call will cook and report on. Cooking is the
+# expensive half of this command, and a caller that wants more than a handful
+# of outputs proved is asking the wrong command.
+_INSPECT_CAP = 8
 
 
 def build_network(
@@ -220,14 +484,20 @@ def build_network(
     nodes: list,
     dry_run: bool = False,
     layout: bool = True,
+    input_policy: str = "preserve",
+    inspect_nodes: list | str | None = None,
     **_: Any,
 ) -> dict:
     """Build a whole node network atomically, with upfront validation.
 
-    Every node type, parameter name, and input reference in the spec is
-    validated against the running Houdini BEFORE anything is created —
-    invalid specs return the full error list and mutate nothing. With
-    dry_run=True only the validation runs.
+    Every node type, parameter name, parameter shape, and input reference in
+    the spec is validated against the running Houdini BEFORE anything is
+    created — invalid specs return the full error list and mutate nothing.
+    With dry_run=True only the validation runs.
+
+    What comes back is evidence rather than assertion: the inputs each node
+    really ended up with, the cook result of the nodes this build produced,
+    and which node the geometry figures were read from.
 
     Args:
         parent_path: Network to build inside (e.g. "/obj/geo1").
@@ -236,7 +506,8 @@ def build_network(
             name (str): node name, referenceable by later specs.
             parms (dict): parameter values; lists set whole parm tuples.
             inputs (list): wiring. Entries are either a source string
-                (wired positionally) or {"index", "source",
+                (wired positionally), null (holds the position without
+                connecting anything), or {"index", "source",
                 "source_output"}. Sources resolve to spec node names
                 first, then children of parent, then absolute paths.
             flags (dict): display/render/bypass/template booleans.
@@ -246,9 +517,40 @@ def build_network(
             happens when FXHOUDINIMCP_AUTO_LAYOUT is enabled. It does not gate
             placement: the nodes this call creates are always positioned, each
             relative to its inputs, and nodes that already existed never move.
+        input_policy: What to do about inputs the spec did not ask for.
+            "preserve" (default, and what this command has always done)
+            connects what the spec names and leaves everything else as
+            Houdini and any creation callbacks left it. "exact" additionally,
+            AFTER every creation callback has run, disconnects any input of a
+            node whose "inputs" key is present that the spec did not name and
+            puts back any the callbacks moved — so an environment that
+            auto-wires new nodes is overruled rather than suppressed, and
+            "inputs": [] really does mean no inputs. Omitting "inputs"
+            entirely still means "no opinion" under both policies, so existing
+            specs behave identically.
+            Under "exact" the whole mapping (index, source, source output) is
+            then read back off the nodes and compared with the request: a
+            refusal from Houdini rolls the build back, and a mapping that
+            still differs comes back as success=false with input_mismatches
+            and created_paths rather than as a build that worked.
+        inspect_nodes: Which of the nodes this build created to cook and
+            report on. Names from the spec or paths of created nodes.
+            Defaults to the build's terminal nodes — the ones nothing else
+            in the build consumes. Nodes outside the build are refused
+            rather than cooked, because cooking a scene this call did not
+            touch is both expensive and not evidence about this call.
     """
     parent = hou.node(parent_path)
     errors: list[str] = []
+    try:
+        input_policy = resolve_input_policy(input_policy)
+    except ValueError as exc:
+        return {
+            "success": False,
+            "valid": False,
+            "errors": [str(exc)],
+            "message": str(exc),
+        }
     if parent is None:
         return {
             "success": False,
@@ -303,39 +605,53 @@ def build_network(
                 errors.append(f"node '{name}' already exists under {parent_path}")
             spec_names.append(name)
 
-    # Learn parameter names by instantiating each unique type once (probe
-    # nodes are destroyed immediately; display/render flags restored), so
-    # bad parm names fail validation, not the build. Runs even when other
+    # Learn each unique type's parameters by instantiating it once (probe nodes
+    # are destroyed immediately; display/render flags and the user's selection
+    # are put back), so a bad parm name or a three-float parm handed two
+    # numbers fails validation rather than the build. Runs even when other
     # errors exist: report everything in one pass.
-    parm_knowledge: dict[str, tuple[set, set, dict, list]] = {}
-    if resolved_types:
-        display_before = parent.displayNode() if hasattr(parent, "displayNode") else None
-        render_before = parent.renderNode() if hasattr(parent, "renderNode") else None
+    parm_knowledge: dict[str, _TypeKnowledge] = {}
+    unknown_types = [
+        (type_name, node_type)
+        for type_name, node_type in resolved_types.items()
+        if _type_cache_key(category, node_type) not in _TYPE_KNOWLEDGE
+    ]
+    for type_name, node_type in resolved_types.items():
+        cached = _TYPE_KNOWLEDGE.get(_type_cache_key(category, node_type))
+        if cached is not None:
+            parm_knowledge[type_name] = cached
+    if unknown_types:
+        # A probe that stole the display flag or the selection leaves the user
+        # looking at something else, and a dry run must leave no trace at all.
+        before_probing = _network_flags(parent)
         try:
-            for type_name, node_type in resolved_types.items():
-                parm_knowledge[type_name] = _parm_names_for_type(parent, node_type)
+            for type_name, node_type in unknown_types:
+                knowledge = _type_knowledge(parent, node_type)
+                _TYPE_KNOWLEDGE[_type_cache_key(category, node_type)] = knowledge
+                parm_knowledge[type_name] = knowledge
         finally:
-            with contextlib.suppress(Exception):
-                if display_before is not None:
-                    display_before.setDisplayFlag(True)
-                if render_before is not None:
-                    render_before.setRenderFlag(True)
+            _restore_network_flags(before_probing)
 
+    # Parsed inputs are kept so the build wires exactly what validation
+    # approved, rather than re-deriving it from the spec a second way.
+    parsed_inputs: list[list[dict[str, Any]]] = []
     for index, spec in enumerate(nodes):
         label = spec.get("name") or spec.get("type") or f"#{index}"
         knowledge = parm_knowledge.get(spec.get("type"))
         if knowledge:
             parm_names, tuple_names, menus, instance_patterns = knowledge
-            for parm_name, value in (spec.get("parms") or {}).items():
+            for parm_name, parm_value in (spec.get("parms") or {}).items():
                 if parm_name in menus:
-                    problem = _menu_error(parm_name, value, menus[parm_name])
+                    problem = _menu_error(parm_name, parm_value, menus[parm_name])
                     if problem:
                         errors.append(f"node {label}: {problem}")
-                if (
-                    parm_name not in parm_names
-                    and parm_name not in tuple_names
-                    and not _is_instance_parm(parm_name, instance_patterns)
-                ):
+                info = knowledge.shapes.get(parm_name)
+                if info is None:
+                    # A multiparm instance has no template on a fresh probe, so
+                    # neither its name nor its shape is knowable here; the name
+                    # pattern is all there is to go on.
+                    if _is_instance_parm(parm_name, instance_patterns):
+                        continue
                     close = get_close_matches(
                         parm_name,
                         sorted(parm_names | tuple_names),
@@ -347,24 +663,20 @@ def build_network(
                         f"node {label}: parm '{parm_name}' does not exist "
                         f"on {spec.get('type')}.{hint}"
                     )
+                    continue
+                errors += check_parm_value(
+                    label, str(spec.get("type")), parm_name, parm_value, info
+                )
         node_type = resolved_types.get(spec.get("type"))
         max_inputs = node_type.maxNumInputs() if node_type else 0
-        for input_index, entry in enumerate(spec.get("inputs") or []):
-            if isinstance(entry, dict):
-                source = entry.get("source")
-                input_index = int(entry.get("index", input_index))
-            else:
-                source = entry
-            if input_index >= max_inputs > 0:
-                errors.append(
-                    f"node {label}: input {input_index} exceeds max inputs "
-                    f"({max_inputs}) of {spec.get('type')}"
-                )
-            if (
-                source not in spec_names
-                and source not in existing
-                and hou.node(str(source)) is None
-            ):
+        parsed, input_errors = parse_input_entries(spec.get("inputs"), max_inputs, label)
+        errors += input_errors
+        parsed_inputs.append(parsed)
+        for entry in parsed:
+            source = entry["source"]
+            if source in spec_names or source in existing:
+                continue
+            if hou.node(str(source)) is None:
                 errors.append(
                     f"node {label}: input source '{source}' is not a spec "
                     f"node, a child of {parent_path}, or an absolute path"
@@ -379,17 +691,33 @@ def build_network(
             "dry_run": True,
             "validated_nodes": len(nodes),
             "validated_types": sorted(t.name() for t in resolved_types.values()),
+            "input_policy": input_policy,
+            "planned_connections": sum(len(entries) for entries in parsed_inputs),
+            "note": (
+                "shapes and names are checked against the live node types; a "
+                "dry run does not cook, so it cannot predict cook errors"
+            ),
         }
 
     ###### Phase 2: build (atomic — any failure rolls back)
 
     created: dict[str, hou.Node] = {}
+    # Parallel to *nodes*, because two specs can end up under one key: a spec
+    # with no name is filed under whatever name Houdini generated, and zipping
+    # the spec list against a dict's values assumed those never collide.
+    built: list[hou.Node] = []
+    enforced: list[dict[str, Any]] = []
+    # A rolled-back build should leave the network as it found it. Destroying
+    # the node that holds the display flag hands that flag to something else,
+    # so a failed build used to change what the user was looking at.
+    flags_before = _network_flags(parent)
     try:
         for spec in nodes:
             node = parent.createNode(resolved_types[spec["type"]].name(), spec.get("name"))
+            built.append(node)
             created[spec.get("name") or node.name()] = node
 
-        for spec, node in zip(nodes, created.values(), strict=False):
+        for spec, node, parsed in zip(nodes, built, parsed_inputs, strict=True):
             for parm_name, value in (spec.get("parms") or {}).items():
                 try:
                     _apply_parm(node, parm_name, value)
@@ -406,19 +734,24 @@ def build_network(
                         f"{node.path()}: no parm '{parm_name}' to put an expression on"
                     )
                 parm.setExpression(str(expression))
-            for input_index, entry in enumerate(spec.get("inputs") or []):
-                if isinstance(entry, dict):
-                    source_name = entry.get("source")
-                    input_index = int(entry.get("index", input_index))
-                    source_output = int(entry.get("source_output", 0))
-                else:
-                    source_name, source_output = entry, 0
+            for entry in parsed:
+                source_name = entry["source"]
                 source = (
                     created.get(source_name)
                     or parent.node(str(source_name))
                     or hou.node(str(source_name))
                 )
-                node.setInput(input_index, source, source_output)
+                if source is None:
+                    # Validation resolved this name; between then and now
+                    # something removed it. setInput(index, None) would
+                    # quietly disconnect instead, which is not what was asked.
+                    raise RuntimeError(
+                        f"{node.path()} input {entry['index']}: source "
+                        f"'{source_name}' no longer exists"
+                    )
+                node.setInput(entry["index"], source, entry["source_output"])
+                # The path, not the name: what the read-back will report.
+                entry["source_path"] = source.path()
             flags = spec.get("flags") or {}
             for flag, setter in (
                 ("display", "setDisplayFlag"),
@@ -433,16 +766,42 @@ def build_network(
             if spec.get("comment"):
                 node.setComment(spec["comment"])
                 node.setGenericFlag(hou.nodeFlag.DisplayComment, True)
+
+        # Inside the atomic block on purpose: every creation callback and
+        # every parameter callback has now run, which is the moment "exact"
+        # is defined to act, and a refusal here rolls the build back rather
+        # than being swallowed into a receipt that claims exact wiring.
+        if input_policy == "exact":
+            enforced = _enforce_exact_inputs(nodes, built, parsed_inputs)
     except Exception as exc:
-        for node in created.values():
+        # Newest first: destroying a node that still feeds another one is the
+        # order most likely to be refused.
+        orphans = []
+        for node in reversed(built):
+            path = None
+            with contextlib.suppress(Exception):
+                path = node.path()
             with contextlib.suppress(Exception):
                 node.destroy()
-        return {
+            with contextlib.suppress(Exception):
+                if path and hou.node(path) is not None:
+                    orphans.append(path)
+        _restore_network_flags(flags_before)
+        failure = {
             "success": False,
             "valid": False,
             "errors": [f"build failed and was rolled back: {readable_message(exc)}"],
             "created": [],
+            "rolled_back": len(built),
         }
+        if orphans:
+            # Saying nothing here is how a caller retries into a name clash
+            # against the wreckage of the previous attempt.
+            failure["orphans"] = orphans
+            failure["errors"].append(
+                f"rollback could not destroy {len(orphans)} node(s): {orphans}"
+            )
+        return failure
 
     # Placement is a floor, not a layout option: whatever `layout` says and
     # whatever the auto-layout flag says, a node THIS call created must not be
@@ -456,25 +815,153 @@ def build_network(
         # by the auto-layout flag as before.
         layout_if_enabled(parent)
 
-    ###### Phase 3: verify — cook and report evidence
+    ###### Phase 2c: read the wiring back and compare it with what was asked
+
+    mismatches = (
+        _input_mismatches(nodes, built, parsed_inputs) if input_policy == "exact" else []
+    )
+
+    ###### Phase 3: verify — cook the nodes this build produced
+
+    order = list(created.keys())
+    edges = [
+        (spec.get("name") or node.name(), entry["source"])
+        for spec, node, parsed in zip(nodes, built, parsed_inputs, strict=True)
+        for entry in parsed
+    ]
+    unresolved: list[str] = []
+    if inspect_nodes is None:
+        targets = [created[name] for name in terminal_names(order, edges) if name in created]
+    else:
+        requested = [inspect_nodes] if isinstance(inspect_nodes, str) else list(inspect_nodes)
+        by_path = {node.path(): node for node in built}
+        by_name = {node.name(): node for node in built}
+        targets = []
+        for wanted in requested:
+            node = created.get(wanted) or by_path.get(str(wanted)) or by_name.get(str(wanted))
+            if node is None:
+                unresolved.append(str(wanted))
+            else:
+                targets.append(node)
+
+    inspected: list[dict[str, Any]] = []
+    cook_errors: list[dict[str, str]] = []
+    for target in targets[:_INSPECT_CAP]:
+        # Cook first, report second: a node's errors are only populated once it
+        # has tried to do its work, and reading them beforehand would cook it
+        # outside the measurement anyway.
+        began = time.time()
+        cook_error: str | None = None
+        try:
+            target.cook(force=False)
+        except hou.OperationFailed as exc:
+            cook_error = readable_message(exc).splitlines()[0][:300]
+            cook_errors.append({"path": target.path(), "error": cook_error})
+        elapsed = round((time.time() - began) * 1000, 1)
+        row = _node_report(target)
+        row["cook_ms"] = elapsed
+        if cook_error:
+            row["cook_error"] = cook_error
+        geometry = _geometry_summary(target)
+        if geometry is not None:
+            row["geometry"] = geometry
+        inspected.append(row)
+
+    reports = [_node_report(node, inputs=True) for node in built]
+    error_nodes = [r["path"] for r in reports if r["errors"]]
+    for row in inspected:
+        if row["errors"] and row["path"] not in error_nodes:
+            error_nodes.append(row["path"])
 
     display = parent.displayNode() if hasattr(parent, "displayNode") else None
-    if display is None:
-        display = list(created.values())[-1]
-    with contextlib.suppress(hou.OperationFailed):
-        display.cook(force=False)
+    queried = inspected[0] if inspected else None
 
-    reports = [_node_report(node) for node in created.values()]
-    error_nodes = [r["path"] for r in reports if r["errors"]]
-    return {
-        "success": True,
+    # How much of the build was actually checked. "cooked": true over an empty
+    # target list was the worst kind of answer -- a confident one about
+    # something nobody looked at.
+    omitted = max(0, len(targets) - _INSPECT_CAP)
+    verification: dict[str, Any] = {
+        "scope": "terminals" if inspect_nodes is None else "requested",
+        "targets_requested": len(targets) + len(unresolved),
+        "targets_inspected": len(inspected),
+        "targets_omitted": omitted,
+        "targets_unresolved": unresolved,
+        "complete": bool(inspected) and not omitted and not unresolved,
+    }
+    if not verification["complete"]:
+        verification["note"] = (
+            "nothing was cooked, so nothing about cooking is known"
+            if not inspected
+            else "some targets were not cooked; cooked/healthy cover only the inspected ones"
+        )
+
+    # None, not false: unknown is its own answer. A caller that treats None as
+    # falsy still does not get told everything was fine. "true" here means
+    # every target that was asked about was cooked and was clean -- so a
+    # truncated, unresolved or empty target list cannot produce one.
+    if cook_errors:
+        cooked: bool | None = False
+    elif verification["complete"]:
+        cooked = True
+    else:
+        cooked = None
+    if error_nodes or cook_errors:
+        healthy: bool | None = False
+    elif verification["complete"]:
+        healthy = True
+    else:
+        healthy = None
+
+    wiring_ok = not mismatches
+    result = {
+        # The build succeeded: the nodes exist and are wired as asked. Whether
+        # they cook is a separate question with a separate answer, because a
+        # single "success" covering both is how a broken network gets reported
+        # as a finished one. Wiring that does not match the request under
+        # input_policy="exact" is a failure of what was asked for, so it is not
+        # reported as a success either.
+        "success": wiring_ok,
         "valid": True,
         "created": reports,
-        "display_node": display.path() if display is not None else None,
-        "geometry": _geometry_summary(display),
-        "error_nodes": error_nodes,
         "node_count": len(reports),
+        "input_policy": input_policy,
+        "queried_node": queried["path"] if queried else None,
+        "geometry": queried.get("geometry") if queried else None,
+        "inspected": inspected,
+        "error_nodes": error_nodes,
+        "cook_errors": cook_errors,
+        "cooked": cooked,
+        "healthy": healthy,
+        "verification": verification,
+        "display_node": display.path() if display is not None else None,
+        # Whether the display node is even part of this build. When it is not,
+        # its geometry is evidence about somebody else's network, which is why
+        # it is no longer what "geometry" reports.
+        "display_node_in_build": bool(display is not None and display in built),
     }
+    if input_policy == "exact":
+        result["exact_inputs_verified"] = wiring_ok
+    if enforced:
+        result["enforced_inputs"] = enforced
+    if mismatches:
+        # The nodes exist and are listed, so the caller can fix or remove
+        # them; what they cannot do is believe the wiring is what they asked
+        # for.
+        result["input_mismatches"] = mismatches
+        result["errors"] = [
+            f"input_policy='exact' asked for wiring the network does not have "
+            f"after every callback ran: {len(mismatches)} mismatch(es)"
+        ]
+        result["created_paths"] = [report["path"] for report in reports]
+    if unresolved:
+        result["inspect_unresolved"] = unresolved
+        result["inspect_note"] = (
+            "inspect_nodes only addresses nodes this call created; the names "
+            "above were not among them and were not cooked"
+        )
+    if omitted:
+        result["inspect_truncated"] = omitted
+    return result
 
 
 ###### graph.verify_network
@@ -569,6 +1056,25 @@ def _help_text(node_type, category_name: str) -> str | None:
     return embedded or None
 
 
+def _menu_representation(template) -> str:
+    """"token" or "index" -- what a menu parameter stores, from the template.
+
+    Read off the template rather than inferred from the tokens' spelling: a
+    menu of "0", "1", "2" is still a token menu if the template says so, and a
+    menu of words can still be stored by index.
+    """
+    with contextlib.suppress(Exception):
+        if template.type() == hou.parmTemplateType.String:
+            return "token"
+    with contextlib.suppress(Exception):
+        if template.menuUseToken():
+            return "token"
+    with contextlib.suppress(Exception):
+        if template.type() == hou.parmTemplateType.Int:
+            return "index"
+    return "unknown"
+
+
 def get_node_card(
     node_type: str,
     context: str = "Sop",
@@ -636,6 +1142,12 @@ def get_node_card(
             items = list(template.menuItems())
             if items:
                 entry["menu"] = items[:_MENU_CAP]
+                # Which of the two things in a menu the parameter actually
+                # stores. A string parameter stores the token; an integer one
+                # stores the index unless its template says otherwise. Guessing
+                # from the look of the tokens is how "quads" gets written to a
+                # parameter that wanted 4.
+                entry["menu_value"] = _menu_representation(template)
                 if len(items) > _MENU_CAP:
                     # Silent truncation reads as "these are all the options",
                     # which is how a caller picks a token that is not in a menu
