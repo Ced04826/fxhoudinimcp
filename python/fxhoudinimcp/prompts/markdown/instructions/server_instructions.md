@@ -1,4 +1,4 @@
-Houdini MCP: 199 tools across 23 categories. Full rules: get_workflow_guide("discipline"), read once per session before building.
+Houdini MCP: 201 tools across 23 categories. Full rules: get_workflow_guide("discipline"), read once per session before building.
 
 1. PLAN, THEN BUILD IN ONE CALL. 3+ nodes = one build_network; dry_run=True for types new this session. Batch reads and sets: every call costs ~50 ms of main-thread marshalling, call count decides the wait.
 2. LOOK IT UP, NEVER GUESS. get_node_card for parms and inputs; search_help + get_help_page for SideFX's own workflow pages (a shelf/ or workflow hit is the answer, read it first); get_workflow_guide(topic) before designing a setup.

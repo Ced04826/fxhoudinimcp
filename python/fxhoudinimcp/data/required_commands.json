@@ -127,6 +127,8 @@
     "parameters.get_parameter",
     "parameters.get_parameter_schema",
     "parameters.get_parameters",
+    "parameters.get_parm_references",
+    "parameters.get_parm_template_tree",
     "parameters.link_parameters",
     "parameters.lock_parameter",
     "parameters.revert_parameter",
