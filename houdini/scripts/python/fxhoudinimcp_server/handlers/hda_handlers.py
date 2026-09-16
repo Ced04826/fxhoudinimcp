@@ -559,7 +559,10 @@ def list_hda_versions(node_path: str) -> dict:
     node = _get_node(node_path)
     current = _get_definition(node)
     node_type = node.type()
-    scope, namespace, name, _ = _type_name_components(node_type.name())
+    own = _type_name_components(node_type.name())
+    if own is None:
+        raise hou.OperationFailed(f"Cannot read the type name of '{node_type.name()}'")
+    scope, namespace, name, _ = own
 
     # Houdini keeps a version in the type name (brick::1.1 is a different
     # NodeType from brick), so allInstalledDefinitions() of one type never
