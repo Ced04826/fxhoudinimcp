@@ -220,3 +220,102 @@ async def list_hda_versions(ctx: Context, node_path: str) -> dict:
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute("hda.list_hda_versions", {"node_path": node_path})
+
+
+@mcp.tool()
+async def set_hda_interface(
+    ctx: Context,
+    node_path: str,
+    parameters: list[dict],
+    replace: bool = False,
+) -> dict:
+    """Author an HDA's Type Properties interface in one call.
+
+    Use this for the asset's TYPE interface — tab folders, strict ranges,
+    ordered menus, Hide/Disable When. `create_spare_parameter` is a different
+    thing: it adds parameters to one node instance and never reaches the type.
+
+    Each entry of `parameters` is a dict:
+        name, label, type (int|float|string|toggle|menu|folder),
+        default, min, max, min_strict, max_strict, components,
+        menu_items ([value, label] pairs or plain strings),
+        folder_type (tabs|simple|collapsible|radio) + children for folders,
+        hide_when / disable_when (Houdini conditionals), help.
+
+    Example — a Controls tab whose Bevel disappears for a single stud:
+        [{"name": "controls", "label": "Controls", "type": "folder",
+          "children": [
+            {"name": "stud_count", "type": "int", "default": 4,
+             "min": 1, "max": 8, "min_strict": True, "max_strict": True},
+            {"name": "bevel", "type": "float", "default": 0.02,
+             "min": 0.0, "max": 0.1, "hide_when": "{ stud_count == 1 }"},
+            {"name": "material", "type": "menu",
+             "menu_items": [["plastic", "Plastic"], ["metal", "Metal"]]}]}]
+
+    The result reports the interface read back off the definition — check
+    `applied` rather than assuming the spec landed.
+
+    Args:
+        ctx: MCP context.
+        node_path: An instance of the HDA whose definition is edited.
+        parameters: Interface spec (see above).
+        replace: Start from an empty interface. Note the built-in Transform and
+            Render folders live in that same group and would go too.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "hda.set_hda_interface",
+        {"node_path": node_path, "parameters": parameters, "replace": replace},
+    )
+
+
+@mcp.tool()
+async def edit_hda_interface(
+    ctx: Context,
+    node_path: str,
+    ops: list[dict],
+    dry_run: bool = False,
+) -> dict:
+    """Edit an HDA's EXISTING Type Properties interface in one atomic call:
+    insert at a position, remove, hide/show, replace, modify, move.
+
+    set_hda_interface only appends. Every op here works on the definition's
+    parameter group; all ops are applied to a copy, the result is checked
+    for component-name collisions, and it is written once — a failing op
+    changes nothing. Read the interface first with get_parm_template_tree.
+
+    Ops (dicts, applied in order):
+        {"op": "insert", "spec": {...}, "after": name | "before": name |
+            "in_folder": label or [labels]}  — omit the position to append.
+            spec is a set_hda_interface spec, plus types button (with
+            "callback", Python by default), separator, label, vector, color,
+            file, oppath; and fields naming_scheme (base1|xyzw|rgba|minmax|
+            startend|uvw), default_expression, hidden, join_with_next,
+            callback, tags; folder_type "multiparm" for a multiparm block
+            (children named "item#").
+        {"op": "remove", "name": name_or_folder_label}
+        {"op": "hide" | "show", "name": ...}
+        {"op": "replace", "name": ..., "spec": {...}}
+        {"op": "modify", "name": ..., <label | help | default |
+            default_expression | min | max | min_strict | max_strict |
+            hide_when | disable_when ("" clears) | hidden | join_with_next |
+            menu_items | callback | naming_scheme | new_name | tags>}
+            ("rename", "set_conditional", "set_default" are aliases)
+        {"op": "move", "name": ..., "after" | "before" | "in_folder": ...}
+
+    Names are template names (`t`, not `tx`; `stud_count`); folders are
+    addressed by label ("Controls"). Built-in parameters of the node type
+    (an Object's Transform) cannot be removed — Houdini re-adds them at the
+    top level and the reply says so in `reinstated_by_houdini`; hide them.
+
+    Args:
+        ctx: MCP context.
+        node_path: An instance of the HDA whose definition is edited.
+        ops: Operations, in order.
+        dry_run: Validate and report the plan without writing.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "hda.edit_hda_interface",
+        {"node_path": node_path, "ops": ops, "dry_run": dry_run},
+    )
