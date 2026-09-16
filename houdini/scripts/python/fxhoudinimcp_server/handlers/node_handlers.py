@@ -559,23 +559,51 @@ def _resolve_input_index(dest: hou.Node, input_index: int, input_name: str | Non
     raise ValueError(f"{dest.path()} has no input named '{input_name}'.{hint}")
 
 
+def _resolve_source(source_path: str, indirect_input: int | None):
+    """The item to wire from: a node, or one of a subnet's indirect inputs.
+
+    A subnet's input connectors are not nodes inside it — they are
+    `SubnetIndirectInput` items with no path of their own, so the first node
+    of a chain built inside a subnet could not be fed from the outside by any
+    verb. `indirect_input=n` names connector n of the subnet at `source_path`.
+    """
+    node = _get_node(source_path)
+    if indirect_input is None:
+        return node, node.path()
+    try:
+        items = list(node.indirectInputs())
+    except Exception as exc:
+        raise ValueError(
+            f"{source_path} has no indirect inputs (not a subnet): {readable_message(exc)}"
+        ) from exc
+    if not 0 <= int(indirect_input) < len(items):
+        raise ValueError(
+            f"{source_path} has {len(items)} indirect input(s); asked for #{indirect_input}."
+        )
+    return items[int(indirect_input)], f"{node.path()} (indirect input {int(indirect_input)})"
+
+
 def connect_nodes(
     source_path: str,
     dest_path: str,
     output_index: int = 0,
     input_index: int = 0,
     input_name: str | None = None,
+    indirect_input: int | None = None,
 ) -> dict:
     """Wire two nodes together.
 
     Args:
-        source_path: Path to the source (upstream) node.
+        source_path: Path to the source (upstream) node — or, with
+            `indirect_input`, the subnet whose input connector is the source.
         dest_path: Path to the destination (downstream) node.
         output_index: Output connector index on the source node.
         input_index: Input connector index on the destination node.
         input_name: Input connector name or label; wins over input_index.
+        indirect_input: Index of the subnet input connector at `source_path`
+            to wire from (the node at dest_path must live inside that subnet).
     """
-    source = _get_node(source_path)
+    source, source_label = _resolve_source(source_path, indirect_input)
     dest = _get_node(dest_path)
 
     input_index = _resolve_input_index(dest, input_index, input_name)
@@ -583,13 +611,16 @@ def connect_nodes(
 
     _focus_network_editor(dest, place_unpositioned=False)
 
-    return {
+    result = {
         "success": True,
-        "source_path": source.path(),
+        "source_path": source_label,
         "dest_path": dest.path(),
         "output_index": output_index,
         "input_index": input_index,
     }
+    if indirect_input is not None:
+        result["indirect_input"] = int(indirect_input)
+    return result
 
 
 ###### nodes.connect_nodes_batch
@@ -603,7 +634,9 @@ def connect_nodes_batch(
     Args:
         connections: List of dicts, each with keys:
             source_path, dest_path, output_index (default 0), input_index (default 0),
-            input_name (optional; a connector name or label, wins over input_index).
+            input_name (optional; a connector name or label, wins over input_index),
+            indirect_input (optional; source_path is then a subnet and this is the
+            index of its input connector to wire from).
     """
     results = []
     errors = []
@@ -615,19 +648,20 @@ def connect_nodes_batch(
         out_idx = int(conn.get("output_index", 0))
         in_idx = int(conn.get("input_index", 0))
         try:
-            source = _get_node(src_path)
+            source, source_label = _resolve_source(src_path, conn.get("indirect_input"))
             dest = _get_node(dst_path)
             in_idx = _resolve_input_index(dest, in_idx, conn.get("input_name"))
             dest.setInput(in_idx, source, out_idx)
             last_dest = dest
-            results.append(
-                {
-                    "source_path": source.path(),
-                    "dest_path": dest.path(),
-                    "output_index": out_idx,
-                    "input_index": in_idx,
-                }
-            )
+            entry = {
+                "source_path": source_label,
+                "dest_path": dest.path(),
+                "output_index": out_idx,
+                "input_index": in_idx,
+            }
+            if conn.get("indirect_input") is not None:
+                entry["indirect_input"] = int(conn["indirect_input"])
+            results.append(entry)
         except Exception as exc:
             errors.append(
                 {

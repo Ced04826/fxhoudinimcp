@@ -39,8 +39,9 @@ async def build_network(
         type (required), name, parms (lists set whole parm tuples),
         inputs (list of source names — earlier spec names, existing
         children, or absolute paths; or dicts with index/source/
-        source_output), flags (display/render/bypass/template),
-        color [r,g,b], comment.
+        source_output; or {"indirect_input": n} to wire from connector n
+        of the parent subnet itself), flags (display/render/bypass/
+        template), color [r,g,b], comment.
 
     Args:
         parent_path: Network to build inside (e.g. "/obj/geo1").

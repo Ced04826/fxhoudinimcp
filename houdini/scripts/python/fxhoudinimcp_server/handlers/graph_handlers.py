@@ -179,6 +179,21 @@ def _apply_parm(node: hou.Node, name: str, value: Any) -> None:
         raise ValueError(f"parameter '{name}' not found")
 
 
+def _indirect_input_error(parent: hou.Node, indirect: Any) -> str | None:
+    """Why connector *indirect* of *parent* cannot be wired from, or None."""
+    try:
+        count = len(list(parent.indirectInputs()))
+    except Exception:
+        return f"{parent.path()} has no indirect inputs (not a subnet)"
+    try:
+        index = int(indirect)
+    except (TypeError, ValueError):
+        return f"indirect_input must be an integer, got {indirect!r}"
+    if not 0 <= index < count:
+        return f"{parent.path()} has {count} indirect input(s); asked for #{index}"
+    return None
+
+
 def _node_report(node: hou.Node) -> dict[str, Any]:
     report: dict[str, Any] = {
         "name": node.name(),
@@ -243,6 +258,8 @@ def build_network(
                 (wired positionally) or {"index", "source",
                 "source_output"}. Sources resolve to spec node names
                 first, then children of parent, then absolute paths.
+                {"indirect_input": n} instead of "source" wires from
+                connector n of the parent subnet itself.
             flags (dict): display/render/bypass/template booleans.
             color (list[3]) and comment (str): network annotations.
         dry_run: Validate only; never mutates the scene.
@@ -354,8 +371,10 @@ def build_network(
         node_type = resolved_types.get(spec.get("type"))
         max_inputs = node_type.maxNumInputs() if node_type else 0
         for input_index, entry in enumerate(spec.get("inputs") or []):
+            indirect = None
             if isinstance(entry, dict):
                 source = entry.get("source")
+                indirect = entry.get("indirect_input")
                 input_index = int(entry.get("index", input_index))
             else:
                 source = entry
@@ -364,6 +383,13 @@ def build_network(
                     f"node {label}: input {input_index} exceeds max inputs "
                     f"({max_inputs}) of {spec.get('type')}"
                 )
+            if indirect is not None:
+                # The parent subnet's own connector: not a node, so it has no
+                # path a source string could name.
+                problem = _indirect_input_error(parent, indirect)
+                if problem:
+                    errors.append(f"node {label}: {problem}")
+                continue
             if (
                 source not in spec_names
                 and source not in existing
@@ -411,17 +437,22 @@ def build_network(
                     )
                 parm.setExpression(str(expression))
             for input_index, entry in enumerate(spec.get("inputs") or []):
+                indirect = None
                 if isinstance(entry, dict):
                     source_name = entry.get("source")
+                    indirect = entry.get("indirect_input")
                     input_index = int(entry.get("index", input_index))
                     source_output = int(entry.get("source_output", 0))
                 else:
                     source_name, source_output = entry, 0
-                source = (
-                    created.get(source_name)
-                    or parent.node(str(source_name))
-                    or hou.node(str(source_name))
-                )
+                if indirect is not None:
+                    source = list(parent.indirectInputs())[int(indirect)]
+                else:
+                    source = (
+                        created.get(source_name)
+                        or parent.node(str(source_name))
+                        or hou.node(str(source_name))
+                    )
                 node.setInput(input_index, source, source_output)
             flags = spec.get("flags") or {}
             for flag, setter in (
