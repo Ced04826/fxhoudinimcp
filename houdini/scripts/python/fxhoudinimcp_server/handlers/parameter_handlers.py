@@ -73,6 +73,32 @@ def _serialize_value(value: Any) -> Any:
     return value
 
 
+def _data_parm_summary(parm: hou.Parm, pt: hou.ParmTemplate) -> dict[str, Any]:
+    """Size and content of a Data parameter, never the blob itself."""
+    summary: dict[str, Any] = {"is_set": False}
+    with contextlib.suppress(Exception):
+        summary["data_parm_type"] = pt.dataParmType().name()
+    value = None
+    with contextlib.suppress(Exception):
+        value = parm.eval()
+    if value is not None:
+        summary["is_set"] = True
+        if isinstance(value, hou.Geometry):
+            with contextlib.suppress(Exception):
+                summary["geometry"] = {
+                    "points": value.intrinsicValue("pointcount"),
+                    "prims": value.intrinsicValue("primitivecount"),
+                }
+        else:
+            summary["value_type"] = type(value).__name__
+    with contextlib.suppress(Exception):
+        blob = parm.asData()
+        if isinstance(blob, dict):
+            summary["size_bytes"] = sum(len(str(v)) for v in blob.values())
+            summary["is_set"] = summary["is_set"] or summary["size_bytes"] > 0
+    return summary
+
+
 def _template_to_dict(pt: hou.ParmTemplate) -> dict[str, Any]:
     """Convert a ParmTemplate to a JSON-serialisable dictionary."""
     info: dict[str, Any] = {
@@ -130,6 +156,23 @@ def _get_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any]:
     """Get the current value, expression, keyframe info, and metadata of a parameter."""
     parm = _resolve_parm(node_path, parm_name)
     pt = parm.parmTemplate()
+
+    if _parm_type_name(pt) == "Data":
+        # A Data parameter (a Curve SOP's stash, a Stash SOP's geometry) holds
+        # a blob: eval() is a hou.Geometry or None and rawValue() is empty
+        # either way, so the old answer was `null` with no way to tell "unset"
+        # from "set". Report the size and what it holds instead.
+        return {
+            "node_path": node_path,
+            "parm_name": parm.name(),
+            "parm_type": "Data",
+            "data": _data_parm_summary(parm, pt),
+            "is_locked": parm.isLocked(),
+            "is_at_default": parm.isAtDefault(),
+            "expression": None,
+            "expression_language": None,
+            "keyframe_count": 0,
+        }
 
     result: dict[str, Any] = {
         "node_path": node_path,
