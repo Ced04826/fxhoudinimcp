@@ -1,0 +1,25 @@
+name: Feature request
+description: A missing tool, or a tool that should answer something it currently cannot
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do in Houdini
+      description: The artist-level task, not the API call. It often turns out an existing tool covers it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today instead
+      description: Which tools you chain, or which step you do by hand in the UI.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What the tool should return
+      description: The reply that would end the workaround. Name the HOM calls behind it if you know them.

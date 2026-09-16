@@ -1,0 +1,46 @@
+name: Bug report
+description: A tool misbehaves, the server will not start, or Houdini disagrees with the reply
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you asked for, what the tool returned, and what Houdini actually shows.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The tool call or prompt, and the scene state it needs. A small .hip beats a description.
+    validations:
+      required: true
+
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: >
+        Paste the output of the `get_houdini_connection_status` tool, which
+        reports the Houdini build and the server version. Otherwise: Houdini
+        version, OS, `pip show fxhoudinimcp`.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      placeholder: Claude Desktop / Claude Code / other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Errors
+      description: Anything from the client's MCP log or Houdini's Python shell.
+      render: text

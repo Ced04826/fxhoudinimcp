@@ -505,6 +505,9 @@ scenes, or do not run it.
 <!-- DEVELOPMENT -->
 ## Development
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the checks CI runs and how pull
+request titles are used. The rest of this section is the detail behind it.
+
 ```shell
 # Install dev dependencies
 pip install -e ".[dev]"
