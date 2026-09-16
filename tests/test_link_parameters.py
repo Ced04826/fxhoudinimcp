@@ -13,6 +13,7 @@ from __future__ import annotations
 
 # Built-in
 import os
+import posixpath
 import sys
 from unittest.mock import MagicMock
 
@@ -36,10 +37,13 @@ def _parm(node, name, kind, value):
     return parm
 
 
-def _node(path, rel_to):
+def _node(path):
     node = MagicMock()
     node.path.return_value = path
-    node.relativePathTo.side_effect = lambda other: rel_to
+    # A real relative path, computed from the argument. A fake returning a
+    # fixed string would pass whether the handler asks dst.relativePathTo(src)
+    # or the reverse, which is the whole point of the assertions below.
+    node.relativePathTo.side_effect = lambda other: posixpath.relpath(other.path(), path)
     return node
 
 
@@ -59,8 +63,8 @@ def _link(monkeypatch, src, dst):
 
 class TestStringParmsAreLinkedWithChs:
     def test_string_destination_uses_chs_and_a_relative_path(self, monkeypatch):
-        ctrl = _node("/obj/gaps/CONTROL", "../CONTROL")
-        n2 = _node("/obj/gaps/n2", "../CONTROL")
+        ctrl = _node("/obj/gaps/CONTROL")
+        n2 = _node("/obj/gaps/n2")
         src = _parm(ctrl, "mat", hou.parmTemplateType.String, "/obj/shopnet1/brick")
         dst = _parm(n2, "label", hou.parmTemplateType.String, "/obj/shopnet1/brick")
 
@@ -74,8 +78,8 @@ class TestStringParmsAreLinkedWithChs:
         assert "warning" not in reply
 
     def test_float_destination_keeps_ch(self, monkeypatch):
-        a = _node("/obj/geo1/box1", "../box2")
-        b = _node("/obj/geo1/box2", "../box1")
+        a = _node("/obj/geo1/box1")
+        b = _node("/obj/geo1/box2")
         src = _parm(a, "sizex", hou.parmTemplateType.Float, 7.0)
         dst = _parm(b, "sizex", hou.parmTemplateType.Float, 7.0)
 
@@ -86,7 +90,7 @@ class TestStringParmsAreLinkedWithChs:
         assert reply["value"] == 7.0
 
     def test_same_node_is_a_bare_parameter_name(self, monkeypatch):
-        node = _node("/obj/geo1/box1", ".")
+        node = _node("/obj/geo1/box1")
         src = _parm(node, "sizex", hou.parmTemplateType.Float, 1.0)
         dst = _parm(node, "sizey", hou.parmTemplateType.Float, 1.0)
 
@@ -95,8 +99,8 @@ class TestStringParmsAreLinkedWithChs:
         assert reply["expression"] == 'ch("sizex")'
 
     def test_mixed_types_are_named_in_a_warning(self, monkeypatch):
-        ctrl = _node("/obj/CONTROL", "../CONTROL")
-        n2 = _node("/obj/n2", "../CONTROL")
+        ctrl = _node("/obj/CONTROL")
+        n2 = _node("/obj/n2")
         src = _parm(ctrl, "count", hou.parmTemplateType.Int, 3)
         dst = _parm(n2, "label", hou.parmTemplateType.String, "3")
 

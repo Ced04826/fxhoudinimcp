@@ -252,9 +252,10 @@ def _is_at_default(parm: hou.Parm, value: Any, default: Any) -> bool:
             return answer
     except Exception:
         pass
-    # Ramp and Data parameters have no comparable defaultValue(), so this
-    # guard never filters them out and they always reach the response --
-    # which is why they have to survive JSON encoding (see serialize.py).
+    # Reached only when isAtDefault() is unavailable or answers non-bool.
+    # Ramp and Data parameters have no comparable defaultValue(), so == is
+    # false for them here and they reach the response -- which is why they
+    # have to survive JSON encoding (see serialize.py).
     try:
         return bool(value == default)
     except Exception:
