@@ -125,6 +125,17 @@ def _foreign_request_reason(request) -> str | None:
             f"request carries an Origin header ({headers['origin']}); "
             f"browsers are not clients of this endpoint"
         )
+    # The Origin tell only holds for POST. ``/fxapi`` takes GET, and a page
+    # can make the browser GET any URL with no Origin at all: an <img>, a
+    # <script>, an <iframe>, a navigation. Browsers stamp those with Fetch
+    # Metadata instead, saying where the request came from and what it is
+    # for; the bridge sends neither header.
+    site = headers.get("sec-fetch-site")
+    if site is not None and site not in ("same-origin", "none"):
+        return f"request carries Sec-Fetch-Site: {site}; browsers are not clients of this endpoint"
+    dest = headers.get("sec-fetch-dest")
+    if dest is not None and dest != "empty":
+        return f"request carries Sec-Fetch-Dest: {dest}; browsers are not clients of this endpoint"
 
     if os.environ.get("FXHOUDINIMCP_BIND", "127.0.0.1") != "127.0.0.1":
         return None
@@ -238,6 +249,11 @@ def list_commands(request):
 @_url_handler("/fxapi")
 def fxapi(request):
     """Body-free RPC endpoint compatible with graphical Houdini 22 sessions."""
+    # Guarded here, before the payload is read, so the file tunnel and the
+    # read-only functions are covered as well as mcp.execute.
+    reason = _foreign_request_reason(request)
+    if reason is not None:
+        return _forbidden(reason)
     inline = _query_value(request, "json")
     filename = _query_value(request, "file")
     if bool(inline) == bool(filename):

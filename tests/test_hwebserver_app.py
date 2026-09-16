@@ -89,6 +89,53 @@ def test_unreadable_headers_do_not_crash():
 
 
 @pytest.mark.parametrize(
+    "headers",
+    [
+        # <img src="http://127.0.0.1:8100/fxapi?json=..."> from any page.
+        {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "image"},
+        {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "script"},
+        {"Sec-Fetch-Site": "same-site", "Sec-Fetch-Dest": "iframe"},
+        # A URL typed or pasted into the address bar.
+        {"Sec-Fetch-Site": "none", "Sec-Fetch-Dest": "document"},
+    ],
+)
+def test_origin_free_browser_get_is_refused(headers):
+    """The GET route reopened what the Origin check closes for POST: no-CORS
+    subresources and navigations carry no Origin. Fetch Metadata still names
+    them as a browser's."""
+    reason = _foreign_request_reason(_Request({**headers, "Host": "127.0.0.1:8100"}))
+    assert reason and "Sec-Fetch" in reason
+
+
+def test_widened_bind_still_refuses_origin_free_browser_get(monkeypatch):
+    monkeypatch.setenv("FXHOUDINIMCP_BIND", "0.0.0.0")
+    request = _Request({"Sec-Fetch-Dest": "image"}, host="render-42.farm:8100")
+    assert _foreign_request_reason(request) is not None
+
+
+def test_fxapi_refuses_a_browser_before_touching_the_payload(monkeypatch):
+    """The route guards itself: a browser must not reach the file tunnel or
+    the read-only functions either, and nothing on disk is read first."""
+    from fxhoudinimcp_server import hwebserver_app
+
+    seen = {}
+    monkeypatch.setattr(hwebserver_app, "_forbidden", lambda reason: seen.setdefault("r", reason))
+
+    def never(_filename):
+        raise AssertionError("payload read before the guard ran")
+
+    monkeypatch.setattr(hwebserver_app, "_read_tunnel_file", never)
+
+    class Browser(_Request):
+        def GET(self):
+            return {"file": "C:/Temp/fxhoudinimcp/rpc-1.json"}
+
+    request = Browser({"Origin": "https://evil.example", "Host": "127.0.0.1:8100"})
+    assert hwebserver_app.fxapi(request) == seen["r"]
+    assert "Origin" in seen["r"]
+
+
+@pytest.mark.parametrize(
     ("host", "bare"),
     [
         ("127.0.0.1:8100", "127.0.0.1"),
