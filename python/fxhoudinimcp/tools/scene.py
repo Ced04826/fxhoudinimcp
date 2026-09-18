@@ -7,6 +7,8 @@ via the HTTP bridge.
 from __future__ import annotations
 
 # Built-in
+from typing import Any
+
 # Third-party
 from fxhoudinimcp._sdk import Context
 
@@ -128,21 +130,39 @@ async def save_scene(ctx: Context, file_path: str | None = None) -> dict:
 
 
 @mcp.tool()
-async def load_scene(ctx: Context, file_path: str, merge: bool = False) -> dict:
-    """Open or merge a Houdini hip file.
+async def load_scene(
+    ctx: Context,
+    file_path: str,
+    merge: bool = False,
+    node_paths: list[str] | None = None,
+    overwrite_on_conflict: bool = False,
+) -> dict:
+    """Open a Houdini hip file, or merge it — or named nodes from it — into
+    the current scene.
+
+    Load warnings (missing assets and the like) come back in `warnings`.
+    A merge reports what arrived: `merged_nodes`, `conflicts` (a node that
+    already exists is merged under a new name, or overwritten in place with
+    overwrite_on_conflict=True) and `not_found_in_file`. node_paths are
+    absolute (`/obj/building_v3`) and bring their contents.
 
     Args:
         file_path: Path to the hip file to open.
         merge: Merge into the current scene instead of replacing it.
+        node_paths: With merge, the absolute node paths to merge; default
+            everything.
+        overwrite_on_conflict: With merge, overwrite same-named nodes
+            instead of renaming the merged copy.
     """
     bridge = _get_bridge(ctx)
-    return await bridge.execute(
-        "scene.load_scene",
-        {
-            "file_path": file_path,
-            "merge": merge,
-        },
-    )
+    payload: dict[str, Any] = {"file_path": file_path, "merge": merge}
+    # Sent only when used, so a plugin that predates them still loads and
+    # merges whole files.
+    if node_paths is not None:
+        payload["node_paths"] = node_paths
+    if overwrite_on_conflict:
+        payload["overwrite_on_conflict"] = True
+    return await bridge.execute("scene.load_scene", payload)
 
 
 @mcp.tool()
