@@ -113,7 +113,12 @@ def _data_parm_value(parm: hou.Parm, pt: hou.ParmTemplate) -> dict[str, Any] | N
     if _parm_type_name(pt) != "Data":
         return None
     data = _data_parm_summary(parm, pt)
-    return {"value": data.get("geometry"), "data": data}
+    value = data.get("geometry")
+    if "key_count" in data:
+        # A KeyValueDictionary always answered with the dictionary itself.
+        with contextlib.suppress(Exception):
+            value = _serialize_value(parm.eval())
+    return {"value": value, "data": data}
 
 
 def _template_to_dict(pt: hou.ParmTemplate) -> dict[str, Any]:

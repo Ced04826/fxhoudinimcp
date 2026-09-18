@@ -118,6 +118,15 @@ class TestReaders:
         assert result["parm_type"] == "Data"
         assert result["keyframe_count"] == 0
 
+    def test_a_set_dictionary_keeps_its_value(self, monkeypatch):
+        parm, template = _data_parm({"k": "v"})
+        template.dataParmType.return_value.name.return_value = "KeyValueDictionary"
+        monkeypatch.setattr(parameters, "_resolve_parm", lambda node_path, parm_name: parm)
+        result = parameters._get_parameter("/obj/geo1/dict1", "stash")
+        assert result["value"] == {"k": "v"}
+        assert result["data"]["is_set"] is True
+        assert result["data"]["key_count"] == 1
+
     def test_get_parameters_reports_data_the_same_way(self, monkeypatch):
         parm, _ = _data_parm(None)
         node = MagicMock()
