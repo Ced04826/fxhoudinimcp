@@ -11,9 +11,10 @@ from typing import Any
 
 # Third-party
 from fxhoudinimcp._sdk import Context
+from fxhoudinimcp.config import auto_layout_enabled
 
 # Internal
-from fxhoudinimcp.config import auto_layout_enabled
+from fxhoudinimcp.errors import HoudiniCommandError
 from fxhoudinimcp.server import _get_bridge, mcp
 
 
@@ -265,9 +266,22 @@ async def connect_nodes(
         "input_index": input_index,
         "input_name": input_name,
     }
-    if indirect_input is not None:
-        params["indirect_input"] = indirect_input
-    return await bridge.execute("nodes.connect_nodes", params)
+    if indirect_input is None:
+        return await bridge.execute("nodes.connect_nodes", params)
+    params["indirect_input"] = indirect_input
+    try:
+        return await bridge.execute("nodes.connect_nodes", params)
+    except HoudiniCommandError as exc:
+        # The compatibility check compares command names, and connect_nodes
+        # exists on a plugin that predates indirect_input: say so.
+        if exc.code == "BAD_ARGUMENTS" and "indirect_input" in str(exc):
+            raise HoudiniCommandError(
+                f"{exc} The Houdini plugin predates indirect_input; update the "
+                f"plugin to wire from a subnet's input connector.",
+                code=exc.code,
+                details=exc.details,
+            ) from exc
+        raise
 
 
 @mcp.tool()

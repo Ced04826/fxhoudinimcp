@@ -559,7 +559,41 @@ def _resolve_input_index(dest: hou.Node, input_index: int, input_name: str | Non
     raise ValueError(f"{dest.path()} has no input named '{input_name}'.{hint}")
 
 
-def _resolve_source(source_path: str, indirect_input: int | None):
+def _indirect_input_item(subnet: hou.Node, indirect: Any, connectors: list | None = None):
+    """Input connector *indirect* of *subnet*, or ValueError saying why not.
+
+    The one rule for connect_nodes, connect_nodes_batch and build_network.
+    *connectors* is the subnet's indirectInputs() when the caller already
+    listed them.
+    """
+    if isinstance(indirect, float) and indirect.is_integer():
+        indirect = int(indirect)
+    if isinstance(indirect, bool) or not isinstance(indirect, int):
+        raise ValueError(f"indirect_input must be an integer, got {indirect!r}")
+    if connectors is None:
+        try:
+            connectors = list(subnet.indirectInputs())
+        except Exception as exc:
+            raise ValueError(
+                f"{subnet.path()} has no input connectors to wire from: {readable_message(exc)}"
+            ) from exc
+    if not connectors:
+        # Not a subnet (a Box answers an empty tuple on 22.0 rather than the
+        # documented InvalidNodeType), or a subnet with no inputs.
+        raise ValueError(
+            f"{subnet.path()} has no input connectors to wire from: it is not a "
+            f"subnet, or a subnet without inputs."
+        )
+    if not 0 <= indirect < len(connectors):
+        raise ValueError(
+            f"{subnet.path()} has {len(connectors)} input connector(s); asked for #{indirect}."
+        )
+    return connectors[indirect]
+
+
+def _resolve_source(
+    source_path: str, indirect_input: Any, dest: hou.Node, output_index: int
+) -> Any:
     """The item to wire from: a node, or one of a subnet's indirect inputs.
 
     A subnet's input connectors are not nodes inside it — they are
@@ -569,18 +603,18 @@ def _resolve_source(source_path: str, indirect_input: int | None):
     """
     node = _get_node(source_path)
     if indirect_input is None:
-        return node, node.path()
-    try:
-        items = list(node.indirectInputs())
-    except Exception as exc:
+        return node
+    item = _indirect_input_item(node, indirect_input)
+    if dest.parent() != node:
         raise ValueError(
-            f"{source_path} has no indirect inputs (not a subnet): {readable_message(exc)}"
-        ) from exc
-    if not 0 <= int(indirect_input) < len(items):
-        raise ValueError(
-            f"{source_path} has {len(items)} indirect input(s); asked for #{indirect_input}."
+            f"{dest.path()} is not inside {node.path()}: a subnet's input connector "
+            f"feeds only nodes inside that subnet."
         )
-    return items[int(indirect_input)], f"{node.path()} (indirect input {int(indirect_input)})"
+    if int(output_index) != 0:
+        raise ValueError(
+            f"a subnet input connector has one output; output_index must be 0, got {output_index}."
+        )
+    return item
 
 
 def connect_nodes(
@@ -603,8 +637,8 @@ def connect_nodes(
         indirect_input: Index of the subnet input connector at `source_path`
             to wire from (the node at dest_path must live inside that subnet).
     """
-    source, source_label = _resolve_source(source_path, indirect_input)
     dest = _get_node(dest_path)
+    source = _resolve_source(source_path, indirect_input, dest, output_index)
 
     input_index = _resolve_input_index(dest, input_index, input_name)
     dest.setInput(input_index, source, output_index)
@@ -613,12 +647,13 @@ def connect_nodes(
 
     result = {
         "success": True,
-        "source_path": source_label,
+        "source_path": _get_node(source_path).path(),
         "dest_path": dest.path(),
         "output_index": output_index,
         "input_index": input_index,
     }
     if indirect_input is not None:
+        # source_path stays a path a caller can reuse; the connector is here.
         result["indirect_input"] = int(indirect_input)
     return result
 
@@ -648,13 +683,13 @@ def connect_nodes_batch(
         out_idx = int(conn.get("output_index", 0))
         in_idx = int(conn.get("input_index", 0))
         try:
-            source, source_label = _resolve_source(src_path, conn.get("indirect_input"))
             dest = _get_node(dst_path)
+            source = _resolve_source(src_path, conn.get("indirect_input"), dest, out_idx)
             in_idx = _resolve_input_index(dest, in_idx, conn.get("input_name"))
             dest.setInput(in_idx, source, out_idx)
             last_dest = dest
             entry = {
-                "source_path": source_label,
+                "source_path": _get_node(src_path).path(),
                 "dest_path": dest.path(),
                 "output_index": out_idx,
                 "input_index": in_idx,
@@ -698,21 +733,23 @@ def disconnect_node(
     """
     node = _get_node(node_path)
     disconnected = []
+    # inputConnections(), not inputs(): inputs() hides a wire from a subnet's
+    # input connector (it reports the node outside the subnet, or None when
+    # that input is open), so such a wire could be made but not removed.
+    connected = sorted({conn.inputIndex() for conn in node.inputConnections()})
 
     if disconnect_all:
-        for i in range(len(node.inputs())):
-            if node.inputs()[i] is not None:
-                node.setInput(i, None)
-                disconnected.append(i)
+        for i in connected:
+            node.setInput(i, None)
+            disconnected.append(i)
     elif input_index is not None:
-        current_inputs = node.inputs()
-        if input_index < len(current_inputs) and current_inputs[input_index] is not None:
+        if input_index in connected:
             node.setInput(input_index, None)
             disconnected.append(input_index)
         else:
             raise ValueError(
                 f"Input index {input_index} is out of range or already disconnected "
-                f"on node {node_path}."
+                f"on node {node_path}. Connected inputs: {connected}."
             )
     else:
         raise ValueError("Provide either input_index or set disconnect_all=True.")
@@ -736,22 +773,29 @@ def reorder_inputs(node_path: str, new_order: list) -> dict:
                    For example, [1, 0] swaps the first two inputs.
     """
     node = _get_node(node_path)
-    current_inputs = list(node.inputs())
+    # Every wire with the item it comes from and that item's output: a
+    # subnet input connector is an item, not a node, and inputs() hides it.
+    wires = {
+        conn.inputIndex(): (conn.inputItem(), conn.inputItemOutputIndex())
+        for conn in node.inputConnections()
+    }
+    count = max([len(node.inputs())] + [index + 1 for index in wires])
 
-    if len(new_order) > len(current_inputs):
+    if len(new_order) > count:
         raise ValueError(
-            f"new_order has {len(new_order)} entries but node only has "
-            f"{len(current_inputs)} inputs."
+            f"new_order has {len(new_order)} entries but node only has {count} inputs."
         )
+    bad = [old for old in new_order if not isinstance(old, int) or not 0 <= old < count]
+    if bad:
+        raise ValueError(f"new_order refers to inputs {bad}; {node_path} has inputs 0-{count - 1}.")
 
-    # Disconnect all first
-    for i in range(len(current_inputs)):
+    # Checked before anything is disconnected, so a refusal leaves the wires.
+    for i in wires:
         node.setInput(i, None)
-
-    # Reconnect in the new order
     for new_idx, old_idx in enumerate(new_order):
-        if old_idx < len(current_inputs) and current_inputs[old_idx] is not None:
-            node.setInput(new_idx, current_inputs[old_idx])
+        if old_idx in wires:
+            item, output_index = wires[old_idx]
+            node.setInput(new_idx, item, output_index)
 
     return {
         "success": True,

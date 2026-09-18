@@ -127,3 +127,60 @@ class TestDiscovery:
         assert len(hou.node(geo).children()) == 3
         children = data.get("children", data.get("nodes", []))
         assert len(children) == 3
+
+
+class TestSubnetInputConnectors:
+    def _subnet(self):
+        geo = hou.node("/obj").createNode("geo")
+        subnet = geo.createNode("subnet")
+        inner = subnet.createNode("null")
+        return geo, subnet, inner
+
+    def _wires(self, node):
+        return [(c.inputIndex(), type(c.inputItem()).__name__) for c in node.inputConnections()]
+
+    def test_the_wire_is_made_and_can_be_removed(self, call):
+        _, subnet, inner = self._subnet()
+        data = call(
+            "nodes.connect_nodes",
+            source_path=subnet.path(),
+            dest_path=inner.path(),
+            indirect_input=0,
+        )
+        assert data["source_path"] == subnet.path()
+        assert self._wires(inner) == [(0, "OpSubnetIndirectInput")]
+        # inputs() hides this wire; disconnect_node must still find it.
+        assert inner.inputs() == ()
+        call("nodes.disconnect_node", node_path=inner.path(), disconnect_all=True)
+        assert self._wires(inner) == []
+
+    def test_reorder_keeps_the_connector(self, call):
+        _, subnet, inner = self._subnet()
+        other = subnet.createNode("box")
+        merge = subnet.createNode("merge")
+        merge.setInput(0, subnet.indirectInputs()[0])
+        merge.setInput(1, other)
+        call("nodes.reorder_inputs", node_path=merge.path(), new_order=[1, 0])
+        assert merge.inputConnections()[0].inputItem() == other
+        assert type(merge.inputConnections()[1].inputItem()).__name__ == "OpSubnetIndirectInput"
+
+    def test_a_destination_outside_the_subnet_is_refused_by_name(self, call):
+        geo, subnet, _ = self._subnet()
+        box = geo.createNode("box")
+        error = call(
+            "nodes.connect_nodes",
+            source_path=subnet.path(),
+            dest_path=box.path(),
+            indirect_input=0,
+            expect_error=True,
+        )
+        assert "is not inside" in error["message"]
+
+    def test_build_network_wires_from_the_connector(self, call):
+        _, subnet, _ = self._subnet()
+        call(
+            "graph.build_network",
+            parent_path=subnet.path(),
+            nodes=[{"type": "null", "name": "fed", "inputs": [{"indirect_input": 0}]}],
+        )
+        assert self._wires(subnet.node("fed")) == [(0, "OpSubnetIndirectInput")]
