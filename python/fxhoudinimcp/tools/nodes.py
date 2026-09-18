@@ -15,6 +15,7 @@ from fxhoudinimcp._sdk import Context
 # Internal
 from fxhoudinimcp.bridge import NO_TIMEOUT
 from fxhoudinimcp.config import auto_layout_enabled
+from fxhoudinimcp.errors import HoudiniCommandError
 from fxhoudinimcp.server import _get_bridge, mcp
 
 
@@ -317,29 +318,50 @@ async def connect_nodes(
     output_index: int = 0,
     input_index: int = 0,
     input_name: str | None = None,
+    indirect_input: int | None = None,
 ) -> dict:
     """Connect two nodes together.
 
+    To feed a node INSIDE a subnet from one of the subnet's own input
+    connectors (a SubnetIndirectInput — not a node, it has no path), pass
+    the subnet as source_path and the connector index as indirect_input.
+
     Args:
         ctx: MCP context.
-        source_path: Upstream node path.
+        source_path: Upstream node path; with indirect_input, the subnet
+            whose input connector is the source.
         dest_path: Downstream node path.
         output_index: Source output index.
         input_index: Destination input index.
         input_name: Destination connector name or label (e.g. "base_color"
             on a VOP shader); wins over input_index.
+        indirect_input: Index of the subnet input connector at source_path
+            to wire from (dest_path must live inside that subnet).
     """
     bridge = _get_bridge(ctx)
-    return await bridge.execute(
-        "nodes.connect_nodes",
-        {
-            "source_path": source_path,
-            "dest_path": dest_path,
-            "output_index": output_index,
-            "input_index": input_index,
-            "input_name": input_name,
-        },
-    )
+    params: dict[str, Any] = {
+        "source_path": source_path,
+        "dest_path": dest_path,
+        "output_index": output_index,
+        "input_index": input_index,
+        "input_name": input_name,
+    }
+    if indirect_input is None:
+        return await bridge.execute("nodes.connect_nodes", params)
+    params["indirect_input"] = indirect_input
+    try:
+        return await bridge.execute("nodes.connect_nodes", params)
+    except HoudiniCommandError as exc:
+        # The compatibility check compares command names, and connect_nodes
+        # exists on a plugin that predates indirect_input: say so.
+        if exc.code == "BAD_ARGUMENTS" and "indirect_input" in str(exc):
+            raise HoudiniCommandError(
+                f"{exc} The Houdini plugin predates indirect_input; update the "
+                f"plugin to wire from a subnet's input connector.",
+                code=exc.code,
+                details=exc.details,
+            ) from exc
+        raise
 
 
 @mcp.tool()
@@ -353,7 +375,10 @@ async def connect_nodes_batch(
         connections: List of connections. Each dict has keys:
             source_path (str), dest_path (str),
             output_index (int, default 0), input_index (int, default 0),
-            input_name (str, optional: connector name or label, wins over input_index).
+            input_name (str, optional: connector name or label, wins over input_index),
+            indirect_input (int, optional: source_path is then a subnet and this is
+            the index of its input connector to wire from — for the first node of
+            a chain built inside that subnet).
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(

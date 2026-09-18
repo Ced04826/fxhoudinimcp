@@ -29,6 +29,7 @@ from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
 from fxhoudinimcp_server.handlers.node_handlers import (
     _find_input,
+    _indirect_input_item,
     _input_table,
     _resolve_input_index,
 )
@@ -320,6 +321,29 @@ def _apply_parm(node: hou.Node, name: str, value: Any) -> None:
         raise ValueError(f"parameter '{name}' not found")
 
 
+def _parse_input_entry(entry: Any, position: int) -> dict[str, Any]:
+    """What one `inputs` entry of a build_network spec asks for.
+
+    Validation and the build both read entries through this, so they cannot
+    disagree about what a spec means.
+    """
+    if not isinstance(entry, dict):
+        return {
+            "index": position,
+            "input_name": None,
+            "source": entry,
+            "indirect": None,
+            "source_output": 0,
+        }
+    return {
+        "index": int(entry.get("index", position)),
+        "input_name": entry.get("input_name"),
+        "source": entry.get("source"),
+        "indirect": entry.get("indirect_input"),
+        "source_output": int(entry.get("source_output", 0)),
+    }
+
+
 def _node_report(node: hou.Node) -> dict[str, Any]:
     report: dict[str, Any] = {
         "name": node.name(),
@@ -385,7 +409,9 @@ def build_network(
                 "source_output"}; "input_name" is a connector name or
                 label, as get_node_card lists them, and wins over "index".
                 Sources resolve to spec node names first, then children of
-                parent, then absolute paths.
+                parent, then absolute paths. {"indirect_input": n} instead
+                of "source" wires from connector n of the parent subnet
+                itself.
             flags (dict): display/render/bypass/template booleans.
             color (list[3]) and comment (str): network annotations.
         dry_run: Validate only; never mutates the scene.
@@ -479,6 +505,20 @@ def build_network(
                 if render_before is not None:
                     render_before.setRenderFlag(True)
 
+    # The parent's input connectors, listed once per build rather than once
+    # per entry that uses one.
+    # None when the listing itself failed: _indirect_input_item then lists
+    # again and reports the real HOM message instead of "not a subnet".
+    listed: list = []
+
+    def parent_connectors() -> list | None:
+        if not listed:
+            connectors: list | None = None
+            with contextlib.suppress(Exception):
+                connectors = list(parent.indirectInputs())
+            listed.append(connectors)
+        return listed[0]
+
     for index, spec in enumerate(nodes):
         label = spec.get("name") or spec.get("type") or f"#{index}"
         knowledge = parm_knowledge.get(spec.get("type"))
@@ -513,30 +553,43 @@ def build_network(
         if connectors is None and knowledge:
             connectors = knowledge[4]
         for position, entry in enumerate(spec.get("inputs") or []):
-            input_index: int | None = position
-            if isinstance(entry, dict):
-                source = entry.get("source")
-                input_name = entry.get("input_name")
-                if input_name:
-                    # Resolved here, by the rule the build uses, so a wrong
-                    # name fails the dry run, not the build.
-                    input_index = None
-                    if connectors is not None:
-                        try:
-                            input_index = _find_input(
-                                connectors["inputs"], str(input_name), max_inputs
-                            )
-                        except ValueError as exc:
-                            errors.append(f"node {label}: {spec.get('type')} {exc}")
-                else:
-                    input_index = int(entry.get("index", position))
-            else:
-                source = entry
+            wire = _parse_input_entry(entry, position)
+            source, indirect = wire["source"], wire["indirect"]
+            input_index: int | None = wire["index"]
+            if wire["input_name"]:
+                # Resolved here, by the rule the build uses, so a wrong
+                # name fails the dry run, not the build.
+                input_index = None
+                if connectors is not None:
+                    try:
+                        input_index = _find_input(
+                            connectors["inputs"], str(wire["input_name"]), max_inputs
+                        )
+                    except ValueError as exc:
+                        errors.append(f"node {label}: {spec.get('type')} {exc}")
             if input_index is not None and input_index >= max_inputs > 0:
                 errors.append(
                     f"node {label}: input {input_index} exceeds max inputs "
                     f"({max_inputs}) of {spec.get('type')}"
                 )
+            if indirect is not None:
+                # The parent subnet's own connector: not a node, so it has no
+                # path a source string could name.
+                if source is not None:
+                    errors.append(
+                        f"node {label}: an input takes either 'source' or "
+                        f"'indirect_input', not both (got {source!r} and {indirect!r})"
+                    )
+                try:
+                    _indirect_input_item(parent, indirect, parent_connectors())
+                except ValueError as exc:
+                    errors.append(f"node {label}: {exc}")
+                if wire["source_output"] != 0:
+                    errors.append(
+                        f"node {label}: a subnet input connector has one output; "
+                        f"source_output must be 0, got {wire['source_output']}"
+                    )
+                continue
             if (
                 source not in spec_names
                 and source not in existing
@@ -583,21 +636,19 @@ def build_network(
                         f"{node.path()}: no parm '{parm_name}' to put an expression on"
                     )
                 parm.setExpression(str(expression))
-            for input_index, entry in enumerate(spec.get("inputs") or []):
-                input_name = None
-                if isinstance(entry, dict):
-                    source_name = entry.get("source")
-                    input_name = entry.get("input_name")
-                    input_index = int(entry.get("index", input_index))
-                    source_output = int(entry.get("source_output", 0))
+            for position, entry in enumerate(spec.get("inputs") or []):
+                wire = _parse_input_entry(entry, position)
+                source_output = wire["source_output"]
+                input_index = _resolve_input_index(node, wire["index"], wire["input_name"])
+                if wire["indirect"] is not None:
+                    source = parent_connectors()[int(wire["indirect"])]
                 else:
-                    source_name, source_output = entry, 0
-                input_index = _resolve_input_index(node, input_index, input_name)
-                source = (
-                    created.get(source_name)
-                    or parent.node(str(source_name))
-                    or hou.node(str(source_name))
-                )
+                    source_name = wire["source"]
+                    source = (
+                        created.get(source_name)
+                        or parent.node(str(source_name))
+                        or hou.node(str(source_name))
+                    )
                 node.setInput(input_index, source, source_output)
             flags = spec.get("flags") or {}
             for flag, setter in (
