@@ -43,7 +43,9 @@ _NO_UNDO_GROUP = frozenset({"scene.undo", "scene.redo"})
 # any number here would be a threshold past which the client is told a lie
 # while Houdini keeps working. FXHOUDINIMCP_TIMEOUT_<COMMAND> can still put
 # one back per command.
-_UNBOUNDED_COMMANDS = frozenset({"cache.write_cache", "rendering.start_render"})
+_UNBOUNDED_COMMANDS = frozenset(
+    {"cache.write_cache", "rendering.start_render", "nodes.press_button"}
+)
 
 # What to do when a command does time out, where the answer is not simply a
 # bigger number.
@@ -57,6 +59,11 @@ _TIMEOUT_HINTS = {
         "Houdini is still rendering and shows its progress dialog to the user. Wait for "
         "the verdict; do not poll the disk. This command has no deadline unless "
         "FXHOUDINIMCP_TIMEOUT_RENDERING_START_RENDER set one."
+    ),
+    "nodes.press_button": (
+        "The button's callback is still running in Houdini. This command has no deadline "
+        "unless FXHOUDINIMCP_TIMEOUT_NODES_PRESS_BUTTON set one; for a Save to Disk or a "
+        "render, write_cache / start_render report a verdict."
     ),
     "code.execute_python": (
         "If this was a cook, a render or a Save to Disk, use write_cache / start_render "

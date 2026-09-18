@@ -25,6 +25,7 @@ sys.modules.setdefault("hdefereval", MagicMock())
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "houdini", "scripts", "python"))
 
 # Internal
+import fxhoudinimcp_server.handlers.graph_handlers as graph  # noqa: E402
 import fxhoudinimcp_server.handlers.node_handlers as nodes  # noqa: E402
 
 
@@ -36,19 +37,29 @@ def _node(path, type_name="xform"):
     return node
 
 
+def _parm(name, at_default):
+    parm = MagicMock()
+    parm.name.return_value = name
+    parm.isAtDefault.return_value = at_default
+    return parm
+
+
 class TestChangeNodeType:
     def _setup(self, monkeypatch, old="xform", new="null"):
         node = _node("/obj/geo1/keepme", old)
         category = node.type.return_value.category.return_value
         category.name.return_value = "Sop"
         category.nodeTypes.return_value = {"xform": None, "null": None}
-        kept = MagicMock()
-        kept.name.return_value = "tx"
-        kept.isAtDefault.return_value = False
-        kept.isSpare.return_value = False
-        node.parms.return_value = [kept]
+        node.parms.return_value = [
+            _parm("tx", False),
+            _parm("scale", False),
+            _parm("ty", True),
+            _parm("sx", True),
+        ]
         changed = _node("/obj/geo1/keepme", new)
-        changed.parms.return_value = []
+        # tx has no home on the new type; scale survives but is back at its
+        # default; sx was never set and is simply gone.
+        changed.parms.return_value = [_parm("scale", True), _parm("ty", True)]
         changed.inputs.return_value = [_node("/obj/geo1/box1", "box")]
         changed.outputs.return_value = []
         changed.children.return_value = []
@@ -57,7 +68,7 @@ class TestChangeNodeType:
         resolved = MagicMock()
         resolved.name.return_value = new
         monkeypatch.setattr(nodes, "_get_node", lambda path: node)
-        monkeypatch.setattr(nodes, "_resolve_node_type", lambda cat, name: resolved)
+        monkeypatch.setattr(graph, "_resolve_node_type", lambda cat, name: resolved)
         monkeypatch.setattr(nodes, "_focus_network_editor", lambda *a, **k: None)
         return node, changed
 
@@ -70,17 +81,39 @@ class TestChangeNodeType:
         assert result["changed"] is True
         assert result["new_type"] == "null"
         assert result["parms_dropped"] == ["tx"]
+        assert result["parms_reset"] == ["scale"]
+        assert result["parms_removed_count"] == 2
         assert result["inputs"] == ["/obj/geo1/box1"]
 
-    def test_the_same_type_is_a_noop(self, monkeypatch):
+    def test_the_same_type_is_a_noop_with_the_same_reply_shape(self, monkeypatch):
         node, _ = self._setup(monkeypatch, old="null", new="null")
+        node.inputs.return_value = []
+        node.outputs.return_value = []
+        node.children.return_value = []
+        node.type.return_value.definition.return_value = None
         result = nodes.change_node_type("/obj/geo1/keepme", "null")
         assert result["changed"] is False
+        assert "already of type" in result["message"]
+        assert result["parms_dropped"] == [] and result["parms_reset"] == []
+        for key in ("inputs", "outputs", "keep_parms", "child_count"):
+            assert key in result
         node.changeNodeType.assert_not_called()
+
+    def test_resetting_contents_forces_the_same_type(self, monkeypatch):
+        node, _ = self._setup(monkeypatch, old="null", new="null")
+        result = nodes.change_node_type("/obj/geo1/keepme", "null", keep_network_contents=False)
+        node.changeNodeType.assert_called_once_with(
+            "null",
+            keep_name=True,
+            keep_parms=True,
+            keep_network_contents=False,
+            force_change_on_node_type_match=True,
+        )
+        assert result["changed"] is True
 
     def test_an_unknown_type_is_refused_with_a_hint(self, monkeypatch):
         self._setup(monkeypatch)
-        monkeypatch.setattr(nodes, "_resolve_node_type", lambda *a, **k: None)
+        monkeypatch.setattr(graph, "_resolve_node_type", lambda *a, **k: None)
         with pytest.raises(ValueError, match="does not exist in Sop"):
             nodes.change_node_type("/obj/geo1/keepme", "nul")
 
@@ -92,19 +125,26 @@ class TestChangeNodeType:
 
 
 class TestResolveNodeType:
-    def test_preferred_version_wins_then_exact_then_newest(self):
-        hou = nodes.hou
+    def test_preferred_version_wins_then_exact_then_newest(self, monkeypatch):
+        preferred = MagicMock(return_value=None)
+        monkeypatch.setattr(graph.hou, "preferredNodeType", preferred)
         category = MagicMock()
         category.name.return_value = "Sop"
         category.nodeTypes.return_value = {"curve": "classic", "curve::2.0": "new"}
-        hou.preferredNodeType.return_value = None
-        assert nodes._resolve_node_type(category, "curve") == "classic"
-        assert nodes._resolve_node_type(category, "curve::2.0") == "new"
+        assert graph._resolve_node_type(category, "curve") == "classic"
+        assert graph._resolve_node_type(category, "curve::2.0") == "new"
         category.nodeTypes.return_value = {"copytopoints::2.0": "v2", "copytopoints::3.0": "v3"}
-        assert nodes._resolve_node_type(category, "copytopoints") == "v3"
-        assert nodes._resolve_node_type(category, "nope") is None
-        hou.preferredNodeType.return_value = "preferred"
-        assert nodes._resolve_node_type(category, "anything") == "preferred"
+        assert graph._resolve_node_type(category, "copytopoints") == "v3"
+        assert graph._resolve_node_type(category, "nope") is None
+        preferred.return_value = "preferred"
+        assert graph._resolve_node_type(category, "anything") == "preferred"
+
+    def test_the_newest_version_is_ordered_by_number_not_by_string(self, monkeypatch):
+        monkeypatch.setattr(graph.hou, "preferredNodeType", MagicMock(return_value=None))
+        category = MagicMock()
+        category.name.return_value = "Sop"
+        category.nodeTypes.return_value = {"mytool::2.0": "v2", "mytool::10.0": "v10"}
+        assert graph._resolve_node_type(category, "mytool") == "v10"
 
 
 class TestPressButton:
@@ -118,17 +158,50 @@ class TestPressButton:
         node.parms.return_value = [parm]
         node.errors.return_value = []
         node.warnings.return_value = ["w"]
+        node.needsToCook.return_value = True
         monkeypatch.setattr(nodes, "_get_node", lambda path: node)
         return node, parm
 
     def test_the_button_is_pressed_and_the_node_state_read_back(self, monkeypatch):
-        _, parm = self._node_with_button(monkeypatch)
+        node, parm = self._node_with_button(monkeypatch)
         result = nodes.press_button("/obj/geo1/stash1", "stashinput")
         parm.pressButton.assert_called_once_with()
+        node.cook.assert_not_called()
         assert result["warnings"] == ["w"]
-        assert result["callback_present"] is True
+        assert result["cooked"] is False
+        assert result["needs_cook"] is True
+        assert result["has_script_callback"] is True
         assert "duration_ms" in result
         assert "note" not in result
+
+    def test_cook_true_cooks_after_the_press_and_survives_a_failed_cook(self, monkeypatch):
+        node, parm = self._node_with_button(monkeypatch)
+        node.cook.side_effect = RuntimeError("Error while cooking.")
+        node.errors.return_value = ["Unable to read file"]
+        result = nodes.press_button("/obj/geo1/stash1", "stashinput", cook=True)
+        parm.pressButton.assert_called_once_with()
+        node.cook.assert_called_once()
+        assert result["cooked"] is True
+        assert result["errors"] == ["Unable to read file"]
+
+    def test_a_failing_errors_read_does_not_lose_the_press(self, monkeypatch):
+        node, parm = self._node_with_button(monkeypatch)
+        node.errors.side_effect = RuntimeError("no errors() here")
+        result = nodes.press_button("/obj/geo1/stash1", "stashinput")
+        parm.pressButton.assert_called_once_with()
+        assert result["success"] is True
+        assert result["errors"] == []
+
+    def test_an_unsupported_argument_is_refused_before_pressing(self, monkeypatch):
+        _, parm = self._node_with_button(monkeypatch)
+        with pytest.raises(ValueError, match=r"arguments\['items'\] is list"):
+            nodes.press_button("/obj/geo1/stash1", "stashinput", arguments={"items": [1, 2]})
+        parm.pressButton.assert_not_called()
+
+    def test_press_button_has_no_deadline(self):
+        import fxhoudinimcp_server.dispatcher as dispatcher
+
+        assert dispatcher.command_timeout("nodes.press_button") is None
 
     def test_arguments_reach_the_callback(self, monkeypatch):
         _, parm = self._node_with_button(monkeypatch)
