@@ -193,3 +193,25 @@ class TestMultiparmInstanceDiscovery:
         # The count parm that governs how many instances exist.
         counts = call("parameters.get_parameters", node_path=solver.path(), patterns=["numsources"])
         assert "numsources" in counts["parameters"]
+
+
+class TestDataParameter:
+    def test_a_stash_reports_unset_then_set_through_both_readers(self, call):
+        geo = hou.node("/obj").createNode("geo")
+        box = geo.createNode("box")
+        stash = geo.createNode("stash")
+        stash.setInput(0, box)
+
+        before = call("parameters.get_parameter", node_path=stash.path(), parm_name="stash")
+        assert before["value"] is None
+        assert before["data"]["is_set"] is False
+
+        stash.parm("stashinput").pressButton()
+        after = call("parameters.get_parameter", node_path=stash.path(), parm_name="stash")
+        assert after["data"]["is_set"] is True
+        assert after["value"]["point_count"] == 8
+        assert after["data"]["geometry"]["prim_count"] == 6
+
+        batch = call("parameters.get_parameters", node_path=stash.path(), patterns=["stash"])
+        entry = batch["parameters"]["stash"]
+        assert entry["data"]["is_set"] is True
