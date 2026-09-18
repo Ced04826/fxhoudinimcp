@@ -17,6 +17,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.serialize import geometry_summary
 
 ###### Helpers
 
@@ -74,29 +75,45 @@ def _serialize_value(value: Any) -> Any:
 
 
 def _data_parm_summary(parm: hou.Parm, pt: hou.ParmTemplate) -> dict[str, Any]:
-    """Size and content of a Data parameter, never the blob itself."""
+    """What a Data parameter holds, never the blob itself.
+
+    Counts come from serialize.geometry_summary (intrinsics), not from
+    parm.asData(): that serialises the whole geometry to a string on the main
+    thread, which is ruinous on a heavy stash and measures characters, not
+    bytes.
+    """
     summary: dict[str, Any] = {"is_set": False}
     with contextlib.suppress(Exception):
         summary["data_parm_type"] = pt.dataParmType().name()
     value = None
     with contextlib.suppress(Exception):
         value = parm.eval()
-    if value is not None:
+    if isinstance(value, hou.Geometry):
+        # Set, possibly to an empty geometry: the counts say which.
         summary["is_set"] = True
-        if isinstance(value, hou.Geometry):
-            with contextlib.suppress(Exception):
-                summary["geometry"] = {
-                    "points": value.intrinsicValue("pointcount"),
-                    "prims": value.intrinsicValue("primitivecount"),
-                }
-        else:
-            summary["value_type"] = type(value).__name__
-    with contextlib.suppress(Exception):
-        blob = parm.asData()
-        if isinstance(blob, dict):
-            summary["size_bytes"] = sum(len(str(v)) for v in blob.values())
-            summary["is_set"] = summary["is_set"] or summary["size_bytes"] > 0
+        summary["geometry"] = geometry_summary(value)
+    elif isinstance(value, dict):
+        # A KeyValueDictionary evaluates to {} when empty.
+        summary["is_set"] = bool(value)
+        summary["key_count"] = len(value)
+    elif value is not None:
+        summary["is_set"] = True
+        summary["value_type"] = type(value).__name__
     return summary
+
+
+def _data_parm_value(parm: hou.Parm, pt: hou.ParmTemplate) -> dict[str, Any] | None:
+    """For a Data parameter, the fields a reader reports; None for any other.
+
+    eval() on a Data parameter is a hou.Geometry or None and rawValue() is
+    empty either way, so `value` alone cannot tell "unset" from "set to an
+    empty geometry". `value` stays the geometry summary it always serialised
+    to; `data` says whether the blob is set and what it holds.
+    """
+    if _parm_type_name(pt) != "Data":
+        return None
+    data = _data_parm_summary(parm, pt)
+    return {"value": data.get("geometry"), "data": data}
 
 
 def _template_to_dict(pt: hou.ParmTemplate) -> dict[str, Any]:
@@ -157,32 +174,18 @@ def _get_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any]:
     parm = _resolve_parm(node_path, parm_name)
     pt = parm.parmTemplate()
 
-    if _parm_type_name(pt) == "Data":
-        # A Data parameter (a Curve SOP's stash, a Stash SOP's geometry) holds
-        # a blob: eval() is a hou.Geometry or None and rawValue() is empty
-        # either way, so the old answer was `null` with no way to tell "unset"
-        # from "set". Report the size and what it holds instead.
-        return {
-            "node_path": node_path,
-            "parm_name": parm.name(),
-            "parm_type": "Data",
-            "data": _data_parm_summary(parm, pt),
-            "is_locked": parm.isLocked(),
-            "is_at_default": parm.isAtDefault(),
-            "expression": None,
-            "expression_language": None,
-            "keyframe_count": 0,
-        }
-
+    data_parm = _data_parm_value(parm, pt)
     result: dict[str, Any] = {
         "node_path": node_path,
         "parm_name": parm_name,
-        "value": _serialize_value(parm.eval()),
+        "value": data_parm["value"] if data_parm else _serialize_value(parm.eval()),
         "raw_value": _serialize_value(parm.rawValue()),
         "parm_type": _parm_type_name(pt),
         "is_locked": parm.isLocked(),
         "is_at_default": parm.isAtDefault(),
     }
+    if data_parm:
+        result["data"] = data_parm["data"]
 
     # Expression
     try:
@@ -816,11 +819,12 @@ def _get_parameters(
         matched += 1
         if len(values) >= _GET_PARMS_CAP:
             continue
-        entry: dict[str, Any] = {"value": _serialize_value(parm.eval())}
+        data_parm = _data_parm_value(parm, parm.parmTemplate())
+        entry: dict[str, Any] = data_parm or {"value": _serialize_value(parm.eval())}
         raw = parm.rawValue()
         # Only worth reporting when it differs: an expression is the thing a
         # caller most often needs to see and a literal is just noise.
-        if isinstance(raw, str) and raw != str(entry["value"]):
+        if not data_parm and isinstance(raw, str) and raw != str(entry["value"]):
             entry["raw_value"] = raw
         if include_defaults:
             entry["is_at_default"] = parm.isAtDefault()
