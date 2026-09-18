@@ -146,81 +146,68 @@ def save_scene(file_path: str = None) -> dict:
 
 ###### scene.load_scene
 
-
-def load_scene(file_path: str, merge: bool = False) -> dict:
-    """Open or merge a hip file.
-
-    Args:
-        file_path: Path to the .hip/.hipnc/.hiplc file.
-        merge: If True, merge nodes into the current scene instead of replacing it.
-    """
-    require_inside_project_root(file_path, "hip file")
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    if merge:
-        hou.hipFile.merge(file_path)
-        message = f"Merged {file_path} into current scene."
-    else:
-        hou.hipFile.load(file_path, suppress_save_prompt=True)
-        message = f"Loaded {file_path}."
-
-    return {
-        "success": True,
-        "hip_file": hou.hipFile.path(),
-        "message": message,
-    }
+# Characters that make a node path a pattern. merge's node_pattern would
+# honour them, but the per-path report could not say what each one brought.
+_PATTERN_CHARS = frozenset("*?^[] ")
 
 
-###### scene.merge_hip
+def _warning_lines(warning: Exception) -> list[str]:
+    return [line.strip() for line in str(warning).splitlines() if line.strip()]
 
 
-def _top_level_nodes() -> dict[str, set]:
-    """Children of every root context, keyed by context path."""
+def _children_of(paths) -> dict[str, set]:
+    """Child paths of each watched network, keyed by its path."""
     snapshot: dict[str, set] = {}
-    root = hou.node("/")
-    if root is None:
-        return snapshot
-    for context in root.children():
-        with contextlib.suppress(Exception):
-            snapshot[context.path()] = {child.path() for child in context.children()}
+    for path in paths:
+        node = hou.node(path)
+        snapshot[path] = set()
+        if node is not None:
+            with contextlib.suppress(Exception):
+                snapshot[path] = {child.path() for child in node.children()}
     return snapshot
 
 
-def merge_hip(
-    file_path: str,
-    node_paths: list | None = None,
-    overwrite_on_conflict: bool = False,
-) -> dict:
-    """Merge nodes from another hip file into the current scene.
+def _base_name(name: str) -> str:
+    """null12 -> null: the stem Houdini renumbers when a name is taken."""
+    return name.rstrip("0123456789")
 
-    Unlike `load_scene(merge=True)` this takes a list of node paths and
-    reports what actually arrived. Houdini's pattern must be absolute
-    (`null1` matches nothing, `/obj/null1` does) and a container named
-    alone comes without its children, so each path is sent as
-    `<path> <path>/*`. A node that already exists is merged under a new name
-    (`null1` -> `null2`) unless overwrite_on_conflict=True, in which case the
-    existing node is overwritten in place; `conflicts` names both cases.
 
-    Args:
-        file_path: The .hip file to merge from (inside the project root).
-        node_paths: Absolute node paths to merge; default everything.
-        overwrite_on_conflict: Overwrite same-named nodes instead of
-            renaming the merged copy.
-    """
-    require_inside_project_root(file_path, "hip file")
-    if not os.path.isfile(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
+def _merge(file_path: str, node_paths: list | None, overwrite_on_conflict: bool) -> dict:
     if node_paths is not None and not isinstance(node_paths, (list, tuple)):
         raise ValueError("node_paths must be a list of absolute node paths.")
     requested = [str(p).rstrip("/") for p in (node_paths or [])]
     for path in requested:
         if not path.startswith("/"):
             raise ValueError(f"node_paths must be absolute (got {path!r}); e.g. '/obj/{path}'.")
-    pattern = " ".join(f"{path} {path}/*" for path in requested) if requested else "*"
+        pattern_chars = sorted(set(path) & _PATTERN_CHARS)
+        if pattern_chars:
+            raise ValueError(
+                f"node_paths are node paths, not patterns: {path!r} contains "
+                f"{pattern_chars}. List each node, or omit node_paths to merge everything."
+            )
+    if node_paths is not None and not requested:
+        return {
+            "success": True,
+            "file_path": file_path,
+            "merged_nodes": [],
+            "merged_count": 0,
+            "message": "node_paths is empty: nothing was merged. Omit it to merge everything.",
+        }
 
-    before = _top_level_nodes()
-    existed = [path for path in requested if hou.node(path) is not None]
+    # A container named alone comes without its children, so each path is
+    # sent with its contents.
+    pattern = " ".join(f"{path} {path}/*" for path in requested) if requested else "*"
+    if requested:
+        watched = sorted({path.rpartition("/")[0] for path in requested})
+    else:
+        watched = [context.path() for context in hou.node("/").children()]
+    colliding: set = set()
+    with contextlib.suppress(Exception):
+        colliding = {
+            node.path()
+            for node in hou.hipFile.collisionNodesIfMerged(file_path, node_pattern=pattern)
+        }
+    before = _children_of(watched)
     warnings: list[str] = []
     try:
         hou.hipFile.merge(
@@ -230,52 +217,129 @@ def merge_hip(
             ignore_load_warnings=False,
         )
     except hou.LoadWarning as warning:
-        warnings = [line.strip() for line in str(warning).splitlines() if line.strip()]
-    after = _top_level_nodes()
+        warnings = _warning_lines(warning)
+    after = _children_of(watched)
+    arrived = set()
+    for network, paths in after.items():
+        arrived |= paths - before.get(network, set())
 
-    merged: list[str] = []
-    for context, paths in after.items():
-        merged.extend(sorted(paths - before.get(context, set())))
-    merged.sort()
-
+    # Attribute what arrived to what was asked for. A colliding node was
+    # either overwritten in place or renumbered (null1 -> null2) next to it.
+    subjects = requested or sorted(path for path in colliding if path.rpartition("/")[0] in before)
+    claimed: set = set()
+    overwritten: list[str] = []
     conflicts: list[dict] = []
-    for path in existed:
-        entry = {"requested": path, "existed": True}
-        if overwrite_on_conflict:
-            entry["outcome"] = "overwritten in place"
-        else:
-            parent, _, name = path.rpartition("/")
-            renamed = [
-                p for p in merged if p.rpartition("/")[0] == parent and p.rpartition("/")[2] != name
-            ]
-            entry["outcome"] = "merged under a new name"
-            if renamed:
-                entry["merged_as"] = renamed
-        conflicts.append(entry)
+    missing: list[str] = []
+    for path in subjects:
+        parent, _, name = path.rpartition("/")
+        if path in colliding and overwrite_on_conflict:
+            overwritten.append(path)
+            conflicts.append({"requested": path, "outcome": "overwritten in place"})
+            continue
+        if path in colliding:
+            candidates = sorted(
+                (
+                    p
+                    for p in arrived - claimed
+                    if p.rpartition("/")[0] == parent
+                    and p not in requested
+                    and _base_name(p.rpartition("/")[2]) == _base_name(name)
+                ),
+                key=lambda p: (len(p), p),
+            )
+            if candidates:
+                claimed.add(candidates[0])
+                conflicts.append(
+                    {
+                        "requested": path,
+                        "outcome": "merged under a new name",
+                        "merged_as": candidates[0],
+                    }
+                )
+                continue
+        elif path in arrived:
+            claimed.add(path)
+            continue
+        if requested:
+            missing.append(path)
 
-    missing = [
-        path
-        for path in requested
-        if path not in existed and hou.node(path) is None and not any(m == path for m in merged)
-    ]
+    merged = sorted(arrived | set(overwritten))
+    descendants = 0
+    for path in merged:
+        with contextlib.suppress(Exception):
+            descendants += len(hou.node(path).allSubChildren())
     result = {
-        "success": True,
+        # Asking for nodes and getting none is a failed merge, whatever the
+        # reason (not in the file, a missing parent, an unreadable file).
+        "success": bool(merged) or (not requested and not warnings),
         "file_path": file_path,
         "node_pattern": pattern,
         "merged_nodes": merged,
         "merged_count": len(merged),
+        "merged_descendant_count": descendants,
         "conflicts": conflicts,
         "not_found_in_file": missing,
         "warnings": warnings,
         "hip_file": hou.hipFile.path(),
         "has_unsaved_changes": hou.hipFile.hasUnsavedChanges(),
+        "message": (
+            f"Merged {len(merged)} node(s) from {file_path} into the current scene"
+            + (f" with {len(warnings)} load warning(s)." if warnings else ".")
+        ),
     }
     if missing:
         result["note"] = (
-            "Paths in not_found_in_file produced nothing: check they are absolute "
-            "paths that exist in the file (a load warning names a missing parent)."
+            "Paths in not_found_in_file brought nothing: check they are absolute "
+            "paths that exist in the file, under a parent that exists in this scene."
         )
     return result
+
+
+def load_scene(
+    file_path: str,
+    merge: bool = False,
+    node_paths: list | None = None,
+    overwrite_on_conflict: bool = False,
+) -> dict:
+    """Open a hip file, or merge it (or named nodes from it) into this scene.
+
+    Load warnings (missing assets and the like) come back in `warnings`
+    instead of failing the call. A merge reports what arrived: node_paths
+    are absolute (`/obj/building`), each brought with its contents; a node
+    that already exists is merged under a new name unless
+    overwrite_on_conflict=True overwrites it in place, and `conflicts` says
+    which.
+
+    Args:
+        file_path: Path to the .hip/.hipnc/.hiplc file.
+        merge: If True, merge nodes into the current scene instead of replacing it.
+        node_paths: With merge, the absolute node paths to merge; default everything.
+        overwrite_on_conflict: With merge, overwrite same-named nodes instead
+            of renaming the merged copy.
+    """
+    require_inside_project_root(file_path, "hip file")
+    if not os.path.isfile(hou.text.expandString(file_path)):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    if not merge and (node_paths is not None or overwrite_on_conflict):
+        raise ValueError("node_paths and overwrite_on_conflict apply only with merge=True.")
+
+    if merge:
+        return _merge(file_path, node_paths, overwrite_on_conflict)
+
+    warnings: list[str] = []
+    try:
+        hou.hipFile.load(file_path, suppress_save_prompt=True, ignore_load_warnings=False)
+    except hou.LoadWarning as warning:
+        warnings = _warning_lines(warning)
+    message = f"Loaded {file_path}."
+    if warnings:
+        message = f"Loaded {file_path} with {len(warnings)} load warning(s)."
+    return {
+        "success": True,
+        "hip_file": hou.hipFile.path(),
+        "message": message,
+        "warnings": warnings,
+    }
 
 
 ###### scene.import_file
@@ -620,7 +684,6 @@ register_handler("scene.get_scene_info", get_scene_info)
 register_handler("scene.new_scene", new_scene)
 register_handler("scene.save_scene", save_scene)
 register_handler("scene.load_scene", load_scene)
-register_handler("scene.merge_hip", merge_hip)
 register_handler("scene.import_file", import_file)
 register_handler("scene.export_file", export_file)
 register_handler("scene.get_context_info", get_context_info)

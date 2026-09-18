@@ -152,3 +152,58 @@ class TestSetViewerContext:
         # The useful failure is "no Scene Viewer", not an AttributeError from
         # somewhere inside hou.ui.
         assert error["message"].strip(), error
+
+
+class TestLoadSceneMerge:
+    @pytest.fixture
+    def source_hip(self, tmp_path):
+        obj = hou.node("/obj")
+        obj.createNode("null", "null1")
+        building = obj.createNode("geo", "building")
+        building.createNode("box", "walls")
+        obj.createNode("geo", "geo1").createNode("sphere", "sphere1")
+        path = str(tmp_path / "source.hip").replace("\\", "/")
+        hou.hipFile.save(path)
+        hou.hipFile.clear(suppress_save_prompt=True)
+        return path
+
+    def test_named_nodes_arrive_and_a_collision_is_renumbered(self, call, source_hip):
+        hou.node("/obj").createNode("null", "null1")
+        data = call(
+            "scene.load_scene",
+            file_path=source_hip,
+            merge=True,
+            node_paths=["/obj/null1", "/obj/building"],
+        )
+        assert data["success"] is True
+        assert data["merged_nodes"] == ["/obj/building", "/obj/null2"]
+        assert hou.node("/obj/building/walls") is not None
+        assert data["conflicts"] == [
+            {
+                "requested": "/obj/null1",
+                "outcome": "merged under a new name",
+                "merged_as": "/obj/null2",
+            }
+        ]
+
+    def test_a_node_merged_into_an_existing_container_is_reported(self, call, source_hip):
+        hou.node("/obj").createNode("geo", "geo1")
+        data = call(
+            "scene.load_scene", file_path=source_hip, merge=True, node_paths=["/obj/geo1/sphere1"]
+        )
+        assert data["merged_nodes"] == ["/obj/geo1/sphere1"]
+        assert hou.node("/obj/geo1/sphere1") is not None
+
+    def test_a_node_absent_from_the_file_is_not_found_and_not_success(self, call, source_hip):
+        hou.node("/obj").createNode("null", "local_only")
+        data = call(
+            "scene.load_scene", file_path=source_hip, merge=True, node_paths=["/obj/local_only"]
+        )
+        assert data["success"] is False
+        assert data["not_found_in_file"] == ["/obj/local_only"]
+        assert data["conflicts"] == []
+
+    def test_an_empty_list_merges_nothing(self, call, source_hip):
+        data = call("scene.load_scene", file_path=source_hip, merge=True, node_paths=[])
+        assert data["merged_nodes"] == []
+        assert hou.node("/obj").children() == ()
