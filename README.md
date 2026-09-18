@@ -9,7 +9,7 @@
   <p align="center">
     The most comprehensive MCP server for SideFX Houdini.
     <br/>
-    204 tools across 23 categories, covering every major Houdini context.
+    206 tools across 23 categories, covering every major Houdini context.
     <br/><br/>
   </p>
 
@@ -54,7 +54,7 @@
 
 A comprehensive [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) server for [SideFX Houdini](https://www.sidefx.com/). Connects AI assistants like Claude directly to Houdini's Python API, enabling natural language control over scene building, simulation setup, rendering, and more.
 
-**204 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
+**206 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
 
 <!-- FEATURES -->
 ## Features
@@ -64,8 +64,8 @@ A comprehensive [MCP](https://modelcontextprotocol.io/) (Model Context Protocol)
 | **Graph Intelligence** | 6 | Atomic validated network building, network verification, node doc cards, cook profiling, frame-range cooking with per-frame evidence, cook status |
 | **Documentation** | 2 | Full-text search + page retrieval over Houdini's own shipped manual (version-exact) |
 | **Scene Management** | 10 | Open, save, import/export, scene info, connection status, undo/redo |
-| **Node Operations** | 20 | Create, delete, copy, connect, layout, flags, network boxes, sticky notes, object transforms |
-| **Parameters** | 14 | Get/set values in bulk, expressions, keyframes, spare parameters |
+| **Node Operations** | 22 | Create, delete, copy, connect, layout, flags, network boxes, sticky notes, object transforms |
+| **Parameters** | 12 | Get/set values in bulk, expressions, keyframes, spare parameters |
 | **Geometry (SOPs)** | 14 | Points, prims, attributes, attribute statistics, volume inspection, groups, sampling, nearest-point search |
 | **LOPs/USD** | 18 | Stage inspection, prims, layers, composition, variants, lighting |
 | **DOPs** | 8 | Simulation info, DOP objects, step/reset, memory usage |
@@ -99,7 +99,7 @@ flowchart LR
 
     subgraph MCP[" ⚡ FXHoudini MCP Server "]
         direction TB
-        B1("🔧 204 tools")
+        B1("🔧 206 tools")
         B2("📦 8 Resources")
         B3("💬 9 Prompts")
     end
@@ -591,7 +591,7 @@ Set `HOUDINI_DISABLE_OPENFX_DEFAULT_PATH=1` when running any of the above.
 This is a Houdini/Universe conflict, not something this repo causes.
 
 Unit tests mock `hou` and run anywhere. The integration suite in
-`tests/integration/` executes all 204 commands against live Houdini via
+`tests/integration/` executes all 206 commands against live Houdini via
 `hython` — including end-to-end user scenarios (procedural modeling,
 simulation, animation, lookdev) — and prints per-command timing and
 coverage reports; it is skipped automatically when `hou` is not
@@ -604,7 +604,7 @@ server's own bridge).
 
 1. **Houdini Plugin** (`houdini/`): Runs inside Houdini's Python environment. Registers `@hwebserver.apiFunction` endpoints that receive JSON commands. Uses `hdefereval.executeInMainThreadWithResult()` to safely execute `hou.*` calls on the main thread.
 
-2. **MCP Server** (`python/fxhoudinimcp/`): A standalone Python process using FastMCP. Exposes 204 tools, 8 resources, and 9 prompts via the MCP protocol. Forwards tool calls to Houdini over HTTP.
+2. **MCP Server** (`python/fxhoudinimcp/`): A standalone Python process using FastMCP. Exposes 206 tools, 8 resources, and 9 prompts via the MCP protocol. Forwards tool calls to Houdini over HTTP.
 
 3. **Bridge** (`python/fxhoudinimcp/bridge.py`): Async HTTP client that sends commands to Houdini's hwebserver and deserializes responses. Handles connection errors and timeouts.
 

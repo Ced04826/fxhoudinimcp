@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+import time
 from difflib import get_close_matches
 from typing import Any
 
@@ -667,6 +668,203 @@ def connect_nodes(
     }
 
 
+###### nodes.change_node_type
+
+
+def _non_default_parm_names(node: hou.Node) -> set[str]:
+    names = set()
+    for parm in node.parms():
+        with contextlib.suppress(Exception):
+            if not parm.isAtDefault():
+                names.add(parm.name())
+    return names
+
+
+def change_node_type(
+    node_path: str,
+    new_type: str,
+    keep_name: bool = True,
+    keep_parms: bool = True,
+    keep_network_contents: bool = True,
+) -> dict:
+    """Swap a node for another type in place — wires, name, position, flags
+    and (by default) parameter values and network contents kept.
+
+    This is the Type Properties "change type" / asset "upgrade to version"
+    gesture: an HDA instance moved to an installed newer version keeps its
+    edits. Every value that was set before the swap and is not set after it
+    is named in `parms_dropped` (no home on the new type) or `parms_reset`
+    (back at its default), measured on the node rather than inferred from
+    the flags.
+
+    Args:
+        node_path: Node to change.
+        new_type: Type name in the node's own category (unversioned names
+            map to the preferred version, as create_node does).
+        keep_name: Keep the node's name (default True).
+        keep_parms: Carry parameter values over by name (default True).
+        keep_network_contents: Keep the children of a subnet/asset (default
+            True). False resets an asset to its definition's contents, also
+            when the node already is of the requested type.
+    """
+    from fxhoudinimcp_server.handlers.graph_handlers import _resolve_node_type
+
+    node = _get_node(node_path)
+    category = node.type().category()
+    resolved = _resolve_node_type(category, new_type)
+    if resolved is None:
+        close = get_close_matches(new_type, list(category.nodeTypes()), n=3, cutoff=0.5)
+        hint = f" Did you mean: {close}?" if close else ""
+        raise ValueError(f"Type '{new_type}' does not exist in {category.name()}.{hint}")
+    old_type = node.type().name()
+    same_type = resolved.name() == old_type
+    # Re-applying the same type only does something when the contents are
+    # to be reset; otherwise it would be a no-op that still costs an undo.
+    changing = not same_type or not keep_network_contents
+
+    before_parms = {p.name() for p in node.parms()}
+    before_non_default = _non_default_parm_names(node)
+    changed = node
+    if changing:
+        kwargs = {
+            "keep_name": bool(keep_name),
+            "keep_parms": bool(keep_parms),
+            "keep_network_contents": bool(keep_network_contents),
+        }
+        if same_type:
+            kwargs["force_change_on_node_type_match"] = True
+        try:
+            changed = node.changeNodeType(resolved.name(), **kwargs)
+        except Exception as exc:
+            raise ValueError(
+                f"Could not change {node_path} ({old_type}) to {resolved.name()}: "
+                f"{readable_message(exc)}"
+            ) from exc
+        _focus_network_editor(changed, place_unpositioned=False)
+
+    after_parms = {p.name() for p in changed.parms()}
+    lost = before_non_default - _non_default_parm_names(changed)
+    result: dict[str, Any] = {
+        "success": True,
+        "node_path": changed.path(),
+        "old_type": old_type,
+        "new_type": changed.type().name(),
+        "changed": changing,
+        "keep_parms": bool(keep_parms),
+        "keep_network_contents": bool(keep_network_contents),
+        # Set values with no home on the new type, and set values that are
+        # back at their default: together, everything the swap lost.
+        "parms_dropped": sorted(lost - after_parms),
+        "parms_reset": sorted(lost & after_parms),
+        # Every parameter the new type lacks, set or not.
+        "parms_removed_count": len(before_parms - after_parms),
+        "inputs": [i.path() if i is not None else None for i in changed.inputs()],
+        "outputs": [o.path() for o in changed.outputs()],
+    }
+    if not changing:
+        result["message"] = f"{changed.path()} is already of type {old_type}; nothing changed."
+    with contextlib.suppress(Exception):
+        result["child_count"] = len(changed.children())
+    with contextlib.suppress(Exception):
+        if changed.type().definition() is not None:
+            result["matches_definition"] = changed.matchesCurrentDefinition()
+    return result
+
+
+###### nodes.press_button
+
+# The value types HOM's pressButton accepts in its arguments dict.
+_BUTTON_ARGUMENT_TYPES = (bool, int, float, str)
+
+
+def press_button(
+    node_path: str,
+    parm_name: str,
+    arguments: dict | None = None,
+    cook: bool = False,
+) -> dict:
+    """Press a button parameter and report what the node says afterwards.
+
+    Runs the button's callback exactly as a click would ("Stash Input",
+    "Reload Geometry", an asset's own Build button). The call holds until
+    the callback returns, with no deadline; a callback that opens a dialog
+    holds Houdini's main thread, and with it this bridge, until the dialog
+    is closed.
+
+    A press usually only dirties the node: `errors` and `warnings` are from
+    its last cook, which may predate the press. `cook=True` cooks the node
+    after the press so they describe the result; without it `needs_cook`
+    says whether they are stale (a cook that failed leaves it True too).
+
+    Args:
+        node_path: Node that owns the button.
+        parm_name: The button parameter's name.
+        arguments: Optional kwargs handed to the callback script; values
+            must be int, bool, float or str.
+        cook: Cook the node after the press (default False).
+    """
+    node = _get_node(node_path)
+    parm = node.parm(parm_name)
+    if parm is None:
+        names = [p.name() for p in node.parms()]
+        close = get_close_matches(parm_name, names, n=3, cutoff=0.4)
+        buttons = [p.name() for p in node.parms() if p.parmTemplate().type().name() == "Button"]
+        hint = f" Did you mean: {close}?" if close else ""
+        raise ValueError(
+            f"{node.path()} has no parameter '{parm_name}'.{hint} Buttons on this node: {buttons}"
+        )
+    for key, value in (arguments or {}).items():
+        if not isinstance(value, _BUTTON_ARGUMENT_TYPES):
+            raise ValueError(
+                f"arguments['{key}'] is {type(value).__name__}; a button callback "
+                f"takes only int, bool, float or str values. Nothing was pressed."
+            )
+    template = parm.parmTemplate()
+    parm_type = template.type().name()
+    started = time.perf_counter()
+    try:
+        if arguments:
+            parm.pressButton(dict(arguments))
+        else:
+            parm.pressButton()
+    except Exception as exc:
+        raise ValueError(
+            f"Callback of {node.path()}/{parm_name} failed: {readable_message(exc)}"
+        ) from exc
+    duration_ms = round((time.perf_counter() - started) * 1000, 1)
+    result: dict[str, Any] = {
+        "success": True,
+        "node_path": node.path(),
+        "parm_name": parm.name(),
+        "parm_type": parm_type,
+        "duration_ms": duration_ms,
+        "cooked": False,
+    }
+    if cook:
+        # A failed cook is an answer, not a failure of the press: its
+        # messages land in errors() below.
+        with contextlib.suppress(Exception):
+            node.cook(force=False)
+        result["cooked"] = True
+    with contextlib.suppress(Exception):
+        result["needs_cook"] = node.needsToCook()
+    for key, read in (("errors", node.errors), ("warnings", node.warnings)):
+        try:
+            result[key] = list(read())
+        except Exception:
+            result[key] = []
+    with contextlib.suppress(Exception):
+        # Built-in buttons (File's Reload, Stash's Stash Input) are handled in
+        # C++ and have no script callback; False does not mean inert.
+        result["has_script_callback"] = bool(template.scriptCallback())
+    if parm_type != "Button":
+        result["note"] = (
+            f"'{parm_name}' is a {parm_type} parameter, not a Button; its callback "
+            f"script (if any) was triggered the way pressButton does for any parameter."
+        )
+    return result
+
+
 ###### nodes.connect_nodes_batch
 
 
@@ -1094,6 +1292,8 @@ register_handler("nodes.list_children", list_children)
 register_handler("nodes.find_nodes", find_nodes)
 register_handler("nodes.list_node_types", list_node_types)
 register_handler("nodes.connect_nodes", connect_nodes)
+register_handler("nodes.change_node_type", change_node_type)
+register_handler("nodes.press_button", press_button)
 register_handler("nodes.connect_nodes_batch", connect_nodes_batch)
 register_handler("nodes.disconnect_node", disconnect_node)
 register_handler("nodes.reorder_inputs", reorder_inputs)

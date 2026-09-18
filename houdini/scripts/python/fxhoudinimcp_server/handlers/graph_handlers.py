@@ -59,10 +59,13 @@ def _resolve_node_type(category: hou.NodeTypeCategory, type_name: str):
     types = category.nodeTypes()
     if type_name in types:
         return types[type_name]
+    from fxhoudinimcp_server.handlers.hda_handlers import _version_key
+
     prefix = type_name + "::"
-    versioned = sorted(key for key in types if key.startswith(prefix))
+    versioned = [key for key in types if key.startswith(prefix)]
     if versioned:
-        return types[versioned[-1]]
+        # Numeric order, not string order: ::10.0 is newer than ::2.0.
+        return types[max(versioned, key=lambda key: _version_key(key[len(prefix) :]))]
     return None
 
 

@@ -13,6 +13,7 @@ from typing import Any
 from fxhoudinimcp._sdk import Context
 
 # Internal
+from fxhoudinimcp.bridge import NO_TIMEOUT
 from fxhoudinimcp.config import auto_layout_enabled
 from fxhoudinimcp.server import _get_bridge, mcp
 
@@ -227,6 +228,85 @@ async def list_node_types(
     if filter is not None:
         params["filter"] = filter
     return await bridge.execute("nodes.list_node_types", params)
+
+
+@mcp.tool()
+async def change_node_type(
+    ctx: Context,
+    node_path: str,
+    new_type: str,
+    keep_name: bool = True,
+    keep_parms: bool = True,
+    keep_network_contents: bool = True,
+) -> dict:
+    """Change a node's type in place, keeping wires, name, position, flags,
+    parameter values and (for subnets/assets) network contents.
+
+    This is how an HDA instance is moved to an installed newer version
+    (`building::2.0`) without losing its edits, and how a placeholder is
+    swapped for the real node. Every value set before the swap and not after
+    it is named in `parms_dropped` (no such parameter on the new type) or
+    `parms_reset` (back at its default). Unversioned names map to the
+    preferred version, as create_node does.
+
+    Args:
+        node_path: Node to change.
+        new_type: Type name in the node's own category.
+        keep_name: Keep the node's name.
+        keep_parms: Carry parameter values over by name.
+        keep_network_contents: Keep a subnet's/asset's children (False resets
+            an asset to its definition's contents, also on a node that is
+            already of new_type).
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute(
+        "nodes.change_node_type",
+        {
+            "node_path": node_path,
+            "new_type": new_type,
+            "keep_name": keep_name,
+            "keep_parms": keep_parms,
+            "keep_network_contents": keep_network_contents,
+        },
+    )
+
+
+@mcp.tool()
+async def press_button(
+    ctx: Context,
+    node_path: str,
+    parm_name: str,
+    arguments: dict[str, Any] | None = None,
+    cook: bool = False,
+) -> dict:
+    """Press a button parameter — "Stash Input", "Reload Geometry", an
+    asset's own Build button — and read the node's errors and warnings
+    afterwards.
+
+    The call holds until the callback returns, with no deadline. A callback
+    that opens a dialog blocks Houdini's main thread and this bridge with it;
+    read the button's script first if in doubt. For a Save to Disk or a
+    render use write_cache / start_render, which report a verdict.
+
+    A press usually only dirties the node, so `errors`/`warnings` are from
+    its last cook unless `cook=True`; without it `needs_cook` says whether
+    they are stale (a cook that failed leaves it True too). `has_script_callback` is False for built-in buttons that still
+    do work (File's Reload, Stash's Stash Input).
+
+    Args:
+        node_path: Node that owns the button.
+        parm_name: The button parameter's name.
+        arguments: Optional kwargs handed to the callback script; values
+            must be int, bool, float or str.
+        cook: Cook the node after the press so errors describe the result.
+    """
+    bridge = _get_bridge(ctx)
+    payload: dict[str, Any] = {"node_path": node_path, "parm_name": parm_name}
+    if arguments:
+        payload["arguments"] = arguments
+    if cook:
+        payload["cook"] = True
+    return await bridge.execute("nodes.press_button", payload, timeout=NO_TIMEOUT)
 
 
 @mcp.tool()

@@ -84,6 +84,7 @@ STAND_INS: dict[str, object] = {
     "text": "a note",
     "type_name": "fxh::test::1.0",
     "new_name": "renamed",
+    "new_type": "null",
     "name": "thing",
     "frame": 1.0,
     "value": 0,
