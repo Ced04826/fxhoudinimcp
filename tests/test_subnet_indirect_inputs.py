@@ -242,6 +242,14 @@ class TestBuildNetwork:
         assert result["valid"] is False
         assert "source_output must be 0" in result["errors"][0]
 
+    def test_a_failing_listing_reports_the_real_message(self, monkeypatch):
+        parent, _, _ = self._network(monkeypatch)
+        parent.indirectInputs.side_effect = RuntimeError("HOM said no")
+        result = self._dry([{"indirect_input": 0}])
+        assert result["valid"] is False
+        assert "HOM said no" in result["errors"][0]
+        assert "not a subnet" not in result["errors"][0]
+
     def test_the_parent_s_connectors_are_listed_once(self, monkeypatch):
         parent, _, _ = self._network(monkeypatch)
         self._dry([{"indirect_input": 0}, {"indirect_input": 1, "index": 1}])

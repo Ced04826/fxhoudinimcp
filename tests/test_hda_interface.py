@@ -211,6 +211,9 @@ class _Definition:
         self.on_write = on_write
         self.writes = 0
 
+    def isEmbedded(self):
+        return self.library == "Embedded"
+
     def parmTemplateGroup(self):
         return _LiveGroup(self.stored)
 
@@ -486,6 +489,19 @@ class TestSetHdaInterface:
         with pytest.raises(PermissionError, match="HDA library"):
             hda.set_hda_interface("/obj/unit", [{"name": "x", "type": "int"}])
         assert definition.writes == 0
+
+    def test_an_embedded_definition_skips_the_library_guard(self, interface_env, monkeypatch):
+        # libraryFilePath() answers the literal "Embedded" for a hip-embedded
+        # asset; realpathed against cwd it would land outside any project root.
+        definition = _Definition(library="Embedded")
+        _asset_with(monkeypatch, definition)
+
+        def outside(path, what=""):
+            raise PermissionError(f"{what} '{path}' is outside FXHOUDINIMCP_PROJECT_ROOT")
+
+        monkeypatch.setattr(hda, "require_inside_project_root", outside)
+        hda.set_hda_interface("/obj/unit", [{"name": "x", "type": "int"}])
+        assert definition.writes == 1
 
 
 class TestHoudiniRenamesTabFolders:

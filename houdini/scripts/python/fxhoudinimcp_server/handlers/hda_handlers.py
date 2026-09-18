@@ -1245,8 +1245,10 @@ def _edit_interface(node_path: str, ops: list, dry_run: bool, clear_first: bool)
 
     # setParmTemplateGroup saves the definition into its .hda library (and a
     # backup beside it), so the library is held to the project root like
-    # every other HDA file this server writes.
-    require_inside_project_root(definition.libraryFilePath(), "HDA library")
+    # every other HDA file this server writes. An embedded definition lives
+    # in the hip file and answers the literal "Embedded" for a path.
+    if not definition.isEmbedded():
+        require_inside_project_root(definition.libraryFilePath(), "HDA library")
     try:
         definition.setParmTemplateGroup(group)
     except Exception as exc:

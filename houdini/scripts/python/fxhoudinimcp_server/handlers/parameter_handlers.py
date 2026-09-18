@@ -1002,8 +1002,10 @@ def _get_parm_references(
     with contextlib.suppress(Exception):
         if node.needsToCook():
             result["note"] = (
-                "node_dependents / node_references are as of this node's last cook "
-                "(HOM: they can differ until it cooks); parameter references are not."
+                "node_dependents / node_references, and the dependents check that "
+                "decides whether `incoming` is scanned, are as of this node's last "
+                "cook (HOM: they can differ until it cooks); `outgoing` is parsed "
+                "from expressions and is not."
             )
     return result
 
