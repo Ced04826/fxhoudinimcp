@@ -255,21 +255,22 @@ async def get_usd_bound_material(
     ctx: Context,
     node_path: str,
     prim_paths: list[str],
-    purpose: str = "all",
+    purpose: str = "full",
 ) -> dict:
-    """The material each prim actually renders with, resolved the way the
-    renderer resolves it (ComputeBoundMaterial), and where the binding comes
-    from: `direct` on the prim, `inherited` from which ancestor, or which
-    `collection`.
+    """The material each prim renders with, resolved the way the renderer
+    resolves it (ComputeBoundMaterials), and where the binding comes from:
+    `direct` on the prim, `inherited` from which ancestor, or which
+    `collection`. A binding to a material prim that does not exist is
+    reported in `missing_material`, not as unbound.
 
-    get_usd_materials lists direct bindings only, so a prim bound through
-    its parent or a collection looks unbound there. Batched: pass every
-    prim of interest in one call.
+    Batched: pass every prim of interest in one call.
 
     Args:
         node_path: LOP node whose stage to read.
         prim_paths: Prim paths to resolve.
-        purpose: "all" (default), "full" or "preview".
+        purpose: "full" (default; what Karma renders, falling back to an
+            all-purpose binding), "preview", or "all" (all-purpose bindings
+            only).
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
@@ -287,6 +288,11 @@ async def get_usd_materials(ctx: Context, node_path: str) -> dict:
     and "mtlx" is the MaterialX shader Karma renders. surface_shader is the
     mtlx one when present, so it agrees with get_material_info on the same
     material.
+
+    `bound_to` lists the prims a binding is authored on. `rendered_on` (up
+    to 50 paths) and `rendered_on_count` are the geometry that resolves to
+    the material for rendering, including geometry bound through a parent
+    or a collection; get_usd_bound_material says why for a given prim.
 
     Args:
         node_path: LOP node path.

@@ -1,15 +1,15 @@
-"""Tests for get_usd_bound_material.
+"""get_usd_bound_material: the material a prim renders with, and why.
 
-get_usd_materials reads each prim's direct binding only, so a prim that
-inherits its material from an ancestor, or receives it through a collection,
-is listed as unbound -- while the renderer, resolving the binding with
-ComputeBoundMaterial, shades it. get_usd_bound_material answers the way the
-renderer does and says where the binding comes from: the prim itself, which
-ancestor, or which collection. Measured live on Houdini 22.0.429: a sphere
-under /grp with the material assigned to /grp resolves to the material with
-`kind: inherited`, `binding_prim: /grp`, `strength: weakerThanDescendants`.
+get_usd_materials reports where bindings are authored, so a prim bound
+through its parent or a collection looked unbound. This resolves bindings the
+way the renderer does (UsdShade ComputeBoundMaterials, one batch) and names
+the source. Behaviour measured on Houdini 22.0.429: the allPurpose token is
+the empty string; ComputeBoundMaterial("full") returns a full-purpose binding
+and falls back to an allPurpose one; a collection binding's relationship is
+material:binding:collection:<purpose>:<name>; a binding to a missing material
+prim returns an invalid material with a valid relationship.
 
-hou and pxr are mocked here.
+pxr is faked here.
 """
 
 from __future__ import annotations
@@ -28,90 +28,100 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "houdini", "scr
 
 # Internal
 import fxhoudinimcp_server.handlers.lops_handlers as lops  # noqa: E402
+from _usd_fakes import Path, prim  # noqa: E402
 
 
-class _Path:
-    def __init__(self, path):
-        self._path = path
-
-    def __str__(self):
-        return self._path
-
-
-def _prim(path, valid=True):
-    prim = MagicMock()
-    prim.IsValid.return_value = valid
-    prim.__bool__ = lambda self: valid
-    prim.GetPath.return_value = _Path(path)
-    return prim
-
-
-def _rel(binding_prim, name="material:binding"):
+def _rel(binding_prim, name="material:binding", collection=None, targets=()):
     rel = MagicMock()
-    rel.GetPath.return_value = _Path(f"{binding_prim}.{name}")
-    rel.GetPrim.return_value.GetPath.return_value = _Path(binding_prim)
+    rel.GetPath.return_value = Path(f"{binding_prim}.{name}")
+    rel.GetPrim.return_value.GetPath.return_value = Path(binding_prim)
     rel.GetName.return_value = name
+    rel.GetTargets.return_value = [Path(t) for t in targets]
+    rel.collection = collection
+    rel.__bool__ = lambda self: True
     return rel
 
 
-def _material(path):
+def _material(path, exists=True):
     material = MagicMock()
-    material.GetPath.return_value = _Path(path)
-    material.GetPrim.return_value.IsValid.return_value = True
-    material.__bool__ = lambda self: True
+    material.GetPath.return_value = Path(path)
+    material.GetPrim.return_value.IsValid.return_value = exists
+    material.__bool__ = lambda self: exists
     return material
 
 
 def _stage(monkeypatch, bindings, direct=None):
-    """bindings: prim path -> (material path | None, binding prim, rel name)."""
+    """bindings: prim path -> (material | None, rel | None)."""
     monkeypatch.setattr(lops, "HAS_PXR", True)
     stage = MagicMock()
-    prims = {path: _prim(path) for path in bindings}
-
-    def prim_at(path):
-        return prims.get(path, _prim(path, valid=False))
-
-    stage.GetPrimAtPath.side_effect = prim_at
+    prims = {path: prim(path) for path in bindings}
+    stage.GetPrimAtPath.side_effect = lambda path: prims.get(path, prim(path, valid=False))
     monkeypatch.setattr(lops, "_get_lop_stage", lambda node_path: stage)
 
-    api_for = {}
+    calls = []
 
-    def api(prim):
-        path = str(prim.GetPath())
-        entry = bindings.get(path)
+    def compute(prims_in, token):
+        calls.append(([str(p.GetPath()) for p in prims_in], token))
+        rows = [bindings[str(p.GetPath())] for p in prims_in]
+        return [m for m, _ in rows], [r for _, r in rows]
+
+    def api(target):
         api_obj = MagicMock()
-        if entry and entry[0]:
-            api_obj.ComputeBoundMaterial.return_value = (
-                _material(entry[0]),
-                _rel(entry[1], entry[2]),
-            )
-        else:
-            api_obj.ComputeBoundMaterial.return_value = (None, None)
-        api_obj.GetDirectBinding.return_value.GetMaterialPath.return_value = _Path(
-            (direct or {}).get(path, "")
+        path = str(target.GetPath())
+        api_obj.GetDirectBinding.side_effect = lambda token: MagicMock(
+            GetMaterialPath=MagicMock(return_value=Path((direct or {}).get((path, token), "")))
         )
-        api_for[path] = api_obj
         return api_obj
 
     usd_shade = MagicMock()
     usd_shade.MaterialBindingAPI.side_effect = api
+    usd_shade.MaterialBindingAPI.ComputeBoundMaterials.side_effect = compute
     usd_shade.MaterialBindingAPI.GetMaterialBindingStrength.return_value = "weakerThanDescendants"
-    usd_shade.Tokens.allPurpose = "allPurpose"
+    usd_shade.MaterialBindingAPI.CollectionBinding.IsCollectionBindingRel.side_effect = lambda rel: (
+        rel.collection is not None
+    )
+    usd_shade.MaterialBindingAPI.CollectionBinding.side_effect = lambda rel: MagicMock(
+        GetCollectionPath=MagicMock(return_value=Path(rel.collection))
+    )
+    # The real tokens: allPurpose is the empty string.
+    usd_shade.Tokens.allPurpose = ""
     usd_shade.Tokens.full = "full"
     usd_shade.Tokens.preview = "preview"
     monkeypatch.setattr(lops, "UsdShade", usd_shade, raising=False)
-    return api_for
+    return calls
 
 
 class TestBoundMaterial:
+    def test_the_default_purpose_is_what_karma_renders_and_one_batch(self, monkeypatch):
+        calls = _stage(
+            monkeypatch,
+            {
+                "/grp/sph1": (
+                    _material("/materials/full_only"),
+                    _rel("/grp", "material:binding:full"),
+                ),
+                "/grp/sph2": (
+                    _material("/materials/full_only"),
+                    _rel("/grp", "material:binding:full"),
+                ),
+            },
+        )
+        lops._get_usd_bound_material(node_path="/stage/x", prim_paths=["/grp/sph1", "/grp/sph2"])
+        assert calls == [(["/grp/sph1", "/grp/sph2"], "full")]
+
+    def test_all_is_the_empty_all_purpose_token(self, monkeypatch):
+        calls = _stage(monkeypatch, {"/p": (_material("/materials/m"), _rel("/p"))})
+        lops._get_usd_bound_material(node_path="/stage/x", prim_paths=["/p"], purpose="all")
+        assert calls[0][1] == ""
+
     def test_an_inherited_binding_names_the_ancestor(self, monkeypatch):
         _stage(
             monkeypatch,
             {
-                "/grp/sph1": ("/materials/srf", "/grp", "material:binding"),
-                "/grp": ("/materials/srf", "/grp", "material:binding"),
+                "/grp/sph1": (_material("/materials/srf"), _rel("/grp")),
+                "/grp": (_material("/materials/srf"), _rel("/grp")),
             },
-            direct={"/grp": "/materials/srf"},
+            direct={("/grp", "full"): "/materials/srf"},
         )
         reply = lops._get_usd_bound_material(
             node_path="/stage/assign", prim_paths=["/grp/sph1", "/grp"]
@@ -123,34 +133,42 @@ class TestBoundMaterial:
         assert child["source"]["strength"] == "weakerThanDescendants"
         assert child["direct_binding"] is None
         assert parent["source"]["kind"] == "direct"
+        # The direct binding is read for the same purpose as the resolution.
         assert parent["direct_binding"] == "/materials/srf"
         assert reply["bound"] == 2
 
-    def test_a_collection_binding_names_the_collection(self, monkeypatch):
-        _stage(
-            monkeypatch,
-            {"/set/chair": ("/materials/wood", "/set", "material:binding:collection:furniture")},
+    def test_a_purpose_specific_collection_binding_names_the_collection(self, monkeypatch):
+        rel = _rel(
+            "/set", "material:binding:collection:preview:furn", collection="/set.collection:furn"
         )
-        reply = lops._get_usd_bound_material(node_path="/stage/x", prim_paths="/set/chair")
+        _stage(monkeypatch, {"/set/chair": (_material("/materials/furn"), rel)})
+        reply = lops._get_usd_bound_material(
+            node_path="/stage/x", prim_paths="/set/chair", purpose="preview"
+        )
         source = reply["bindings"][0]["source"]
         assert source["kind"] == "collection"
-        assert source["collection"] == "furniture"
+        assert source["collection"] == "/set.collection:furn"
 
-    def test_unbound_and_missing_prims_answer_in_their_own_rows(self, monkeypatch):
-        _stage(monkeypatch, {"/materials": (None, None, None)})
+    def test_a_binding_to_a_missing_material_is_not_unbound(self, monkeypatch):
+        rel = _rel("/broken", targets=["/materials/missing"])
+        _stage(monkeypatch, {"/broken/s": (_material("", exists=False), rel)})
+        reply = lops._get_usd_bound_material(node_path="/stage/x", prim_paths=["/broken/s"])
+        row = reply["bindings"][0]
+        assert row["material"] is None
+        assert row["missing_material"] == ["/materials/missing"]
+        assert row["source"]["binding_prim"] == "/broken"
+        assert reply["missing_material"] == 1
+
+    def test_every_row_has_a_material_key_and_the_counts_tell_rows_apart(self, monkeypatch):
+        _stage(monkeypatch, {"/materials": (None, None)})
         reply = lops._get_usd_bound_material(
             node_path="/stage/x", prim_paths=["/materials", "/nope"]
         )
         unbound, missing = reply["bindings"]
-        assert unbound["material"] is None
-        assert "source" not in unbound
+        assert unbound["material"] is None and "source" not in unbound
+        assert missing["material"] is None
         assert missing["error"] == "prim not found on this stage"
-        assert reply["bound"] == 0
-
-    def test_purpose_is_passed_as_the_usd_token(self, monkeypatch):
-        api_for = _stage(monkeypatch, {"/p": ("/materials/m", "/p", "material:binding")})
-        lops._get_usd_bound_material(node_path="/stage/x", prim_paths=["/p"], purpose="preview")
-        api_for["/p"].ComputeBoundMaterial.assert_called_once_with("preview")
+        assert (reply["count"], reply["bound"], reply["not_found"]) == (2, 0, 1)
 
     def test_an_unknown_purpose_is_refused(self, monkeypatch):
         _stage(monkeypatch, {})

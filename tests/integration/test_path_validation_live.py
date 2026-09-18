@@ -106,6 +106,7 @@ STAND_INS: dict[str, object] = {
     "locked": True,
     "pattern": "*",
     "prim_path": "/root",
+    "prim_paths": ["/root"],
     "expression": "1",
     "vex_code": "@P.y += 1;",
     "chop_type": "null",

@@ -21,32 +21,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "houdini", "scr
 # Internal
 import fxhoudinimcp_server.handlers.lops_handlers as lops  # noqa: E402
 
-
-class _Path:
-    """Enough of Sdf.Path: element-wise prefix and element count."""
-
-    def __init__(self, text):
-        self.text = text
-        self.elements = [e for e in text.split("/") if e]
-
-    @property
-    def pathElementCount(self):
-        return len(self.elements)
-
-    def HasPrefix(self, other):
-        return self.elements[: len(other.elements)] == other.elements
-
-    def __str__(self):
-        return self.text
-
-
-def _prim(path):
-    prim = MagicMock()
-    prim.GetPath.return_value = _Path(path)
-    prim.GetTypeName.return_value = "Xform"
-    prim.IsValid.return_value = True
-    return prim
-
+# Shared with the other USD handler tests.
+from _usd_fakes import Path as _Path  # noqa: E402, F401
+from _usd_fakes import prim as _prim  # noqa: E402
 
 ALL = ["/materials", "/materials/BLD", "/materials/BLD/wood", "/materials/BLD_probes", "/geo"]
 
