@@ -691,8 +691,18 @@ register_handler("lops.set_usd_attribute", _set_usd_attribute)
 ###### lops.get_usd_materials
 
 
+# Geometry paths listed per material; the count is always complete.
+_RENDERED_ON_CAP = 50
+
+
 def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
-    """List all materials with their bindings."""
+    """List all materials with their bindings.
+
+    `bound_to` is where a binding is authored (a direct allPurpose binding);
+    `rendered_on` / `rendered_on_count` are the gprims that resolve to the
+    material for rendering, inherited and collection bindings included.
+    get_usd_bound_material says why for a given prim.
+    """
     stage = _get_lop_stage(node_path)
 
     materials: list[dict[str, Any]] = []
@@ -736,6 +746,7 @@ def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
             bindings_map[mat_path] = []
 
     # Find bindings
+    gprims = []
     for prim in stage.Traverse():
         binding = UsdShade.MaterialBindingAPI(prim)
         try:
@@ -745,10 +756,30 @@ def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
                 bindings_map[mat_path].append(str(prim.GetPath()))
         except Exception:
             pass
+        with contextlib.suppress(Exception):
+            if prim.IsA(UsdGeom.Gprim):
+                gprims.append(prim)
+
+    # What each material is rendered on. bound_to only names the prims a
+    # binding is authored on, so geometry bound through a parent or a
+    # collection looked unbound; this resolves every gprim the way Karma does
+    # (purpose "full"), in one batch.
+    rendered_on: dict[str, list[str]] = {}
+    with contextlib.suppress(Exception):
+        if gprims:
+            resolved, _ = UsdShade.MaterialBindingAPI.ComputeBoundMaterials(
+                gprims, UsdShade.Tokens.full
+            )
+            for prim, material in zip(gprims, resolved, strict=False):
+                if material:
+                    rendered_on.setdefault(str(material.GetPath()), []).append(str(prim.GetPath()))
 
     # Attach bindings to materials
     for mat in materials:
         mat["bound_to"] = bindings_map.get(mat["path"], [])
+        on = rendered_on.get(mat["path"], [])
+        mat["rendered_on_count"] = len(on)
+        mat["rendered_on"] = on[:_RENDERED_ON_CAP]
 
     return {
         "node_path": node_path,
@@ -758,6 +789,114 @@ def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
 
 
 register_handler("lops.get_usd_materials", _get_usd_materials)
+
+
+###### lops.get_usd_bound_material
+
+# The purpose Karma renders with is "full", and ComputeBoundMaterial("full")
+# falls back to an allPurpose binding by itself. allPurpose ("all" here) is
+# the narrowest query, not a union: it ignores a full-purpose binding.
+_BINDING_PURPOSES = {"full": "full", "preview": "preview", "all": "allPurpose"}
+
+
+def _binding_source(prim_path: str, rel: Any) -> dict[str, Any]:
+    """Where a resolved binding comes from: the prim, an ancestor, or a collection."""
+    source: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        source["relationship"] = str(rel.GetPath())
+    binding_prim = None
+    with contextlib.suppress(Exception):
+        binding_prim = str(rel.GetPrim().GetPath())
+        source["binding_prim"] = binding_prim
+    is_collection = False
+    with contextlib.suppress(Exception):
+        is_collection = bool(
+            UsdShade.MaterialBindingAPI.CollectionBinding.IsCollectionBindingRel(rel)
+        )
+    if is_collection:
+        source["kind"] = "collection"
+        # material:binding:collection:preview:furn names the purpose too; the
+        # API answers with the collection itself (/set.collection:furn).
+        with contextlib.suppress(Exception):
+            binding = UsdShade.MaterialBindingAPI.CollectionBinding(rel)
+            source["collection"] = str(binding.GetCollectionPath())
+    elif binding_prim == prim_path:
+        source["kind"] = "direct"
+    else:
+        source["kind"] = "inherited"
+    with contextlib.suppress(Exception):
+        source["strength"] = str(UsdShade.MaterialBindingAPI.GetMaterialBindingStrength(rel))
+    return source
+
+
+def _binding_targets(rel: Any) -> list[str]:
+    with contextlib.suppress(Exception):
+        return [str(target) for target in rel.GetTargets()]
+    return []
+
+
+def _get_usd_bound_material(
+    *, node_path: str, prim_paths: Any, purpose: str = "full", **_: Any
+) -> dict[str, Any]:
+    """The material each prim renders with, and why.
+
+    get_usd_materials reports where bindings are authored; a prim bound
+    through its parent, or through a collection, is not listed there. This
+    resolves the binding the way the renderer does (ComputeBoundMaterials, for
+    the whole batch at once) and names the source: direct, inherited from
+    which ancestor, or which collection. A binding whose material prim does
+    not exist is reported as such, not as "unbound".
+    """
+    stage = _get_lop_stage(node_path)
+    token_name = _BINDING_PURPOSES.get(str(purpose).lower())
+    if token_name is None:
+        raise ValueError(f"purpose must be one of {sorted(_BINDING_PURPOSES)}, got {purpose!r}.")
+    token = getattr(UsdShade.Tokens, token_name)
+    if isinstance(prim_paths, str):
+        prim_paths = [prim_paths]
+    if not isinstance(prim_paths, (list, tuple)) or not prim_paths:
+        raise ValueError("prim_paths must be a prim path or a non-empty list of them.")
+
+    rows: list[dict[str, Any]] = []
+    found: list[tuple[dict[str, Any], Any]] = []
+    for raw in prim_paths:
+        prim_path = str(raw)
+        prim = stage.GetPrimAtPath(prim_path)
+        row: dict[str, Any] = {"prim": prim_path, "material": None}
+        if not prim or not prim.IsValid():
+            row["error"] = "prim not found on this stage"
+        else:
+            found.append((row, prim))
+        rows.append(row)
+
+    if found:
+        materials, rels = UsdShade.MaterialBindingAPI.ComputeBoundMaterials(
+            [prim for _, prim in found], token
+        )
+        for (row, prim), material, rel in zip(found, materials, rels, strict=False):
+            if material and material.GetPrim().IsValid():
+                row["material"] = str(material.GetPath())
+            if rel:
+                row["source"] = _binding_source(row["prim"], rel)
+                if row["material"] is None:
+                    # Bound, to a material prim that is not on the stage.
+                    row["missing_material"] = _binding_targets(rel)
+            with contextlib.suppress(Exception):
+                direct = UsdShade.MaterialBindingAPI(prim).GetDirectBinding(token)
+                row["direct_binding"] = str(direct.GetMaterialPath()) or None
+
+    return {
+        "node_path": node_path,
+        "purpose": str(purpose).lower(),
+        "count": len(rows),
+        "bound": sum(1 for row in rows if row["material"]),
+        "missing_material": sum(1 for row in rows if "missing_material" in row),
+        "not_found": sum(1 for row in rows if "error" in row),
+        "bindings": rows,
+    }
+
+
+register_handler("lops.get_usd_bound_material", _get_usd_bound_material)
 
 
 ###### lops.find_usd_prims

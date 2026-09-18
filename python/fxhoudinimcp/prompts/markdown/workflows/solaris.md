@@ -41,7 +41,7 @@ During lookdev NEVER render to disk. `set_viewport_renderer`("Karma XPU") or `se
 3. Establish structure and transforms before look, so later nodes are not chasing paths that are still moving.
 4. Materials, then lights, then render settings.
 5. `set_viewport_renderer`("Karma XPU"), `capture_screenshot`, and LOOK.
-6. `get_stage_info`, `list_usd_prims`, `get_usd_materials`, `get_usd_layers` to verify hierarchy, bindings and the layer stack.
+6. `get_stage_info`, `list_usd_prims`, `get_usd_materials`, `get_usd_layers` to verify hierarchy, bindings and the layer stack. A prim that renders with the wrong material (or none): `get_usd_bound_material` names what it resolves to and where the binding comes from.
 
 Wire with `connect_nodes_batch`. LOP chains read top to bottom, and branch-then-merge is idiomatic.
 
