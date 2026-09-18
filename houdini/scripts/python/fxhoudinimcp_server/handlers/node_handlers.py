@@ -7,6 +7,7 @@ nodes within Houdini's node graph.
 from __future__ import annotations
 
 import contextlib
+import re
 from difflib import get_close_matches
 from typing import Any
 
@@ -540,6 +541,82 @@ def list_node_types(
 ###### nodes.connect_nodes
 
 
+def _input_table(node: hou.Node) -> list[dict[str, Any]]:
+    """A node's input connectors in order: index, name, label, data type.
+
+    Each read is guarded on its own, so a type whose labels or data types
+    cannot be read still lists its names.
+    """
+    names: list[str] = []
+    labels: list[str] = []
+    data_types: list[str] = []
+    with contextlib.suppress(Exception):
+        names = list(node.inputNames())
+    with contextlib.suppress(Exception):
+        labels = list(node.inputLabels())
+    with contextlib.suppress(Exception):
+        data_types = list(node.inputDataTypes())
+    table: list[dict[str, Any]] = []
+    for index, name in enumerate(names):
+        entry: dict[str, Any] = {"index": index, "name": name}
+        if index < len(labels):
+            entry["label"] = labels[index]
+        if index < len(data_types):
+            entry["data_type"] = data_types[index]
+        table.append(entry)
+    return table
+
+
+_NUMBERED = re.compile(r"(.*?)(\d+)")
+
+
+def _variadic_index(inputs: list[dict[str, Any]], name: str, max_inputs: int) -> int | None:
+    """Index of `input3` on a node that grows inputs as they are wired.
+
+    A merge or switch lists only the connectors it has now (a fresh merge
+    shows `input1` though it takes 9999), so a name further along the same
+    numbered series is still a real connector.
+    """
+    if not inputs or max_inputs <= len(inputs):
+        return None
+    first = _NUMBERED.fullmatch(str(inputs[0].get("name", "")))
+    wanted = _NUMBERED.fullmatch(name)
+    if first is None or wanted is None or wanted.group(1) != first.group(1):
+        return None
+    stem, start = first.group(1), int(first.group(2))
+    if any(entry.get("name") != f"{stem}{start + entry['index']}" for entry in inputs):
+        return None
+    index = int(wanted.group(2)) - start
+    return index if 0 <= index < max_inputs else None
+
+
+def _find_input(inputs: list[dict[str, Any]], input_name: str, max_inputs: int = 0) -> int:
+    """Index of the input called *input_name*: names first, then labels, then
+    the rest of a numbered variadic series. The one rule build_network's dry
+    run and every wiring verb use, so validation and wiring cannot disagree.
+    """
+    for entry in inputs:
+        if entry.get("name") == input_name:
+            return int(entry["index"])
+    for entry in inputs:
+        if entry.get("label") == input_name:
+            return int(entry["index"])
+    variadic = _variadic_index(inputs, input_name, max_inputs)
+    if variadic is not None:
+        return variadic
+    candidates: list[str] = []
+    for entry in inputs:
+        for value in (entry.get("name"), entry.get("label")):
+            if value and value not in candidates:
+                candidates.append(value)
+    close = get_close_matches(input_name, candidates, n=3, cutoff=0.4)
+    if close:
+        hint = f" Did you mean: {close}?"
+    else:
+        hint = f" Inputs: {candidates[:15] + (['...'] if len(candidates) > 15 else [])}"
+    raise ValueError(f"has no input named '{input_name}'.{hint}")
+
+
 def _resolve_input_index(dest: hou.Node, input_index: int, input_name: str | None) -> int:
     """Turn an input name (VOP connector such as "base_color") into its index.
 
@@ -548,15 +625,13 @@ def _resolve_input_index(dest: hou.Node, input_index: int, input_name: str | Non
     """
     if not input_name:
         return int(input_index)
-    names = list(dest.inputNames()) if hasattr(dest, "inputNames") else []
-    if input_name in names:
-        return names.index(input_name)
-    labels = list(dest.inputLabels())
-    if input_name in labels:
-        return labels.index(input_name)
-    close = get_close_matches(input_name, names + labels, n=3, cutoff=0.4)
-    hint = f" Did you mean: {close}?" if close else ""
-    raise ValueError(f"{dest.path()} has no input named '{input_name}'.{hint}")
+    max_inputs = 0
+    with contextlib.suppress(Exception):
+        max_inputs = int(dest.type().maxNumInputs())
+    try:
+        return _find_input(_input_table(dest), str(input_name), max_inputs)
+    except ValueError as exc:
+        raise ValueError(f"{dest.path()} {exc}") from None
 
 
 def connect_nodes(

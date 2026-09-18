@@ -392,3 +392,45 @@ class TestCookStatus:
     def test_missing_node_is_a_clean_error(self, call):
         error = call("graph.get_cook_status", node_path="/obj/nope", expect_error=True)
         assert "not found" in error["message"].lower()
+
+
+class TestNodeCardConnectors:
+    def test_a_vop_card_lists_connectors_by_index_and_name(self, call):
+        card = call("graph.get_node_card", node_type="mtlximage", context="Vop", include_help=False)
+        assert card["connectors_probed"] is True
+        texcoord = next(i for i in card["inputs"] if i["name"] == "texcoord")
+        assert texcoord["index"] == 3
+
+    def test_reading_a_card_leaves_nothing_on_the_undo_stack(self, call):
+        before = hou.undos.undoLabels()
+        call("graph.get_node_card", node_type="polyextrude", context="Sop", include_help=False)
+        assert hou.undos.undoLabels() == before
+        assert hou.node("/obj/fxhoudinimcp_card_probe") is None
+
+    def test_a_category_without_a_preferred_container_is_still_probed(self, call):
+        # Cop2 has no entry in _PREFERRED_CONTAINERS: cop2net is found through
+        # childTypeCategory().
+        card = call("graph.get_node_card", node_type="blend", context="Cop2", include_help=False)
+        assert card["connectors_probed"] is True, card.get("connectors_note")
+        assert len(card["inputs"]) >= 2
+
+    def test_build_network_wires_a_later_merge_input_by_name(self, call):
+        geo = hou.node("/obj").createNode("geo")
+        call(
+            "graph.build_network",
+            parent_path=geo.path(),
+            nodes=[
+                {"type": "box", "name": "a"},
+                {"type": "sphere", "name": "b"},
+                {
+                    "type": "merge",
+                    "name": "m",
+                    "inputs": [
+                        {"source": "a", "input_name": "input1"},
+                        {"source": "b", "input_name": "input2"},
+                    ],
+                },
+            ],
+        )
+        merge = geo.node("m")
+        assert [n.name() for n in merge.inputs()] == ["a", "b"]

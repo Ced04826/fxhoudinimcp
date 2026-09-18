@@ -93,7 +93,10 @@ async def get_node_card(
     from the running Houdini: connectors in order (`inputs` / `outputs`
     with index, name and label — the index of `texcoord` on mtlximage
     lives here), real parameter names/defaults/menus, and the node's own
-    shipped help text.
+    shipped help text. Connectors are read off a probe node the first time
+    a type is asked for in a session (no undo entry, creation scripts not
+    run); `connectors_probed: false` with `connectors_note` means they could
+    not be read, not that the type has none.
 
     Use this BEFORE setting parameters on a node type you have not used
     in this session — never guess parameter names. Unversioned names
@@ -101,8 +104,9 @@ async def get_node_card(
 
     Args:
         node_type: Type name (e.g. "scatter", "rbdbulletsolver").
-        context: Category — "Sop", "Lop", "Dop", "Cop", "Chop", "Top",
-            "Object", "Driver".
+        context: Category — "Sop", "Lop", "Vop" (MaterialX and other shader
+            nodes inside a material network), "Dop", "Cop", "Chop", "Top",
+            "Object", "Driver"; also "Cop2", "Shop", "VopNet".
         parm_filter: Substring filter for the parameter list.
         include_help: False drops the help text (about 4 KB per card) when
             only parameter names or connectors are needed.
