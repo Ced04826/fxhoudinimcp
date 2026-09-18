@@ -2,7 +2,7 @@
 
 ## Overview
 
-fxhoudinimcp exposes **200 tools** across **23 categories**, covering every major Houdini context.
+fxhoudinimcp exposes **202 tools** across **23 categories**, covering every major Houdini context.
 
 Once connected, your AI assistant can:
 
@@ -66,11 +66,10 @@ Read points, primitives, attributes and their statistics, volumes, groups and
 group membership, bounding boxes, intrinsics. Sample geometry and run
 nearest-point searches.
 
-### LOPs/USD (19 tools)
+### LOPs/USD (18 tools)
 
 Stage inspection, USD prims and attributes, layers, composition arcs, variants,
-materials, lights and light rigs. `get_usd_bound_material` resolves the
-material a prim renders with and where its binding comes from.
+materials, lights and light rigs.
 
 ### DOPs (8 tools)
 
@@ -87,10 +86,12 @@ or one work item, schedulers and dependency graphs.
 
 Image nodes, layers, and VDB data access.
 
-### HDAs (11 tools)
+### HDAs (13 tools)
 
 Create, install, uninstall, reload and update Houdini Digital Assets, list
 every installed version of an asset's type, and read or write their sections.
+`set_hda_interface` and `edit_hda_interface` author and edit the asset's Type
+Properties interface: tab folders, ranges, menus, conditionals, callbacks.
 
 ### Animation (9 tools)
 
