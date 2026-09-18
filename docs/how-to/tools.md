@@ -2,7 +2,7 @@
 
 ## Overview
 
-fxhoudinimcp exposes **199 tools** across **23 categories**, covering every major Houdini context.
+fxhoudinimcp exposes **201 tools** across **23 categories**, covering every major Houdini context.
 
 Once connected, your AI assistant can:
 
@@ -86,10 +86,12 @@ or one work item, schedulers and dependency graphs.
 
 Image nodes, layers, and VDB data access.
 
-### HDAs (11 tools)
+### HDAs (13 tools)
 
 Create, install, uninstall, reload and update Houdini Digital Assets, list
 every installed version of an asset's type, and read or write their sections.
+`set_hda_interface` and `edit_hda_interface` author and edit the asset's Type
+Properties interface: tab folders, ranges, menus, conditionals, callbacks.
 
 ### Animation (9 tools)
 

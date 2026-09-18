@@ -96,6 +96,7 @@ STAND_INS: dict[str, object] = {
     "end": 2.0,
     "position": [0.0, 0.0, 0.0],
     "new_order": [0],
+    "ops": [],
     "keyframes": [],
     "nodes": [],
     "params": {},

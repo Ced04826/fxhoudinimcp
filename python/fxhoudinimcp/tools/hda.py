@@ -228,6 +228,7 @@ async def set_hda_interface(
     node_path: str,
     parameters: list[dict],
     replace: bool = False,
+    dry_run: bool = False,
 ) -> dict:
     """Author an HDA's Type Properties interface in one call.
 
@@ -252,21 +253,27 @@ async def set_hda_interface(
             {"name": "material", "type": "menu",
              "menu_items": [["plastic", "Plastic"], ["metal", "Metal"]]}]}]
 
-    The result reports the interface read back off the definition — check
-    `applied` rather than assuming the spec landed.
+    It is edit_hda_interface with one insert per entry: names already in the
+    interface are refused before anything is written, and the reply is read
+    back off the definition — `ops[].stored`, `renamed_by_houdini` (a tab
+    folder joins the existing tab set's naming series), `not_found_after_write`
+    and `instance_parms_missing`.
 
     Args:
         ctx: MCP context.
         node_path: An instance of the HDA whose definition is edited.
-        parameters: Interface spec (see above).
-        replace: Start from an empty interface. Note the built-in Transform and
-            Render folders live in that same group and would go too.
+        parameters: Interface spec (see above). create_spare_parameters'
+            spelling (parm_name, parm_type, default_value) is accepted too.
+        replace: Start from an empty interface. Built-in parameters of the node
+            type cannot be removed: Houdini puts them back
+            (`reinstated_by_houdini`).
+        dry_run: Validate and report the plan without writing.
     """
     bridge = _get_bridge(ctx)
-    return await bridge.execute(
-        "hda.set_hda_interface",
-        {"node_path": node_path, "parameters": parameters, "replace": replace},
-    )
+    payload: dict = {"node_path": node_path, "parameters": parameters, "replace": replace}
+    if dry_run:
+        payload["dry_run"] = True
+    return await bridge.execute("hda.set_hda_interface", payload)
 
 
 @mcp.tool()

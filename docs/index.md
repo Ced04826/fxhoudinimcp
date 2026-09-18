@@ -4,7 +4,7 @@
 
 The most comprehensive [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) server for [SideFX Houdini](https://www.sidefx.com/).
 
-**199 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
+**201 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
 
 Connects AI assistants like Claude directly to Houdini's Python API, enabling natural language control over scene building, simulation setup, rendering, and more.
 
@@ -22,7 +22,7 @@ Connects AI assistants like Claude directly to Houdini's Python API, enabling na
 | **DOPs** | 8 | Simulation info, DOP objects, step/reset, memory usage |
 | **PDG/TOPs** | 12 | Cook, work items, failed items and logs, schedulers, dependency graphs |
 | **COPs (Copernicus)** | 7 | Image nodes, layers, VDB data |
-| **HDAs** | 11 | Create, install, manage Digital Assets, their versions and sections |
+| **HDAs** | 13 | Create, install, manage Digital Assets, their versions and sections |
 | **Animation** | 9 | Keyframes, playbar control, frame range |
 | **Rendering** | 9 | Viewport capture, render nodes, settings, render launch |
 | **VEX** | 5 | Create/edit wrangles, validate VEX code |
@@ -49,7 +49,7 @@ flowchart LR
 
     subgraph MCP[" ⚡ FXHoudini MCP Server "]
         direction TB
-        B1("🔧 199 tools")
+        B1("🔧 201 tools")
         B2("📦 8 Resources")
         B3("💬 9 Prompts")
     end
@@ -80,6 +80,6 @@ Uses Houdini's built-in `hwebserver`. No custom socket servers, no rpyc. Uses `h
 
 1. **Houdini Plugin** (`houdini/`): Runs inside Houdini's Python environment. Registers `@hwebserver.apiFunction` endpoints that receive JSON commands. Uses `hdefereval.executeInMainThreadWithResult()` to safely execute `hou.*` calls on the main thread.
 
-2. **MCP Server** (`python/fxhoudinimcp/`): A standalone Python process using FastMCP. Exposes 199 tools, 8 resources, and 9 prompts via the MCP protocol. Forwards tool calls to Houdini over HTTP.
+2. **MCP Server** (`python/fxhoudinimcp/`): A standalone Python process using FastMCP. Exposes 201 tools, 8 resources, and 9 prompts via the MCP protocol. Forwards tool calls to Houdini over HTTP.
 
 3. **Bridge** (`python/fxhoudinimcp/bridge.py`): Async HTTP client that sends commands to Houdini's hwebserver and deserializes responses. Handles connection errors and timeouts.

@@ -18,6 +18,7 @@ import hou
 from fxhoudinimcp_server.config import require_inside_project_root
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import as_text, readable_message
+from fxhoudinimcp_server.handlers.parameter_handlers import _template_to_dict
 
 ###### Helpers
 
@@ -455,10 +456,44 @@ def _menu_pairs(spec: dict) -> tuple:
     return tuple(values), tuple(labels)
 
 
+# create_spare_parameters' spelling of the same fields, accepted here so one
+# spec works for both verbs.
+_SPEC_ALIASES = {
+    "parm_name": "name",
+    "parm_type": "type",
+    "default_value": "default",
+    "min_val": "min",
+    "max_val": "max",
+}
+
+
+def _menu_default(spec: dict, values: tuple) -> int:
+    """A menu's default as an index, checked against its items either way."""
+    default = spec.get("default", 0)
+    if isinstance(default, str):
+        if default not in values:
+            raise ValueError(
+                f"Default {default!r} of menu {spec.get('name')!r} is not one of its "
+                f"items {list(values)}."
+            )
+        return values.index(default)
+    index = int(default)
+    if not 0 <= index < len(values):
+        raise ValueError(
+            f"Default {index} of menu {spec.get('name')!r} is out of range: it has "
+            f"{len(values)} item(s), 0-{len(values) - 1}."
+        )
+    return index
+
+
 def _build_parm_template(spec: dict, seen: set):
     """Turn one spec dict into a hou.ParmTemplate (recursive for folders)."""
     if not isinstance(spec, dict):
         raise ValueError(f"Each parameter must be a dict, got {type(spec).__name__}.")
+    spec = dict(spec)
+    for alias, key in _SPEC_ALIASES.items():
+        if alias in spec and key not in spec:
+            spec[key] = spec.pop(alias)
 
     name = spec.get("name")
     if not name:
@@ -550,29 +585,22 @@ def _build_parm_template(spec: dict, seen: set):
     elif kind == "button":
         template = hou.ButtonParmTemplate(name, label, **common)
     elif kind == "separator":
-        template = hou.SeparatorParmTemplate(name)
+        template = hou.SeparatorParmTemplate(name, is_hidden=bool(spec.get("hidden", False)))
     elif kind == "label":
         template = hou.LabelParmTemplate(
             name,
             label,
             column_labels=tuple(str(c) for c in spec.get("column_labels", ()) or ()),
-            **{k: v for k, v in common.items() if k in ("is_hidden", "join_with_next", "help")},
+            **{k: v for k, v in common.items() if k in ("is_hidden", "join_with_next")},
         )
     elif kind == "menu":
         values, labels = _menu_pairs(spec)
-        default = spec.get("default", 0)
-        if isinstance(default, str):
-            if default not in values:
-                raise ValueError(
-                    f"Default {default!r} of menu {name!r} is not one of its items {list(values)}."
-                )
-            default = values.index(default)
         template = hou.MenuParmTemplate(
             name,
             label,
             menu_items=values,
             menu_labels=labels,
-            default_value=int(default),
+            default_value=_menu_default(spec, values),
             menu_type=hou.menuType.Normal,
             **common,
         )
@@ -702,12 +730,12 @@ def _apply_default_expression(template, spec: dict) -> None:
 
 
 def _describe_template(template) -> dict:
-    """Read back what Houdini actually stored for one template."""
-    info = {
-        "name": template.name(),
-        "label": template.label(),
-        "type": template.type().name(),
-    }
+    """Read back what Houdini actually stored for one template.
+
+    Built on parameter_handlers._template_to_dict, so the readback carries
+    the default value and hidden state and uses get_parameter_schema's keys.
+    """
+    info = _template_to_dict(template)
     try:
         conditionals = template.conditionals()
         if conditionals:
@@ -720,10 +748,6 @@ def _describe_template(template) -> dict:
     # group hands back plain ParmTemplates and the check has to survive that.
     if info["type"] == "Folder":
         info["children"] = [_describe_template(child) for child in template.parmTemplates()]
-    else:
-        for attr, key in (("minIsStrict", "min_strict"), ("maxIsStrict", "max_strict")):
-            with contextlib.suppress(Exception):
-                info[key] = bool(getattr(template, attr)())
     return info
 
 
@@ -731,6 +755,7 @@ def set_hda_interface(
     node_path: str,
     parameters: list,
     replace: bool = False,
+    dry_run: bool = False,
 ) -> dict:
     """Author an HDA's Type Properties interface — the definition, not spares.
 
@@ -744,93 +769,27 @@ def set_hda_interface(
         menu_items ([value, label] pairs or plain strings),
         folder_type (tabs|simple|collapsible|radio) and children for folders,
         hide_when / disable_when (Houdini conditional expressions), help.
+    create_spare_parameters' spelling (parm_name, parm_type, default_value,
+    min_val, max_val) is accepted too.
+
+    It is edit_hda_interface with one `insert` per entry (after clearing the
+    interface when `replace`): the same checks before anything is written,
+    the same single write and the same readback.
 
     Args:
         node_path: An instance of the HDA whose definition is edited.
         parameters: Interface spec (see above).
         replace: Start from an empty interface instead of appending to the
-            existing one. The built-in parameters live in that group too, so
-            this throws away the node's Transform/Render folders as well.
+            existing one. Built-in parameters of the node type cannot be
+            removed; Houdini puts them back (`reinstated_by_houdini`).
+        dry_run: Validate and report the plan without writing.
     """
-    node = _get_node(node_path)
-    definition = node.type().definition()
-    if definition is None:
-        raise ValueError(
-            f"Node {node_path} ({node.type().name()}) is not an HDA instance — "
-            f"there is no definition whose interface could be edited. "
-            f"For parameters on this node only, use create_spare_parameter."
-        )
-
+    _get_node(node_path)  # a bad path is named before a bad spec
     if not isinstance(parameters, (list, tuple)) or not parameters:
         raise ValueError("parameters must be a non-empty list of specs.")
-
-    group = definition.parmTemplateGroup()
-    if replace:
-        group.clear()
-
-    seen = set()
-    requested = []
-    for spec in parameters:
-        template = _build_parm_template(spec, seen)
-        group.append(template)
-        requested.append(template.name())
-
-    definition.setParmTemplateGroup(group)
-
-    # Read the interface back off the definition — the point of the verb is the
-    # stored result, not the request.
-    #
-    # Matching by name alone is not enough: a tab folder appended next to an
-    # existing tab group joins that group and takes its naming series, and
-    # Houdini renumbers the WHOLE series while doing it (measured live: the
-    # asset's own "stdswitcher"/"_1"/"_2" became "stdswitcher4"/"_1"/"_2" and
-    # the folder asked for as "controls" landed as "stdswitcher4_3"). So: try
-    # the requested name, then fall back to position — appended entries sit at
-    # the end, in the order they were appended.
-    stored = list(definition.parmTemplateGroup().parmTemplates())
-    matched = []
-    for offset, want in enumerate(requested):
-        hit = next((t for t in stored if t.name() == want), None)
-        if hit is None:
-            index = len(stored) - len(requested) + offset
-            hit = stored[index] if 0 <= index < len(stored) else None
-        matched.append((want, hit))
-
-    applied = [_describe_template(hit) for _want, hit in matched if hit is not None]
-    renamed = [
-        {"requested": want, "stored_as": hit.name(), "label": hit.label()}
-        for want, hit in matched
-        if hit is not None and hit.name() != want
-    ]
-    lost = [want for want, hit in matched if hit is None]
-
-    node_parms = {parm.name() for parm in hou.node(node_path).parms()}
-    expected_parms = []
-    for spec in parameters:
-        for child in spec.get("children", []) if spec.get("children") else [spec]:
-            if child.get("name"):
-                expected_parms.append(child["name"])
-
-    result = {
-        "success": True,
-        "node_path": node_path,
-        "type_name": definition.nodeTypeName(),
-        "hda_file": definition.libraryFilePath(),
-        "replaced": replace,
-        "requested": requested,
-        "applied": applied,
-        "renamed_by_houdini": renamed,
-        "not_found_after_write": lost,
-        "instance_parms_present": sorted(name for name in expected_parms if name in node_parms),
-        "instance_parms_missing": sorted(name for name in expected_parms if name not in node_parms),
-    }
-    if renamed:
-        result["note"] = (
-            "Houdini renamed the folder(s) above: a tab folder appended next to "
-            "an existing tab group joins that group and takes its naming series. "
-            "The label and the parameters inside keep the names you asked for — "
-            "only the folder's internal name changed."
-        )
+    ops = [{"op": "insert", "spec": spec} for spec in parameters]
+    result = _edit_interface(node_path, ops, dry_run=dry_run, clear_first=bool(replace))
+    result["replaced"] = bool(replace)
     return result
 
 
@@ -874,29 +833,64 @@ def _component_names(template) -> list[str]:
     return [f"{name}{suffixes[i] if i < len(suffixes) else i + 1}" for i in range(count)]
 
 
-def _flatten_templates(entries) -> list:
-    """Every template in *entries*, folders included, depth-first."""
+def _is_multiparm(template) -> bool:
+    """A multiparm block is a Folder template that is not an actual folder."""
+    if template.type().name() != "Folder":
+        return False
+    with contextlib.suppress(Exception):
+        return not template.isActualFolder()
+    return False
+
+
+def _flatten_templates(entries, into_multiparms: bool = False) -> list:
+    """Every template in *entries*, folders included, depth-first.
+
+    A multiparm block's children (`item#`) are templates, not parameters of
+    the interface: they are left out unless *into_multiparms* (the collision
+    scan wants them, because two blocks with an `item#` both make `item1`).
+    """
     flat = []
     for entry in entries:
         flat.append(entry)
-        if entry.type().name() == "Folder":
-            with contextlib.suppress(Exception):
-                flat.extend(_flatten_templates(entry.parmTemplates()))
+        if entry.type().name() != "Folder":
+            continue
+        if _is_multiparm(entry) and not into_multiparms:
+            continue
+        with contextlib.suppress(Exception):
+            flat.extend(_flatten_templates(entry.parmTemplates(), into_multiparms))
     return flat
 
 
+def _names_under(template) -> set:
+    """*template*'s name and every name inside it."""
+    names = {template.name()}
+    if template.type().name() == "Folder":
+        with contextlib.suppress(Exception):
+            names |= {t.name() for t in _flatten_templates(template.parmTemplates(), True)}
+    return names
+
+
 def _component_collisions(group) -> list[dict]:
-    """Pairs of templates whose component names collide."""
-    owners: dict[str, str] = {}
+    """Pairs of templates whose names or component names collide.
+
+    Two templates of one name collide (Houdini: "Parameter name 'size' is
+    invalid or already exists", measured on 22.0.429) — except folders of
+    one tab set, which share a name by design. Multiparm children are
+    scanned too: two blocks with an `item#` both make `item1`.
+    """
+    owners: dict[str, tuple[str, bool]] = {}
     collisions: list[dict] = []
-    for template in _flatten_templates(group.entries()):
+    for template in _flatten_templates(group.entries(), into_multiparms=True):
+        is_folder = template.type().name() == "Folder"
         # The tuple's own name is a name on the node as well: `fh_range2` the
         # tuple collides with `fh_range2` the second component of `fh_range`.
         for component in dict.fromkeys([*_component_names(template), template.name()]):
             other = owners.get(component)
-            if other is not None and other != template.name():
-                collisions.append({"component": component, "templates": [other, template.name()]})
-            owners.setdefault(component, template.name())
+            if other is not None and not (other[1] and is_folder):
+                collisions.append(
+                    {"component": component, "templates": [other[0], template.name()]}
+                )
+            owners.setdefault(component, (template.name(), is_folder))
     return collisions
 
 
@@ -1011,15 +1005,13 @@ def _modify_template(template, op: dict) -> list[str]:
         with contextlib.suppress(Exception):
             components = template.numComponents()
         kind = template.type().name()
-        if kind == "Menu" and isinstance(op["default"], str):
-            items = list(template.menuItems())
-            if op["default"] not in items:
-                raise ValueError(f"Default {op['default']!r} is not one of {items}.")
-            template.setDefaultValue(items.index(op["default"]))
+        if kind == "Menu":
+            items = tuple(template.menuItems())
+            template.setDefaultValue(
+                _menu_default({"name": template.name(), "default": op["default"]}, items)
+            )
         elif kind == "Toggle":
             template.setDefaultValue(bool(op["default"]))
-        elif kind == "Menu":
-            template.setDefaultValue(int(op["default"]))
         elif kind in ("Int", "Float", "String"):
             cast = {"Int": int, "Float": float, "String": str}[kind]
             template.setDefaultValue(
@@ -1080,6 +1072,16 @@ _OP_ALIASES = {
 }
 
 
+def _refuse_taken(names: set, existing: set, index: int, what: str) -> None:
+    """Refuse names already in the interface, by name, before anything is written."""
+    taken = sorted(name for name in names if name in existing)
+    if taken:
+        raise ValueError(
+            f"op #{index} ({what}): {taken} already exist(s) in the interface; use "
+            f"'replace' or 'modify' for an existing parameter, or another name."
+        )
+
+
 def _apply_op(group, op: dict, index: int, existing: set) -> dict:
     """Apply one op to *group*; returns a record for the reply."""
     if not isinstance(op, dict):
@@ -1097,12 +1099,7 @@ def _apply_op(group, op: dict, index: int, existing: set) -> dict:
             spec = {"type": "folder", "folder_type": "multiparm", **spec}
         seen: set = set()
         template = _build_parm_template(spec, seen)
-        for name in seen:
-            if name in existing and "#" not in name:
-                raise ValueError(
-                    f"op #{index} (insert): a parameter named {name!r} already exists; "
-                    f"use 'replace' or 'modify' for it, or another name."
-                )
+        _refuse_taken(seen, existing, index, "insert")
         record["placed"] = _place(group, template, op)
         record["names"] = sorted(seen)
         existing.update(seen)
@@ -1114,8 +1111,9 @@ def _apply_op(group, op: dict, index: int, existing: set) -> dict:
         record["target"] = target.name()
         record["target_kind"] = target_kind
         if kind == "remove":
+            # A removed folder takes its contents with it.
+            existing.difference_update(_names_under(target))
             group.remove(target)
-            existing.discard(target.name())
         else:
             hidden = kind == "hide" and bool(op.get("hidden", True))
             if target_kind == "folder":
@@ -1133,8 +1131,10 @@ def _apply_op(group, op: dict, index: int, existing: set) -> dict:
             raise ValueError(f"op #{index} (replace) needs a 'spec' dict.")
         seen = set()
         template = _build_parm_template(spec, seen)
+        freed = _names_under(target)
+        _refuse_taken(seen, existing - freed, index, "replace")
         group.replace(target, template)
-        existing.discard(target.name())
+        existing.difference_update(freed)
         existing.update(seen)
         record["target"] = target.name()
         record["names"] = sorted(seen)
@@ -1144,6 +1144,8 @@ def _apply_op(group, op: dict, index: int, existing: set) -> dict:
         clone = target.clone()
         record["target"] = target.name()
         record["changed"] = _modify_template(clone, op)
+        if clone.name() != target.name():
+            _refuse_taken({clone.name()}, existing, index, "rename")
         group.replace(target, clone)
         if clone.name() != target.name():
             existing.discard(target.name())
@@ -1170,27 +1172,36 @@ def edit_hda_interface(node_path: str, ops: list, dry_run: bool = False) -> dict
     the definition's ParmTemplateGroup — insert at a position, remove, hide,
     replace, modify (label / default / default_expression / conditionals /
     menu / callback / rename), move — applies them all to a copy, checks the
-    result for component-name collisions, and writes once. Any failing op
-    leaves the definition untouched.
+    result for name and component-name collisions, and writes once. Any
+    failing op leaves the definition untouched.
 
     Args:
         node_path: An instance of the HDA whose definition is edited.
         ops: Operation dicts, applied in order.
         dry_run: Validate and report the plan without writing.
     """
-    node = _get_node(node_path)
-    definition = node.type().definition()
-    if definition is None:
-        raise ValueError(
-            f"Node {node_path} ({node.type().name()}) is not an HDA instance — "
-            f"there is no definition whose interface could be edited."
-        )
+    _get_node(node_path)  # a bad path is named before bad ops
     if not isinstance(ops, (list, tuple)) or not ops:
         raise ValueError("ops must be a non-empty list of operation dicts.")
+    return _edit_interface(node_path, ops, dry_run=dry_run, clear_first=False)
+
+
+def _edit_interface(node_path: str, ops: list, dry_run: bool, clear_first: bool) -> dict:
+    """The one write path of set_hda_interface and edit_hda_interface."""
+    node = _get_node(node_path)
+    try:
+        definition = _get_definition(node)
+    except ValueError as exc:
+        raise ValueError(
+            f"{exc} There is no definition whose interface could be edited; for "
+            f"parameters on this node only, use create_spare_parameter."
+        ) from exc
 
     group = definition.parmTemplateGroup()
     before_names = {t.name() for t in _flatten_templates(group.entries())}
-    existing = set(before_names)
+    if clear_first:
+        group.clear()
+    existing = {t.name() for t in _flatten_templates(group.entries())}
     records: list[dict] = []
     for index, op in enumerate(ops):
         try:
@@ -1206,16 +1217,18 @@ def edit_hda_interface(node_path: str, ops: list, dry_run: bool = False) -> dict
     collisions = _component_collisions(group)
     if collisions:
         raise ValueError(
-            "Component-name collision — Houdini would refuse the whole interface: "
+            "Name collision — Houdini would refuse the whole interface: "
             + "; ".join(
                 f"'{c['component']}' is produced by both {c['templates'][0]!r} and "
                 f"{c['templates'][1]!r}"
                 for c in collisions
             )
-            + ". A 2-component parameter under Base1 makes <name>1/<name>2; under XYZW, <name>x/<name>y."
+            + ". A 2-component parameter under Base1 makes <name>1/<name>2; under XYZW, "
+            "<name>x/<name>y. Nothing was written."
         )
 
-    planned = {t.name() for t in _flatten_templates(group.entries())}
+    planned_templates = {t.name(): t for t in _flatten_templates(group.entries())}
+    planned = set(planned_templates)
     result: dict = {
         "success": True,
         "node_path": node_path,
@@ -1230,6 +1243,10 @@ def edit_hda_interface(node_path: str, ops: list, dry_run: bool = False) -> dict
         result["message"] = f"{len(records)} op(s) validated; nothing written."
         return result
 
+    # setParmTemplateGroup saves the definition into its .hda library (and a
+    # backup beside it), so the library is held to the project root like
+    # every other HDA file this server writes.
+    require_inside_project_root(definition.libraryFilePath(), "HDA library")
     try:
         definition.setParmTemplateGroup(group)
     except Exception as exc:
@@ -1238,14 +1255,49 @@ def edit_hda_interface(node_path: str, ops: list, dry_run: bool = False) -> dict
         ) from exc
 
     stored_group = definition.parmTemplateGroup()
-    stored = {t.name(): t for t in _flatten_templates(stored_group.entries())}
+    stored_list = _flatten_templates(stored_group.entries())
+    stored = {t.name(): t for t in stored_list}
+
+    # A tab folder placed next to an existing tab group joins that group and
+    # takes its naming series (measured: "controls" was stored as
+    # "stdswitcher3_3"), keeping its label. Planned folders missing by name
+    # are matched to unclaimed stored folders by label.
+    unclaimed = [t for t in stored_list if t.name() not in planned]
+    renamed: dict[str, str] = {}
+    for name in sorted(planned - set(stored)):
+        wanted = planned_templates[name]
+        if wanted.type().name() != "Folder":
+            continue
+        match = next(
+            (t for t in unclaimed if t.type().name() == "Folder" and t.label() == wanted.label()),
+            None,
+        )
+        if match is not None:
+            unclaimed.remove(match)
+            renamed[name] = match.name()
+
     # Built-in parameters of the node's own type (an Object's Transform,
     # its Subnet folder) cannot be removed from a definition: Houdini puts
     # them back, at the top level, and says nothing (measured live).
     reinstated = sorted(name for name in result["removed"] if name in stored)
     result["removed"] = [name for name in result["removed"] if name not in reinstated]
     result["reinstated_by_houdini"] = reinstated
-    result["not_found_after_write"] = sorted(name for name in planned if name not in stored)
+    added = set(result["added"])
+    # A folder the caller placed, stored under another name...
+    result["renamed_by_houdini"] = [
+        {"requested": name, "stored_as": renamed[name], "label": stored[renamed[name]].label()}
+        for name in sorted(renamed)
+        if name in added
+    ]
+    # ...and folders that were already there, renumbered with the series.
+    result["renumbered_by_houdini"] = [
+        {"name": name, "stored_as": renamed[name], "label": stored[renamed[name]].label()}
+        for name in sorted(renamed)
+        if name not in added
+    ]
+    result["not_found_after_write"] = sorted(
+        name for name in planned if name not in stored and name not in renamed
+    )
     for record in records:
         target = record.get("renamed_to") or record.get("target")
         if record.get("op") in ("hide", "show") and target in stored:
@@ -1256,22 +1308,41 @@ def edit_hda_interface(node_path: str, ops: list, dry_run: bool = False) -> dict
                     else stored_group.isHidden(target)
                 )
         names = record.get("names") or ([target] if target else [])
-        record["stored"] = [_describe_template(stored[n]) for n in names if n in stored]
+        record["stored"] = [
+            _describe_template(stored[renamed.get(n, n)])
+            for n in names
+            if renamed.get(n, n) in stored
+        ]
 
-    node_parms = {parm.name() for parm in hou.node(node_path).parms()}
-    tuple_names = {t.name() for t in hou.node(node_path).parmTuples()}
-    result["instance_parms_present"] = sorted(
-        n for n in result["added"] if n in node_parms or n in tuple_names
+    # Parameters the instance should now carry: value templates only. A
+    # folder of a tab set has no tuple of its own (the set's tuple takes the
+    # first folder's name), and a multiparm child `item#` exists only as
+    # item1, item2, ...
+    instance = hou.node(node_path)
+    on_node = {parm.name() for parm in instance.parms()}
+    on_node |= {t.name() for t in instance.parmTuples()}
+    expected = sorted(
+        name
+        for name in result["added"]
+        if planned_templates[name].type().name() != "Folder" and "#" not in name
     )
-    result["instance_parms_missing"] = sorted(
-        n for n in result["added"] if n not in node_parms and n not in tuple_names
-    )
+    result["instance_parms_present"] = [name for name in expected if name in on_node]
+    result["instance_parms_missing"] = [name for name in expected if name not in on_node]
+    notes = []
+    if result["renamed_by_houdini"]:
+        notes.append(
+            "Houdini renamed the folder(s) in renamed_by_houdini: a tab folder placed next "
+            "to an existing tab group joins that group and takes its naming series. The "
+            "label and the parameters inside keep the names you asked for."
+        )
     if reinstated:
-        result["note"] = (
+        notes.append(
             "Built-in parameters of the node type cannot be removed from an asset's "
             "interface; Houdini re-adds them at the top level. Hide them instead "
             "({'op': 'hide', 'name': ...})."
         )
+    if notes:
+        result["note"] = " ".join(notes)
     return result
 
 

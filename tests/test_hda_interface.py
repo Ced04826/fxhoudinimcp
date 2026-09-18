@@ -45,18 +45,6 @@ class _Parm:
         return self._spare
 
 
-class _PlainNode:
-    """A node type that simply does not carry createDigitalAsset, like merge."""
-
-    def path(self):
-        return "/obj/unit"
-
-    def type(self):
-        node_type = MagicMock()
-        node_type.name.return_value = "merge"
-        return node_type
-
-
 class _Node:
     """A node that is NOT a subnet — the case the old guard refused."""
 
@@ -156,11 +144,37 @@ class _Template:
     def parmTemplates(self):
         return tuple(self.kwargs.get("parm_templates", ()))
 
+    def numComponents(self):
+        return self.kwargs.get("components", 1)
 
-class _Group:
-    def __init__(self):
-        self.templates = []
+    def isHidden(self):
+        return bool(self.kwargs.get("is_hidden", False))
+
+    def defaultValue(self):
+        return self.kwargs.get("default_value")
+
+    def isActualFolder(self):
+        return self.kwargs.get("folder_type") is not hda.hou.folderType.MultiparmBlock
+
+
+def _walk(templates):
+    for template in templates:
+        yield template
+        yield from _walk(template.parmTemplates())
+
+
+class _LiveGroup:
+    """A ParmTemplateGroup that behaves like one: entries, find, remove."""
+
+    def __init__(self, templates=()):
+        self.templates = list(templates)
         self.cleared = False
+
+    def entries(self):
+        return tuple(self.templates)
+
+    def parmTemplates(self):
+        return tuple(self.templates)
 
     def clear(self):
         self.cleared = True
@@ -169,8 +183,56 @@ class _Group:
     def append(self, template):
         self.templates.append(template)
 
-    def parmTemplates(self):
-        return tuple(self.templates)
+    def find(self, name):
+        return next((t for t in _walk(self.templates) if t.name() == name), None)
+
+    def findFolder(self, label):
+        label = label[-1] if isinstance(label, tuple) else label
+        return next(
+            (
+                t
+                for t in _walk(self.templates)
+                if t.type().name() == "Folder" and t.label() == label
+            ),
+            None,
+        )
+
+    def remove(self, template):
+        self.templates.remove(template)
+
+
+class _Definition:
+    """Hands out a copy of its group, stores what is written, and can play
+    Houdini's part on the write (renames, reinstated built-ins)."""
+
+    def __init__(self, templates=(), library="/proj/brick.hda", on_write=None):
+        self.stored = list(templates)
+        self.library = library
+        self.on_write = on_write
+        self.writes = 0
+
+    def parmTemplateGroup(self):
+        return _LiveGroup(self.stored)
+
+    def setParmTemplateGroup(self, group):
+        self.writes += 1
+        stored = list(group.templates)
+        self.stored = self.on_write(stored) if self.on_write else stored
+
+    def nodeTypeName(self):
+        return "brick"
+
+    def libraryFilePath(self):
+        return self.library
+
+
+def _asset_with(monkeypatch, definition, parms=(), tuples=()):
+    node = _Node(type_name="brick", definition=definition, parms=[_Parm(n, False) for n in parms])
+    node.parmTuples = lambda: tuple(_Parm(n, False) for n in tuples)
+    monkeypatch.setattr(hda, "_get_node", lambda path: node)
+    monkeypatch.setattr(hda.hou, "node", lambda path: node, raising=False)
+    monkeypatch.setattr(hda, "require_inside_project_root", lambda path, what="": path)
+    return node
 
 
 @pytest.fixture
@@ -213,7 +275,12 @@ def interface_env(monkeypatch):
         lambda n, label, **kw: _Template(n, label, "Folder", **kw),
         raising=False,
     )
-    monkeypatch.setattr(hou, "FolderParmTemplate", hou.FolderParmTemplate, raising=False)
+    monkeypatch.setattr(
+        hou,
+        "SeparatorParmTemplate",
+        lambda n, **kw: _Template(n, "", "Separator", **kw),
+        raising=False,
+    )
     monkeypatch.setattr(hda.hou, "folderType", MagicMock(), raising=False)
     monkeypatch.setattr(hda.hou, "menuType", MagicMock(), raising=False)
     monkeypatch.setattr(
@@ -223,17 +290,6 @@ def interface_env(monkeypatch):
         raising=False,
     )
     return hou
-
-
-def _hda_node(monkeypatch, group):
-    definition = MagicMock()
-    definition.parmTemplateGroup.return_value = group
-    definition.nodeTypeName.return_value = "brick"
-    definition.libraryFilePath.return_value = "/tmp/brick.hda"
-    node = _Node(type_name="brick", definition=definition)
-    monkeypatch.setattr(hda, "_get_node", lambda path: node)
-    monkeypatch.setattr(hda.hou, "node", lambda path: node, raising=False)
-    return node, definition
 
 
 class TestBuildParmTemplate:
@@ -287,6 +343,26 @@ class TestBuildParmTemplate:
         assert t.kwargs["menu_items"] == ("a", "b")
         assert t.kwargs["menu_labels"] == ("a", "b")
 
+    def test_a_menu_index_default_is_range_checked(self, interface_env):
+        with pytest.raises(ValueError, match="out of range"):
+            hda._build_parm_template(
+                {"name": "material", "type": "menu", "default": 7, "menu_items": ["a", "b"]},
+                set(),
+            )
+
+    def test_a_hidden_separator_is_hidden(self, interface_env):
+        t = hda._build_parm_template({"name": "sep1", "type": "separator", "hidden": True}, set())
+        assert t.kwargs["is_hidden"] is True
+
+    def test_create_spare_parameters_spelling_is_accepted(self, interface_env):
+        t = hda._build_parm_template(
+            {"parm_name": "size", "parm_type": "float", "default_value": 2.0, "max_val": 5},
+            set(),
+        )
+        assert t.name() == "size"
+        assert t.kwargs["default_value"] == (2.0,)
+        assert t.kwargs["max"] == 5
+
     def test_menu_default_outside_items_is_rejected(self, interface_env):
         with pytest.raises(ValueError, match="not one of its items"):
             hda._build_parm_template(
@@ -333,46 +409,49 @@ class TestBuildParmTemplate:
 
 
 class TestSetHdaInterface:
-    def test_appends_by_default_and_writes_the_definition(self, interface_env, monkeypatch):
-        group = _Group()
-        group.append(_Template("stdswitcher", "Transform", "Folder"))
-        node, definition = _hda_node(monkeypatch, group)
+    """set_hda_interface is edit_hda_interface with one insert per entry."""
 
-        result = hda.set_hda_interface(
-            "/obj/unit",
-            [
-                {
-                    "name": "controls",
-                    "type": "folder",
-                    "children": [
-                        {
-                            "name": "stud_count",
-                            "type": "int",
-                            "min": 1,
-                            "max": 8,
-                            "min_strict": True,
-                            "max_strict": True,
-                        }
-                    ],
-                }
-            ],
-        )
+    CONTROLS = {
+        "name": "controls",
+        "label": "Controls",
+        "type": "folder",
+        "children": [{"name": "stud_count", "type": "int", "min": 1, "max": 8}],
+    }
 
-        assert group.cleared is False
-        assert [t.name() for t in group.parmTemplates()] == ["stdswitcher", "controls"]
-        definition.setParmTemplateGroup.assert_called_once_with(group)
-        assert result["requested"] == ["controls"]
-        assert result["applied"][0]["children"][0]["name"] == "stud_count"
+    def test_appends_and_writes_the_definition_once(self, interface_env, monkeypatch):
+        definition = _Definition([_Template("stdswitcher", "Transform", "Folder")])
+        _asset_with(monkeypatch, definition, parms=["stud_count"])
+        result = hda.set_hda_interface("/obj/unit", [self.CONTROLS])
+        assert definition.writes == 1
+        assert [t.name() for t in definition.stored] == ["stdswitcher", "controls"]
+        assert result["added"] == ["controls", "stud_count"]
+        assert result["ops"][0]["stored"][0]["children"][0]["name"] == "stud_count"
         assert result["renamed_by_houdini"] == []
+        assert result["replaced"] is False
 
-    def test_replace_clears_first(self, interface_env, monkeypatch):
-        group = _Group()
-        group.append(_Template("stdswitcher", "Transform", "Folder"))
-        _hda_node(monkeypatch, group)
+    def test_a_retry_is_refused_by_name_before_anything_is_written(
+        self, interface_env, monkeypatch
+    ):
+        definition = _Definition([_Template("stdswitcher", "Transform", "Folder")])
+        _asset_with(monkeypatch, definition)
+        hda.set_hda_interface("/obj/unit", [self.CONTROLS])
+        with pytest.raises(ValueError, match="already exist"):
+            hda.set_hda_interface("/obj/unit", [self.CONTROLS])
+        assert definition.writes == 1
 
-        hda.set_hda_interface("/obj/unit", [{"name": "only", "type": "int"}], replace=True)
-        assert group.cleared is True
-        assert [t.name() for t in group.parmTemplates()] == ["only"]
+    def test_replace_clears_first_and_reports_reinstated_builtins(self, interface_env, monkeypatch):
+        builtin = _Template("stdswitcher", "Transform", "Folder")
+        definition = _Definition([builtin], on_write=lambda stored: [builtin, *stored])
+        _asset_with(monkeypatch, definition)
+        result = hda.set_hda_interface("/obj/unit", [{"name": "only", "type": "int"}], replace=True)
+        assert result["replaced"] is True
+        assert result["reinstated_by_houdini"] == ["stdswitcher"]
+
+    def test_dry_run_writes_nothing(self, interface_env, monkeypatch):
+        definition = _Definition()
+        _asset_with(monkeypatch, definition)
+        result = hda.set_hda_interface("/obj/unit", [self.CONTROLS], dry_run=True)
+        assert result["dry_run"] is True and definition.writes == 0
 
     def test_plain_node_is_rejected_with_the_alternative(self, interface_env, monkeypatch):
         node = _Node(type_name="geo", definition=None)
@@ -381,80 +460,157 @@ class TestSetHdaInterface:
             hda.set_hda_interface("/obj/unit", [{"name": "x", "type": "int"}])
 
     def test_empty_spec_is_rejected(self, interface_env, monkeypatch):
-        _hda_node(monkeypatch, _Group())
+        _asset_with(monkeypatch, _Definition())
         with pytest.raises(ValueError, match="non-empty list"):
             hda.set_hda_interface("/obj/unit", [])
 
     def test_nothing_is_written_when_a_spec_is_bad(self, interface_env, monkeypatch):
-        group = _Group()
-        _, definition = _hda_node(monkeypatch, group)
+        definition = _Definition()
+        _asset_with(monkeypatch, definition)
         with pytest.raises(ValueError):
             hda.set_hda_interface(
                 "/obj/unit", [{"name": "good", "type": "int"}, {"name": "bad", "type": "ramp"}]
             )
-        definition.setParmTemplateGroup.assert_not_called()
+        assert definition.writes == 0
+
+    def test_a_library_outside_the_project_root_is_refused_before_the_write(
+        self, interface_env, monkeypatch
+    ):
+        definition = _Definition(library="/shared/studio.hda")
+        _asset_with(monkeypatch, definition)
+
+        def outside(path, what=""):
+            raise PermissionError(f"{what} '{path}' is outside FXHOUDINIMCP_PROJECT_ROOT")
+
+        monkeypatch.setattr(hda, "require_inside_project_root", outside)
+        with pytest.raises(PermissionError, match="HDA library"):
+            hda.set_hda_interface("/obj/unit", [{"name": "x", "type": "int"}])
+        assert definition.writes == 0
 
 
 class TestHoudiniRenamesTabFolders:
-    """Houdini renames a tab folder appended next to an existing tab group.
+    """A tab folder placed next to an existing tab group joins its naming
+    series. Measured on 22.0.429: "Look" appended to an Object asset was
+    stored as "stdswitcher3_3", label and children intact."""
 
-    Measured live: asking for "controls" on a Geo-derived asset stored it as
-    "stdswitcher4_3" — label and child parameters intact. Matching the result
-    by the requested name reported "nothing applied" while the interface was
-    sitting right there, so the verb diffs the group instead and says so.
-    """
+    def _renaming(self, stored):
+        for template in stored:
+            if template.label() == "Controls":
+                template._name = "stdswitcher3_3"
+        return stored
 
-    def test_rename_is_reported_not_swallowed(self, interface_env, monkeypatch):
-        group = _Group()
-        group.append(_Template("stdswitcher4", "Transform", "Folder"))
-        node, definition = _hda_node(monkeypatch, group)
-
-        def rename_on_write(written):
-            # what Houdini does: the appended folder joins the tab series
-            written.templates[-1]._name = "stdswitcher4_1"
-
-        definition.setParmTemplateGroup.side_effect = rename_on_write
-
-        result = hda.set_hda_interface(
-            "/obj/unit",
-            [
-                {
-                    "name": "controls",
-                    "label": "Controls",
-                    "type": "folder",
-                    "children": [{"name": "stud_count", "type": "int"}],
-                }
-            ],
+    def test_a_renamed_folder_is_matched_by_label(self, interface_env, monkeypatch):
+        definition = _Definition(
+            [_Template("stdswitcher3", "Transform", "Folder")], on_write=self._renaming
         )
-
+        _asset_with(monkeypatch, definition, parms=["stud_count"])
+        result = hda.set_hda_interface("/obj/unit", [TestSetHdaInterface.CONTROLS])
         assert result["renamed_by_houdini"] == [
-            {"requested": "controls", "stored_as": "stdswitcher4_1", "label": "Controls"}
+            {"requested": "controls", "stored_as": "stdswitcher3_3", "label": "Controls"}
         ]
+        assert result["not_found_after_write"] == []
         assert "tab group" in result["note"]
-        # And the interface is still reported, not lost:
-        assert result["applied"][0]["children"][0]["name"] == "stud_count"
+        assert result["ops"][0]["stored"][0]["name"] == "stdswitcher3_3"
 
-    def test_child_parms_are_checked_on_the_instance(self, interface_env, monkeypatch):
-        group = _Group()
-        node, _ = _hda_node(monkeypatch, group)
-        node._parms = [_Parm("stud_count", False)]
+    def test_the_edit_verb_reports_the_same_rename(self, interface_env, monkeypatch):
+        definition = _Definition(
+            [_Template("stdswitcher3", "Transform", "Folder")], on_write=self._renaming
+        )
+        _asset_with(monkeypatch, definition, parms=["stud_count"])
+        result = hda.edit_hda_interface(
+            "/obj/unit", [{"op": "insert", "spec": TestSetHdaInterface.CONTROLS}]
+        )
+        assert result["renamed_by_houdini"][0]["stored_as"] == "stdswitcher3_3"
+        assert result["instance_parms_missing"] == []
 
+    def test_instance_parms_cover_tuples_nesting_and_skip_folders(self, interface_env, monkeypatch):
+        definition = _Definition()
+        _asset_with(monkeypatch, definition, parms=["clrr", "clrg", "clrb"], tuples=["clr"])
         result = hda.set_hda_interface(
             "/obj/unit",
             [
                 {
-                    "name": "controls",
+                    "name": "outer",
                     "type": "folder",
                     "children": [
-                        {"name": "stud_count", "type": "int"},
-                        {"name": "bevel", "type": "float"},
+                        {
+                            "name": "inner",
+                            "type": "folder",
+                            "children": [
+                                {"name": "clr", "type": "color"},
+                                {"name": "bevel", "type": "float"},
+                            ],
+                        }
                     ],
                 }
             ],
         )
-
-        assert result["instance_parms_present"] == ["stud_count"]
+        assert result["instance_parms_present"] == ["clr"]
         assert result["instance_parms_missing"] == ["bevel"]
+
+
+class TestTheInterfaceIsCheckedBeforeTheWrite:
+    def test_a_parameter_of_a_removed_folder_can_be_inserted_again(
+        self, interface_env, monkeypatch
+    ):
+        controls = _Template(
+            "controls",
+            "Controls",
+            "Folder",
+            parm_templates=[_Template("stud_count", "Stud Count", "Int")],
+        )
+        definition = _Definition([controls])
+        _asset_with(monkeypatch, definition)
+        result = hda.edit_hda_interface(
+            "/obj/unit",
+            [
+                {"op": "remove", "name": "Controls"},
+                {"op": "insert", "spec": {"name": "stud_count", "type": "int"}},
+            ],
+        )
+        assert [t.name() for t in definition.stored] == ["stud_count"]
+        assert result["removed"] == ["controls"]
+
+    def test_a_rename_onto_an_existing_name_is_refused(self, interface_env, monkeypatch):
+        width = MagicMock()
+        width.name.return_value = "width"
+        width.type.return_value.name.return_value = "Float"
+        clone = MagicMock()
+        clone.name.return_value = "size"
+        width.clone.return_value = clone
+        size = _Template("size", "Size", "Float")
+        definition = _Definition([width, size])
+        _asset_with(monkeypatch, definition)
+        with pytest.raises(ValueError, match="already exist"):
+            hda.edit_hda_interface(
+                "/obj/unit", [{"op": "rename", "name": "width", "new_name": "size"}]
+            )
+        assert definition.writes == 0
+
+    def test_two_templates_of_one_name_collide_but_tab_folders_do_not(self):
+        group = MagicMock()
+        group.entries.return_value = [_template("size"), _template("size")]
+        assert hda._component_collisions(group)[0]["component"] == "size"
+        group.entries.return_value = [_template("tabs", "Folder"), _template("tabs", "Folder")]
+        assert hda._component_collisions(group) == []
+
+    def test_two_multiparms_with_the_same_child_collide(self):
+        def block(name):
+            folder = _template(name, "Folder")
+            folder.isActualFolder.return_value = False
+            folder.parmTemplates.return_value = (_template("item#"),)
+            return folder
+
+        group = MagicMock()
+        group.entries.return_value = [block("a"), block("b")]
+        assert hda._component_collisions(group)[0]["component"] == "item#"
+
+    def test_multiparm_children_are_not_interface_parameters(self):
+        folder = _template("items", "Folder")
+        folder.isActualFolder.return_value = False
+        folder.parmTemplates.return_value = (_template("item#"),)
+        assert [t.name() for t in hda._flatten_templates([folder])] == ["items"]
+        assert len(hda._flatten_templates([folder], into_multiparms=True)) == 2
 
 
 class TestComponentNames:
@@ -524,6 +680,7 @@ class TestEditHdaInterface:
         monkeypatch.setattr(hda, "_get_node", lambda path: node)
         monkeypatch.setattr(hda, "_component_collisions", lambda g: [])
         monkeypatch.setattr(hda, "_describe_template", lambda t: {"name": t.name()})
+        monkeypatch.setattr(hda, "require_inside_project_root", lambda path, what="": path)
         return node, definition, group, templates
 
     def test_ops_are_applied_in_order_and_written_once(self, monkeypatch):
