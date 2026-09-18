@@ -2,7 +2,7 @@
 
 ## Overview
 
-fxhoudinimcp exposes **202 tools** across **23 categories**, covering every major Houdini context.
+fxhoudinimcp exposes **204 tools** across **23 categories**, covering every major Houdini context.
 
 Once connected, your AI assistant can:
 
@@ -54,11 +54,13 @@ manage flags, colours and positions. `create_network_box` and
 `set_object_transform` sets translate, rotate, scale and parent on an object
 in one call.
 
-### Parameters (12 tools)
+### Parameters (14 tools)
 
 Get/set values one at a time or in bulk, expressions, channel references
 between parameters, keyframes, locking, reverting to defaults, and spare
-parameters.
+parameters. `get_parm_references` lists who reads a parameter and what it
+reads, and `get_parm_template_tree` reads a node's or type's whole interface
+as a tree of folders.
 
 ### Geometry / SOPs (14 tools)
 
@@ -86,12 +88,10 @@ or one work item, schedulers and dependency graphs.
 
 Image nodes, layers, and VDB data access.
 
-### HDAs (13 tools)
+### HDAs (11 tools)
 
 Create, install, uninstall, reload and update Houdini Digital Assets, list
 every installed version of an asset's type, and read or write their sections.
-`set_hda_interface` and `edit_hda_interface` author and edit the asset's Type
-Properties interface: tab folders, ranges, menus, conditionals, callbacks.
 
 ### Animation (9 tools)
 
