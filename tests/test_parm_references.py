@@ -80,8 +80,34 @@ class TestParmReferences:
             resolved if token == "../src/scale" else None
         )
         entry = parameters._outgoing_reference(parm)
-        assert entry["references"] == ["/obj/src/scale", "../src/name"]
+        assert entry["references"] == ["/obj/src/scale"]
+        # Written in the expression but not resolvable now: kept apart.
+        assert entry["unresolved"] == ["../src/name"]
         assert entry["pure_reference"] is False
+
+    def test_every_channel_function_is_read(self):
+        parm = self._parm("/obj/dst/tx", 'chramp("../ctrl/falloff", @u) + chsop("../ctrl/geo")')
+        parm.node.return_value.parm.side_effect = lambda token: None
+        entry = parameters._outgoing_reference(parm)
+        assert entry["unresolved"] == ["../ctrl/falloff", "../ctrl/geo"]
+
+    def test_an_expression_that_reads_no_channel_is_not_a_reference(self):
+        assert parameters._outgoing_reference(self._parm("/obj/dst/tz", "$F * 2")) is None
+
+    def test_backtick_references_in_a_string_are_read(self):
+        parm = self._parm("/obj/geo1/filecache1/file")
+        parm.unexpandedString.return_value = '$HIP/cache/`chs("/obj/CTRL/version")`/geo.bgeo.sc'
+        version = MagicMock()
+        version.path.return_value = "/obj/CTRL/version"
+        parm.node.return_value.parm.side_effect = lambda token: version
+        entry = parameters._outgoing_reference(parm)
+        assert entry["in_backticks"] is True
+        assert entry["references"] == ["/obj/CTRL/version"]
+
+    def test_a_string_without_backticks_is_not_a_reference(self):
+        parm = self._parm("/obj/geo1/filecache1/file")
+        parm.unexpandedString.return_value = "$HIP/cache/geo.bgeo.sc"
+        assert parameters._outgoing_reference(parm) is None
 
     def test_a_plain_value_has_no_outgoing_entry(self):
         assert parameters._outgoing_reference(self._parm("/obj/dst/ty")) is None
@@ -105,16 +131,54 @@ class TestParmReferences:
         src_tx = self._parm("/obj/src/tx", referencing=[by])
         node = _node("/obj/src")
         node.parms.return_value = [src_tx, self._parm("/obj/src/ty")]
+        node.dependents.return_value = [_node("/obj/dst")]
         monkeypatch.setattr(parameters, "_resolve_node", lambda path: node)
         monkeypatch.setattr(parameters, "_resolve_parm", lambda path, name: src_tx)
         result = parameters._get_parm_references("/obj/src", parm_name="tx", direction="incoming")
         assert result["incoming"] == [{"parm": "tx", "referenced_by": ["/obj/dst/tx"]}]
         assert result["parm_name"] == "tx"
 
-    def test_direction_is_checked(self, monkeypatch):
-        monkeypatch.setattr(parameters, "_resolve_node", lambda path: _node("/obj/src"))
+    def test_direction_is_checked_before_the_path(self, monkeypatch):
+        def missing(path):
+            raise ValueError(f"Node not found: {path}")
+
+        monkeypatch.setattr(parameters, "_resolve_node", missing)
         with pytest.raises(ValueError, match="direction"):
-            parameters._get_parm_references("/obj/src", direction="sideways")
+            parameters._get_parm_references("/obj/typo", direction="sideways")
+
+    def _node_with(self, monkeypatch, parms, dependents):
+        node = _node("/obj/src")
+        node.parms.return_value = parms
+        node.dependents.return_value = dependents
+        node.references.return_value = []
+        node.needsToCook.return_value = False
+        monkeypatch.setattr(parameters, "_resolve_node", lambda path: node)
+        return node
+
+    def test_with_no_dependents_the_scene_is_not_scanned(self, monkeypatch):
+        tx = self._parm("/obj/src/tx")
+        node = self._node_with(monkeypatch, [tx], dependents=[])
+        parameters._get_parm_references("/obj/src")
+        tx.parmsReferencingThis.assert_not_called()
+        node.dependents.assert_called_once_with(include_children=False)
+
+    def test_truncated_only_when_an_entry_did_not_fit(self, monkeypatch):
+        by = self._parm("/obj/dst/tx")
+        first = self._parm("/obj/src/tx", referencing=[by])
+        empty = self._parm("/obj/src/ty")
+        self._node_with(monkeypatch, [first, empty], dependents=[_node("/obj/dst")])
+        assert parameters._get_parm_references("/obj/src", limit=1)["truncated"] is False
+        second = self._parm("/obj/src/tz", referencing=[by])
+        self._node_with(monkeypatch, [first, second], dependents=[_node("/obj/dst")])
+        assert parameters._get_parm_references("/obj/src", limit=1)["truncated"] is True
+
+    def test_node_level_lists_are_this_node_only_and_capped(self, monkeypatch):
+        many = [_node(f"/obj/user{i}") for i in range(5)]
+        node = self._node_with(monkeypatch, [], dependents=many)
+        result = parameters._get_parm_references("/obj/src", limit=2)
+        assert result["node_dependents"] == ["/obj/user0", "/obj/user1"]
+        assert result["node_dependents_count"] == 5
+        node.references.assert_called_once_with(include_children=False)
 
 
 ###### get_parm_template_tree
@@ -163,9 +227,10 @@ class TestParmTemplateTree:
         assert entry["folder_type"] == "Tabs"
         child = entry["children"][0]
         assert child["conditionals"] == {"HideWhen": "{ stud_count == 1 }"}
-        assert child["default"] == [0.5]
-        assert child["max_strict"] is True
-        assert "hidden" not in child
+        # The same keys get_parameter_schema uses for a template.
+        assert child["default_value"] == [0.5]
+        assert child["max_is_strict"] is True
+        assert child["is_hidden"] is False
 
     def test_menu_items_come_with_their_labels(self):
         menu = self._float("splittype")
@@ -173,10 +238,26 @@ class TestParmTemplateTree:
         menu.menuItems.return_value = ("edge", "point")
         menu.menuLabels.return_value = ("Edge", "Point")
         entry = parameters._template_tree_entry(menu)
-        assert entry["menu"] == [
-            {"value": "edge", "label": "Edge"},
-            {"value": "point", "label": "Point"},
-        ]
+        assert entry["menu_items"] == ["edge", "point"]
+        assert entry["menu_labels"] == ["Edge", "Point"]
+
+    def test_a_scalar_default_is_kept(self):
+        toggle = self._float("enable")
+        toggle.type.return_value.name.return_value = "Toggle"
+        toggle.defaultValue.return_value = True
+        assert parameters._template_tree_entry(toggle)["default_value"] is True
+
+    def test_a_multiparm_reports_its_default_instance_count(self):
+        block = self._folder("items", "Items", [self._float("item#")], "MultiparmBlock")
+        block.defaultValue.return_value = 3
+        assert parameters._template_tree_entry(block)["default_instances"] == 3
+
+    def test_one_unreadable_child_costs_only_that_child(self):
+        broken = self._float("broken")
+        broken.name.side_effect = RuntimeError("unreadable")
+        folder = self._folder("f", "Folder", [self._float("a"), broken, self._float("b")])
+        children = parameters._template_tree_entry(folder)["children"]
+        assert [c["name"] for c in children] == ["a", "b"]
 
     def test_the_tree_is_cut_at_max_entries_and_says_so(self, monkeypatch):
         parms = [self._float(f"p{i}") for i in range(6)]
@@ -208,6 +289,10 @@ class TestParmTemplateTree:
         preferred.name.return_value = "polyextrude::2.0"
         preferred.parmTemplateGroup.return_value.entries.return_value = [self._float("dist")]
         monkeypatch.setattr(hou, "preferredNodeType", lambda name: preferred)
+        # The same resolver get_node_card and build_network use.
+        import fxhoudinimcp_server.handlers.graph_handlers as graph
+
+        monkeypatch.setattr(graph.hou, "preferredNodeType", lambda name: preferred)
         result = parameters._get_parm_template_tree(type_name="polyextrude", context="Sop")
         assert result["type"] == "polyextrude::2.0"
         assert [e["name"] for e in result["entries"]] == ["dist"]

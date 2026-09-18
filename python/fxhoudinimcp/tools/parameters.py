@@ -1,6 +1,6 @@
 """MCP tools for Houdini parameter operations.
 
-Exposes 12 tools covering parameter get/set, expressions, channel
+Exposes 14 tools covering parameter get/set, expressions, channel
 references, locking, schema inspection, and spare parameter creation.
 """
 
@@ -116,9 +116,11 @@ async def get_parm_references(
 
     `incoming`: for each parameter of the node (or just parm_name), the
     parameters elsewhere whose expressions read it — what breaks if this
-    control is renamed. `outgoing`: what this node's expressions read,
-    resolved to parameter paths (pure ch() links and richer expressions
-    alike). `node_dependents` / `node_references` give the node-level view.
+    control is renamed. `outgoing`: what this node's expressions and
+    backtick strings read, resolved to parameter paths (pure ch() links and
+    richer expressions alike; `unresolved` names a written target that no
+    longer exists). `node_dependents` / `node_references` give the
+    node-level view for this node only.
 
     Args:
         node_path: Node to inspect.
@@ -148,7 +150,9 @@ async def get_parm_template_tree(
     """The whole parameter interface as a tree, the way Type Properties shows
     it: folders (with folder_type — tabs, collapsible, multiparm), every
     parameter in order with defaults, default expressions, ranges, menu
-    items, Hide/Disable When conditionals, callbacks, naming scheme.
+    items, Hide/Disable When conditionals, callbacks, naming scheme; a
+    multiparm's `default_instances`. Each entry uses get_parameter_schema's
+    keys (`default_value`, `is_hidden`, `menu_items`...).
 
     get_hda_info shows only the top folders and get_parameter_schema
     flattens the structure away; read this before editing an interface.

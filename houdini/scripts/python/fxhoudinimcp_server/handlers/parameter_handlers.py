@@ -1,6 +1,6 @@
 """Houdini-side handlers for parameter operations.
 
-Provides 10 command handlers for reading, writing, and managing
+Provides 14 command handlers for reading, writing, and managing
 node parameters, expressions, channel references, and spare parameters.
 """
 
@@ -800,40 +800,80 @@ register_handler("parameters.get_parameters", _get_parameters)
 
 ###### Handler: parameters.get_parm_references
 
-_CHANNEL_REF_RE = re.compile(r"""\bch[sfo]?\s*\(\s*['"]([^'"]+)['"]""")
+# Every HScript function that reads a channel by path
+# ($HFS/houdini/help/expressions.zip). Longest first, so chsop is not read
+# as chs.
+_CHANNEL_FUNCTIONS = (
+    "ch", "chexist", "chexpr", "chexprf", "chexprt", "chf", "chramp", "chrampf",
+    "chrampraw", "chrampt", "chs", "chsop", "chsoplist", "chsraw", "cht",
+)  # fmt: skip
+_CHANNEL_NAMES = "|".join(sorted(_CHANNEL_FUNCTIONS, key=len, reverse=True))
+_CHANNEL_REF_RE = re.compile(r"\b(?:" + _CHANNEL_NAMES + r""")\s*\(\s*['"]([^'"]+)['"]""")
+_BACKTICKS_RE = re.compile(r"`([^`]*)`")
 
 
 def _outgoing_reference(parm: hou.Parm) -> dict[str, Any] | None:
-    """What *parm* reads from, or None when it holds a plain value.
+    """What *parm* reads from, or None when it reads no other channel.
 
     A pure `ch("../src/tx")` resolves through getReferencedParm(). Anything
     richer -- `ch("../src/scale") * 2` -- answers with the parm itself there
     (measured on 22.0.429), so the channel references are read out of the
-    expression text and resolved relative to the node.
+    expression text and resolved relative to the node. A string parameter's
+    backtick expressions (`$HIP/`chs("../CTRL/version")`/geo.bgeo.sc`) are not
+    an expression() at all; they are read from unexpandedString(). An
+    expression that reads no channel (`$F * 2`) is not a reference.
     """
     expression = None
     with contextlib.suppress(Exception):
         expression = parm.expression()
-    if not expression:
+    texts: list[str] = []
+    in_backticks = False
+    if expression:
+        texts = [expression]
+    else:
+        with contextlib.suppress(Exception):
+            raw = parm.unexpandedString()
+            texts = _BACKTICKS_RE.findall(raw)
+            if texts:
+                expression, in_backticks = raw, True
+    if not texts:
         return None
     entry: dict[str, Any] = {"parm": parm.name(), "expression": expression}
-    with contextlib.suppress(Exception):
-        direct = parm.getReferencedParm()
-        if direct is not None and direct.path() != parm.path():
-            entry["references"] = [direct.path()]
-            entry["pure_reference"] = True
-            return entry
-    references: list[str] = []
-    node = parm.node()
-    for token in _CHANNEL_REF_RE.findall(expression):
-        target = None
+    if in_backticks:
+        entry["in_backticks"] = True
+    else:
         with contextlib.suppress(Exception):
-            target = node.parm(token)
-        references.append(target.path() if target is not None else token)
-    if references:
-        entry["references"] = references
-        entry["pure_reference"] = False
+            direct = parm.getReferencedParm()
+            if direct is not None and direct.path() != parm.path():
+                entry["references"] = [direct.path()]
+                entry["pure_reference"] = True
+                return entry
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    node = parm.node()
+    for text in texts:
+        for token in _CHANNEL_REF_RE.findall(text):
+            target = None
+            with contextlib.suppress(Exception):
+                target = node.parm(token)
+            if target is not None:
+                resolved.append(target.path())
+            else:
+                unresolved.append(token)
+    if not resolved and not unresolved:
+        return None
+    entry["references"] = resolved
+    if unresolved:
+        # Written in the expression, but no such parameter now: a renamed or
+        # deleted target, which is exactly what a rename audit is after.
+        entry["unresolved"] = unresolved
+    entry["pure_reference"] = False
     return entry
+
+
+def _capped_paths(nodes: Any, exclude: str, limit: int) -> tuple[list[str], int]:
+    paths = sorted({n.path() for n in nodes} - {exclude})
+    return paths[:limit], len(paths)
 
 
 def _get_parm_references(
@@ -847,31 +887,47 @@ def _get_parm_references(
 
     `incoming` lists, per parameter of *node_path* (or the one *parm_name*),
     the parameters elsewhere whose expressions read it (parmsReferencingThis).
-    `outgoing` lists what this node's expressions read. Node-level
-    `dependents` / `references` round it off, so "what breaks if I rename
-    this control" is one call instead of a HOM script.
+    `outgoing` lists what this node's expressions and backtick strings read.
+    Node-level `dependents` / `references` round it off, so "what breaks if I
+    rename this control" is one call instead of a HOM script.
     """
-    node = _resolve_node(node_path)
     if direction not in ("both", "incoming", "outgoing"):
         raise ValueError("direction must be 'both', 'incoming' or 'outgoing'.")
+    limit = int(limit)
+    node = _resolve_node(node_path)
     parms = [_resolve_parm(node_path, parm_name)] if parm_name is not None else list(node.parms())
+
+    dependents: list = []
+    with contextlib.suppress(Exception):
+        dependents = list(node.dependents(include_children=False))
+    # parmsReferencingThis() walks the whole scene, once per parameter. A
+    # reader through ch() or backticks makes its node a dependent (a
+    # self-reference makes this node its own), so with no dependents there is
+    # nothing to find and the scan is skipped.
+    scan_incoming = direction in ("both", "incoming") and bool(dependents)
 
     incoming: list[dict[str, Any]] = []
     outgoing: list[dict[str, Any]] = []
     truncated = False
     for parm in parms:
-        if len(incoming) + len(outgoing) >= int(limit):
-            truncated = True
-            break
-        if direction in ("both", "incoming"):
+        found: list[tuple[list, dict[str, Any]]] = []
+        if scan_incoming:
             with contextlib.suppress(Exception):
                 refs = [p.path() for p in parm.parmsReferencingThis()]
                 if refs:
-                    incoming.append({"parm": parm.name(), "referenced_by": refs})
+                    found.append((incoming, {"parm": parm.name(), "referenced_by": refs}))
         if direction in ("both", "outgoing"):
             entry = _outgoing_reference(parm)
             if entry is not None:
-                outgoing.append(entry)
+                found.append((outgoing, entry))
+        if not found:
+            continue
+        # Truncated only when there is an entry that does not fit.
+        if len(incoming) + len(outgoing) + len(found) > limit:
+            truncated = True
+            break
+        for target, entry in found:
+            target.append(entry)
 
     result: dict[str, Any] = {
         "node_path": node.path(),
@@ -881,14 +937,22 @@ def _get_parm_references(
         "outgoing": outgoing,
         "truncated": truncated,
     }
+    # This node only (include_children=False: a subnet's descendants are not
+    # its own references), capped like the parameter lists.
+    result["node_dependents"], count = _capped_paths(dependents, node.path(), limit)
+    if count > limit:
+        result["node_dependents_count"] = count
     with contextlib.suppress(Exception):
-        result["node_dependents"] = sorted(
-            n.path() for n in node.dependents() if n.path() != node.path()
-        )
+        references = node.references(include_children=False)
+        result["node_references"], count = _capped_paths(references, node.path(), limit)
+        if count > limit:
+            result["node_references_count"] = count
     with contextlib.suppress(Exception):
-        result["node_references"] = sorted(
-            n.path() for n in node.references() if n.path() != node.path()
-        )
+        if node.needsToCook():
+            result["note"] = (
+                "node_dependents / node_references are as of this node's last cook "
+                "(HOM: they can differ until it cooks); parameter references are not."
+            )
     return result
 
 
@@ -897,20 +961,16 @@ register_handler("parameters.get_parm_references", _get_parm_references)
 
 ###### Handler: parameters.get_parm_template_tree
 
-_TREE_MENU_CAP = 30
-
 
 def _template_tree_entry(pt: hou.ParmTemplate) -> dict[str, Any]:
     """One template as the Type Properties dialog shows it: folders, ranges,
-    menus, conditionals, callbacks, defaults -- nothing evaluated."""
-    entry: dict[str, Any] = {
-        "name": pt.name(),
-        "label": pt.label(),
-        "type": _parm_type_name(pt),
-    }
-    with contextlib.suppress(Exception):
-        if pt.isHidden():
-            entry["hidden"] = True
+    menus, conditionals, callbacks, defaults -- nothing evaluated.
+
+    Built on _template_to_dict, so the tree and get_parameter_schema report a
+    template with the same keys (default_value, is_hidden, min_is_strict,
+    menu_items...) and the same fixes; the tree adds what only the tree needs.
+    """
+    entry = _template_to_dict(pt)
     with contextlib.suppress(Exception):
         conditionals = pt.conditionals()
         if conditionals:
@@ -934,43 +994,25 @@ def _template_tree_entry(pt: hou.ParmTemplate) -> dict[str, Any]:
     if entry["type"] == "Folder":
         with contextlib.suppress(Exception):
             entry["folder_type"] = pt.folderType().name()
+            if "Multiparm" in entry["folder_type"]:
+                # A multiparm folder's default is the instance count a fresh
+                # node gets.
+                entry["default_instances"] = entry.get("default_value")
         with contextlib.suppress(Exception):
             if pt.endsTabGroup():
                 entry["ends_tab_group"] = True
+        children: list[dict[str, Any]] = []
         with contextlib.suppress(Exception):
-            entry["children"] = [_template_tree_entry(child) for child in pt.parmTemplates()]
+            for child in pt.parmTemplates():
+                # One unreadable child costs that child, not the folder.
+                with contextlib.suppress(Exception):
+                    children.append(_template_tree_entry(child))
+        entry["children"] = children
         return entry
-    with contextlib.suppress(Exception):
-        components = pt.numComponents()
-        if components != 1:
-            entry["components"] = components
-    with contextlib.suppress(Exception):
-        scheme = pt.namingScheme().name()
-        if scheme != "XYZW" or entry.get("components", 1) > 1:
-            entry["naming_scheme"] = scheme
-    with contextlib.suppress(Exception):
-        entry["default"] = list(pt.defaultValue())
     with contextlib.suppress(Exception):
         expressions = [e for e in pt.defaultExpression() if e]
         if expressions:
             entry["default_expression"] = expressions
-    with contextlib.suppress(Exception):
-        entry["min"], entry["max"] = pt.minValue(), pt.maxValue()
-        if pt.minIsStrict():
-            entry["min_strict"] = True
-        if pt.maxIsStrict():
-            entry["max_strict"] = True
-    with contextlib.suppress(Exception):
-        items = list(pt.menuItems())
-        if items:
-            labels = list(pt.menuLabels())
-            entry["menu"] = [
-                {"value": value, "label": labels[i] if i < len(labels) else value}
-                for i, value in enumerate(items[:_TREE_MENU_CAP])
-            ]
-            if len(items) > _TREE_MENU_CAP:
-                entry["menu_truncated"] = True
-                entry["menu_count"] = len(items)
     with contextlib.suppress(Exception):
         callback = pt.scriptCallback()
         if callback:
@@ -1007,26 +1049,19 @@ def _prune_tree(entries: list[dict[str, Any]], budget: list[int]) -> list[dict[s
 
 
 def _node_type_for_tree(context: str, type_name: str):
-    """Resolve *type_name* in *context* the way createNode would: the
-    preferred version for an unversioned name, else the exact name, else the
-    newest versioned one."""
+    """Resolve *type_name* in *context* the way createNode would, through the
+    same resolver build_network and get_node_card use."""
+    from fxhoudinimcp_server.handlers.graph_handlers import _resolve_node_type
+
     categories = hou.nodeTypeCategories()
     category = categories.get(context)
     if category is None:
         raise ValueError(f"Unknown context '{context}'. Available: {sorted(categories)}")
-    with contextlib.suppress(Exception):
-        preferred = hou.preferredNodeType(f"{category.name()}/{type_name}")
-        if preferred is not None:
-            return preferred
-    types = category.nodeTypes()
-    if type_name in types:
-        return types[type_name]
-    prefix = type_name + "::"
-    versioned = sorted(key for key in types if key.startswith(prefix))
-    if versioned:
-        return types[versioned[-1]]
-    close = get_close_matches(type_name, list(types), n=5, cutoff=0.4)
-    raise ValueError(f"Node type '{type_name}' not found in {context}. Close: {close}")
+    resolved = _resolve_node_type(category, type_name)
+    if resolved is None:
+        close = get_close_matches(type_name, list(category.nodeTypes()), n=5, cutoff=0.4)
+        raise ValueError(f"Node type '{type_name}' not found in {context}. Close: {close}")
+    return resolved
 
 
 def _get_parm_template_tree(
