@@ -254,6 +254,7 @@ async def link_parameters(
     source_parm: str,
     dest_path: str,
     dest_parm: str,
+    replace_existing: bool = False,
 ) -> dict:
     """Create a channel reference from one parameter to another.
 
@@ -269,6 +270,10 @@ async def link_parameters(
         source_parm: Source parameter name.
         dest_path: Destination node path.
         dest_parm: Destination parameter name.
+        replace_existing: Overwrite a destination that already has keyframes
+            or an expression. Refused otherwise, so animation is never lost
+            by accident. A link whose source already reads the destination
+            through ch() is refused as a cycle in every case.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
@@ -278,6 +283,7 @@ async def link_parameters(
             "source_parm": source_parm,
             "dest_path": dest_path,
             "dest_parm": dest_parm,
+            "replace_existing": replace_existing,
         },
     )
 
@@ -351,6 +357,10 @@ async def create_spare_parameters(
     folder_type: str = "Tabs",
 ) -> dict:
     """Batch-create multiple spare parameters in one call, optionally in a folder tab.
+
+    A name that already exists as a spare parameter is updated in place
+    (label, default, range); its current value and keyframes are kept.
+    A type change on an existing parameter is refused.
 
     Args:
         node_path: Node path.

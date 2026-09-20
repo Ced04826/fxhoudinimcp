@@ -17,6 +17,8 @@ import posixpath
 import sys
 from unittest.mock import MagicMock
 
+import pytest
+
 sys.modules.setdefault("hou", MagicMock())
 sys.modules.setdefault("hdefereval", MagicMock())
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "houdini", "scripts", "python"))
@@ -34,6 +36,7 @@ def _parm(node, name, kind, value):
     parm.node.return_value = node
     parm.parmTemplate.return_value.type.return_value = kind
     parm.eval.return_value = value
+    parm.keyframes.return_value = ()
     return parm
 
 
@@ -47,7 +50,7 @@ def _node(path):
     return node
 
 
-def _link(monkeypatch, src, dst):
+def _link(monkeypatch, src, dst, **kwargs):
     lookup = {(src.node().path(), src.name()): src, (dst.node().path(), dst.name()): dst}
     monkeypatch.setattr(
         parms, "_resolve_parm", lambda node_path, parm_name: lookup[(node_path, parm_name)]
@@ -58,6 +61,7 @@ def _link(monkeypatch, src, dst):
         source_parm=src.name(),
         dest_path=dst.node().path(),
         dest_parm=dst.name(),
+        **kwargs,
     )
 
 
@@ -108,3 +112,33 @@ class TestStringParmsAreLinkedWithChs:
 
         assert reply["function"] == "chs"
         assert "converts the value on read" in reply["warning"]
+
+
+class TestExistingAnimationAndCyclesAreRefused:
+    def test_animated_destination_needs_replace_existing(self, monkeypatch):
+        a = _node("/obj/geo1/box1")
+        b = _node("/obj/geo1/box2")
+        src = _parm(a, "sizex", hou.parmTemplateType.Float, 1.0)
+        dst = _parm(b, "sizex", hou.parmTemplateType.Float, 1.0)
+        dst.keyframes.return_value = (MagicMock(),)
+
+        with pytest.raises(ValueError, match="replace_existing"):
+            _link(monkeypatch, src, dst)
+        dst.setExpression.assert_not_called()
+
+        _link(monkeypatch, src, dst, replace_existing=True)
+        dst.setExpression.assert_called_once()
+
+    def test_source_reading_destination_is_a_cycle(self, monkeypatch):
+        node = _node("/obj/geo1/box1")
+        src = _parm(node, "b", hou.parmTemplateType.Float, 0.0)
+        dst = _parm(node, "a", hou.parmTemplateType.Float, 0.0)
+        # b already reads a through a static HScript reference.
+        key = MagicMock()
+        key.expression.return_value = 'ch("a") * 2'
+        src.keyframes.return_value = (key,)
+        node.parm.side_effect = lambda name: {"a": dst, "b": src}.get(name)
+
+        with pytest.raises(ValueError, match="cycle"):
+            _link(monkeypatch, src, dst)
+        dst.setExpression.assert_not_called()

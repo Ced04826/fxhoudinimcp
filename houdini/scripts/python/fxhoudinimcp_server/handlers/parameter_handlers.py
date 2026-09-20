@@ -500,11 +500,35 @@ def _relative_channel_path(dst: hou.Parm, src: hou.Parm) -> str:
     return f"{rel}/{src.name()}"
 
 
+_CH_REF = re.compile(r"""\bch[fis]?\(\s*["']([^"']+)["']\s*\)""")
+
+
+def _reaches(parm: hou.Parm, goal: str, seen: set[str]) -> bool:
+    """True when *parm* reads *goal* through static HScript ch() references.
+
+    Only literal ``ch("path")`` calls are followed; Python or computed
+    references cannot be validated and are treated as leaves.
+    """
+    if parm.path() == goal:
+        return True
+    if parm.path() in seen:
+        return False
+    seen.add(parm.path())
+    for key in parm.keyframes():
+        with contextlib.suppress(hou.OperationFailed):
+            for ref in _CH_REF.findall(key.expression()):
+                dep = parm.node().parm(ref)
+                if dep is not None and _reaches(dep, goal, seen):
+                    return True
+    return False
+
+
 def _link_parameters(
     source_path: str,
     source_parm: str,
     dest_path: str,
     dest_parm: str,
+    replace_existing: bool = False,
     **_: Any,
 ) -> dict[str, Any]:
     """Create a channel reference from destination parameter to source parameter.
@@ -513,9 +537,21 @@ def _link_parameters(
     everything else, and a path relative to the destination node. The reply
     reads the destination back so the caller sees the linked value, not just
     the expression text.
+
+    A destination that already has keyframes or an expression is refused
+    unless *replace_existing* is set, and a link whose source already reads
+    the destination through static ch() references is refused as a cycle.
     """
     src = _resolve_parm(source_path, source_parm)
     dst = _resolve_parm(dest_path, dest_parm)
+
+    if dst.keyframes() and not replace_existing:
+        raise ValueError(
+            f"{dst.path()} already has animation or an expression; "
+            "pass replace_existing=True to overwrite it."
+        )
+    if _reaches(src, dst.path(), set()):
+        raise ValueError(f"Linking {dst.path()} to {src.path()} would create a channel cycle.")
 
     function = _channel_function(dst)
     channel_path = _relative_channel_path(dst, src)
@@ -746,17 +782,49 @@ def _create_spare_parameters(
 ) -> dict[str, Any]:
     """Batch-create spare parameters, optionally inside a folder/tab."""
     node = _resolve_node(node_path)
+    ptg = node.parmTemplateGroup()
 
     templates = []
     created = []
+    updated = []
     for spec in parameters:
         pt = _build_parm_template(spec)
-        templates.append(pt)
-        created.append(spec["parm_name"])
+        existing = ptg.find(spec["parm_name"])
+        if existing is None:
+            # A tuple component such as "tx" is not a template name, so the
+            # group does not know it, but Houdini refuses it at commit time.
+            component = node.parm(spec["parm_name"])
+            if component is not None:
+                raise ValueError(
+                    f"'{spec['parm_name']}' is a component of the existing tuple "
+                    f"'{component.tuple().name()}'; pick another name."
+                )
+            templates.append(pt)
+            created.append(spec["parm_name"])
+            continue
+        # Same name: edit in place. Houdini keeps the current value and
+        # keyframes when the name and type are unchanged, so a type change
+        # is refused rather than silently dropping data.
+        current = node.parm(spec["parm_name"]) or node.parmTuple(spec["parm_name"])
+        if current is not None and not (
+            current.isSpare()
+            if isinstance(current, hou.Parm)
+            else all(p.isSpare() for p in current)
+        ):
+            raise ValueError(
+                f"'{spec['parm_name']}' is a built-in parameter; only spare parameters can be edited."
+            )
+        if existing.type() != pt.type():
+            raise ValueError(
+                f"'{spec['parm_name']}' exists as {existing.type().name()}; "
+                f"cannot change it to {pt.type().name()} without losing its value."
+            )
+        ptg.replace(spec["parm_name"], pt)
+        updated.append(spec["parm_name"])
 
-    ptg = node.parmTemplateGroup()
-
-    if folder_name is not None:
+    if not templates:
+        pass
+    elif folder_name is not None:
         ft = _FOLDER_TYPE_MAP.get(folder_type, hou.folderType.Tabs)
         folder = hou.FolderParmTemplate(
             folder_name.lower().replace(" ", "_"),
@@ -774,7 +842,8 @@ def _create_spare_parameters(
     return {
         "node_path": node_path,
         "created": created,
-        "count": len(created),
+        "updated": updated,
+        "count": len(created) + len(updated),
         "folder_name": folder_name,
     }
 
