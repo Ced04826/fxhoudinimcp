@@ -48,6 +48,17 @@ def _answers(monkeypatch, *replies: str) -> None:
     monkeypatch.setattr("builtins.input", fake_input)
 
 
+@pytest.fixture(autouse=True)
+def no_other_clients(monkeypatch):
+    """Cursor, Codex and friends on the developer's machine must never be touched.
+
+    Claude Code and Claude Desktop keep their own seams (claude_code_available,
+    desktop_config_path), which the tests below patch as they always have.
+    """
+    monkeypatch.setattr(uninst, "cli_available", lambda key: False)
+    monkeypatch.setattr(uninst, "client_config_path", lambda key: None)
+
+
 @pytest.fixture
 def no_clients(monkeypatch):
     """No MCP client on the machine, so the Houdini half can be tested alone."""

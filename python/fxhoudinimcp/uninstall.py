@@ -41,11 +41,21 @@ from pathlib import Path
 # Internal
 from fxhoudinimcp.houdini_package import CLI, PACKAGE_NAME, existing_packages
 from fxhoudinimcp.install import (
+    CLI_CLIENTS,
+    CLIENT_KEYS,
+    JSON_CLIENTS,
     SERVER_NAME,
     claude_code_available,
     claude_code_remove_argv,
+    cli_available,
+    cli_remove_argv,
+    client_config_path,
+    client_label,
     config_file_note,
     desktop_config_path,
+    printable_argv,
+    resolve_client_targets,
+    restart_note,
 )
 
 
@@ -103,31 +113,37 @@ def remove_package_files(paths: list[Path], dry_run: bool) -> list[str]:
 
 
 def remove_desktop_entry(config: Path, dry_run: bool) -> list[str]:
-    """Drop our entry from Claude Desktop's config, keeping everything else.
+    """Drop our entry from Claude Desktop's config, keeping everything else."""
+    return remove_json_entry("claude-desktop", config, dry_run)
+
+
+def remove_json_entry(key: str, config: Path, dry_run: bool) -> list[str]:
+    """Drop our entry from a JSON-configured client, keeping everything else.
 
     The same care ``install`` takes, for the same reason: this file is likely to
     hold servers that took someone effort to set up, and an uninstaller that
     eats them is worse than one that never ran.
     """
+    label, servers_key, _, _ = JSON_CLIENTS[key]
     if not config.is_file():
-        return [f"  Claude Desktop has no config at {config}. Nothing to remove."]
+        return [f"  {label} has no config at {config}. Nothing to remove."]
 
     try:
         existing = json.loads(config.read_text(encoding="utf-8-sig")) or {}
     except Exception as exc:
         return [
-            f"  SKIPPED Claude Desktop: {config} is not readable JSON ({exc}).",
+            f"  SKIPPED {label}: {config} is not readable JSON ({exc}).",
             "          Fix or remove it by hand. It was left untouched.",
         ]
     if not isinstance(existing, dict):
         return [
-            f"  SKIPPED Claude Desktop: {config} is not a JSON object.",
+            f"  SKIPPED {label}: {config} is not a JSON object.",
             "          It was left untouched.",
         ]
 
-    servers = existing.get("mcpServers") or {}
+    servers = existing.get(servers_key) or {}
     if SERVER_NAME not in servers:
-        return [f"  Claude Desktop has no '{SERVER_NAME}' entry. Nothing to remove."]
+        return [f"  {label} has no '{SERVER_NAME}' entry. Nothing to remove."]
 
     if dry_run:
         return [f"  Would remove '{SERVER_NAME}' from {config}"]
@@ -137,12 +153,36 @@ def remove_desktop_entry(config: Path, dry_run: bool) -> list[str]:
     remaining = dict(servers)
     del remaining[SERVER_NAME]
     updated = dict(existing)
-    updated["mcpServers"] = remaining
+    updated[servers_key] = remaining
     config.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8", newline="\n")
     return [
         f"  Backed up {backup.name}",
         f"  Removed '{SERVER_NAME}' from {config}",
-        "  Fully quit Claude Desktop (tray > Quit) and relaunch.",
+        restart_note(key),
+    ]
+
+
+def remove_cli_client(key: str, dry_run: bool) -> list[str]:
+    """Unregister from a client through its own CLI. Returns report lines."""
+    label = client_label(key)
+    argv = cli_remove_argv(key)
+    printable = printable_argv(argv)
+    if not cli_available(key):
+        return [
+            f"  {label} not on PATH, so nothing was changed. Run this yourself",
+            f"  if you use {label}:",
+            f"      {printable}",
+        ]
+    if dry_run:
+        return [f"  Would run: {printable}"]
+    result = subprocess.run(argv, capture_output=True, text=True)
+    if result.returncode == 0:
+        return [f"  Removed '{SERVER_NAME}' from {label}."]
+    detail = ((result.stderr or "") + (result.stdout or "")).strip().splitlines()
+    first = detail[0] if detail else f"exit code {result.returncode}"
+    return [
+        f"  {label} had no '{SERVER_NAME}' entry, or removing it failed: {first}",
+        f"  Check with: {printable}",
     ]
 
 
@@ -195,10 +235,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--client",
-        choices=("auto", "claude-code", "claude-desktop", "both", "none"),
-        default="auto",
-        help="which MCP client to unregister from (default: auto, meaning "
-        "whichever of the two is present)",
+        action="append",
+        choices=CLIENT_KEYS,
+        help="which MCP client to unregister from; repeatable (default: auto, "
+        "meaning every client registered on this machine)",
     )
     parser.add_argument(
         "--client-only",
@@ -263,12 +303,14 @@ def main(argv: list[str] | None = None) -> int:
     for target in targets:
         if target == "claude-code":
             lines = remove_claude_code(args.dry_run)
+        elif target in CLI_CLIENTS:
+            lines = remove_cli_client(target, args.dry_run)
         else:
-            config = desktop_config_path()
+            config = client_config_path(target)
             if config is None:
-                print("  Could not locate Claude Desktop's config on this platform.")
+                print(f"  Could not locate {client_label(target)}'s config on this platform.")
                 continue
-            lines = remove_desktop_entry(config, args.dry_run)
+            lines = remove_json_entry(target, config, args.dry_run)
         for line in lines:
             print(line)
 
@@ -281,21 +323,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _client_targets(args) -> list[str]:
-    """Which client configs are in scope, mirroring `install`'s --client."""
-    if args.client == "none":
-        return []
-    if args.client == "both":
-        return ["claude-code", "claude-desktop"]
-    if args.client != "auto":
-        return [args.client]
+    """Which client configs are in scope, mirroring `install`'s --client.
 
-    targets = []
-    if claude_code_available():
-        targets.append("claude-code")
-    config = desktop_config_path()
-    if config is not None and config.is_file():
-        targets.append("claude-desktop")
-    return targets
+    A JSON client counts as present only when its config file exists: there is
+    nothing to remove from a file that was never written.
+    """
+
+    def present(key: str) -> bool:
+        if key == "claude-code":
+            return claude_code_available()
+        if key in CLI_CLIENTS:
+            return cli_available(key)
+        config = desktop_config_path() if key == "claude-desktop" else client_config_path(key)
+        return config is not None and config.is_file()
+
+    return resolve_client_targets(args.client, present)
 
 
 def _confirmed(package_files: list[Path], targets: list[str]) -> bool:
