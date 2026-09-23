@@ -9,6 +9,7 @@ a single-use file in the local temporary directory.
 from __future__ import annotations
 
 # Built-in
+import asyncio
 import json
 import logging
 import os
@@ -84,23 +85,42 @@ async def find_servers(
     every server found rather than just the first, so a caller can say how many
     Houdini sessions are running instead of silently picking one.
 
-    Probing is cheap because mcp.health touches no HOM: a closed port refuses
-    immediately, and a live one answers without waiting on Houdini's main thread.
+    mcp.health touches no HOM, so a live port answers without waiting on
+    Houdini's main thread. The ports are probed together: on Windows a closed
+    loopback port does not refuse, the connect waits out the timeout, and one
+    port after another cost a second each -- fifteen seconds of every
+    unpinned server start.
     """
-    found: list[dict[str, Any]] = []
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for port in range(base, base + max_tries):
-            try:
-                response = await client.get(
-                    f"http://{host}:{port}/fxapi", params={"json": _rpc_payload("mcp.health")}
-                )
-                response.raise_for_status()
-                payload = response.json()
-            except Exception:
-                continue  # nothing there, or not our endpoint
-            if isinstance(payload, dict) and payload.get("status") == "ok":
-                found.append({**payload, "port": port})
-    return found
+
+    # The plugin binds 127.0.0.1 (startup._bind_localhost_only), and "localhost"
+    # tries ::1 first: a quarter of a second per port on Windows before the
+    # IPv4 attempt, longer than the connect budget below.
+    probe_host = "127.0.0.1" if host == "localhost" else host
+
+    async def probe(client: httpx.AsyncClient, port: int) -> dict[str, Any] | None:
+        try:
+            response = await client.get(
+                f"http://{probe_host}:{port}/fxapi", params={"json": _rpc_payload("mcp.health")}
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            return None  # nothing there, or not our endpoint
+        if isinstance(payload, dict) and payload.get("status") == "ok":
+            return {**payload, "port": port}
+        return None
+
+    # On this machine a live plugin accepts the connection within milliseconds
+    # even while Houdini is busy (the OS completes it), so the probe only
+    # needs the full timeout for the answer, not for the connect.
+    limits = httpx.Timeout(timeout)
+    if host in ("localhost", "127.0.0.1", "::1"):
+        limits = httpx.Timeout(timeout, connect=min(timeout, 0.25))
+    async with httpx.AsyncClient(timeout=limits) as client:
+        answers = await asyncio.gather(
+            *(probe(client, port) for port in range(base, base + max_tries))
+        )
+    return [answer for answer in answers if answer is not None]
 
 
 class HoudiniBridge:
