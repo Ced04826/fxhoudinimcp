@@ -286,3 +286,73 @@ async def get_uv_report(
     if schema_version is not None:
         params["schema_version"] = schema_version
     return await bridge.execute("modeling.get_uv_report", params)
+
+
+@mcp.tool()
+async def section_geometry(
+    ctx: Context,
+    node_path: str,
+    levels: list[float],
+    axis: str | None = None,
+    normal: list[float] | None = None,
+    bbox: list[float] | None = None,
+    group: str | None = None,
+    space: str = "sop",
+    fit: str | None = None,
+    max_chains: int = 10,
+    dump_path: str | None = None,
+) -> dict:
+    """Cut a polygon mesh with parallel planes and measure the section lines.
+
+    Use it instead of writing plane cuts and circle fits in execute_python:
+    hole and boss diameters, wall outlines, profile widths at given heights.
+    Computed in memory from the cooked faces; nothing is created.
+
+    Per level, the chains where the plane cuts the faces, longest first. Per
+    chain: closed, points (one per mesh edge crossed, so it also shows the
+    wiring density), length, bbox; for a closed chain its area and inside (the
+    index of the smallest closed chain around it in the same list, null when
+    none: an outline with holes reads as one chain plus chains inside 0).
+    fit="circle" adds center, radius and rms (least squares over the points)
+    and max_dev, measured at the points and at the chord midpoints: a square's
+    corners lie on a circle, its sides do not (max_dev ~0.29 r against ~0.005 r
+    for 32 sides), so judge roundness by max_dev against radius. height_range is where the scoped
+    geometry lies along the normal; a level outside it cuts nothing.
+    branch_points counts crossings where more than two segments meet
+    (non-manifold or folded faces). Only closed polygons are cut; not_cut
+    counts the rest.
+
+    Args:
+        node_path: SOP node path.
+        levels: Plane positions: the coordinate on axis, or dot(normal, p)
+            for a normal (normalised first). Up to 64.
+        axis: "x", "y" or "z"; or give normal instead.
+        normal: Plane normal [nx, ny, nz].
+        bbox: Keep only what lies inside [xmin, ymin, zmin, xmax, ymax,
+            zmax]; chains cut by the box end open at its faces.
+        group: Primitive group limiting the faces cut.
+        space: "sop" (raw positions) or "world" (through the object transform).
+        fit: None or "circle".
+        max_chains: Chains listed per level (0-200); the rest are counted in
+            chains_omitted.
+        dump_path: JSON file with every chain's ordered_points and the face
+            each segment came from (segment_prims).
+    """
+    bridge = _get_bridge(ctx)
+    params: dict[str, Any] = {
+        "node_path": node_path,
+        "levels": levels,
+        "space": space,
+        "max_chains": max_chains,
+    }
+    for key, value in (
+        ("axis", axis),
+        ("normal", normal),
+        ("bbox", bbox),
+        ("group", group),
+        ("fit", fit),
+        ("dump_path", dump_path),
+    ):
+        if value is not None:
+            params[key] = value
+    return await bridge.execute("modeling.section_geometry", params)

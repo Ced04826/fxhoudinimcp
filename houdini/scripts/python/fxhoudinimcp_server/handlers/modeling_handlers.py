@@ -18,6 +18,9 @@
 ``modeling.get_uv_report``
     Islands, winding, overlapping UV triangles, occupied area and stretch.
 
+``modeling.section_geometry``
+    Plane sections: ordered chains per level, nesting, optional circle fit.
+
 The maths and validation below are deliberately free of ``hou`` and ``numpy``
 so they can be tested without Houdini; only the handlers touch either. The
 heavier geometry -- triangulation, sampling, closest points, UV overlap -- lives
@@ -3157,3 +3160,277 @@ def _add_distortion(report: dict[str, Any], stats: dict[str, Any], threshold: fl
 
 
 register_handler("modeling.get_uv_report", _get_uv_report)
+
+
+###### Handler: modeling.section_geometry
+#
+# Every CAD-rebuild session wrote this by hand in execute_python -- plane cut,
+# chain the crossings, fit a circle -- and one read a hole of 3.4155 as 6.09.
+# The cut is taken in memory from the cooked faces; nothing is created.
+
+_SECTION_AXES = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+MAX_SECTION_LEVELS = 64
+SECTION_FITS = ("circle",)
+
+
+def _section_plane(axis: Any, normal: Any) -> tuple[gm.Point3, dict[str, Any]]:
+    """The unit normal and how the receipt names the plane."""
+    if (axis is None) == (normal is None):
+        raise ValueError("pass exactly one of axis ('x', 'y' or 'z') and normal ([nx, ny, nz])")
+    if axis is not None:
+        name = as_text(axis, "axis").strip().lower()
+        if name not in _SECTION_AXES:
+            raise ValueError(f"axis must be 'x', 'y' or 'z', not {axis!r}")
+        return _SECTION_AXES[name], {"axis": name}
+    vector = _vector3(normal, "section", "normal")
+    try:
+        unit = gm.normalize3(vector)
+    except ValueError:
+        raise ValueError("normal must not be [0, 0, 0]") from None
+    return unit, {"normal": [gm.significant(c) for c in unit]}
+
+
+def _section_levels(levels: Any) -> list[float]:
+    if isinstance(levels, (int, float)) and not isinstance(levels, bool):
+        levels = [levels]
+    if not isinstance(levels, (list, tuple)) or not levels:
+        raise ValueError("levels must be a non-empty list of plane positions")
+    if len(levels) > MAX_SECTION_LEVELS:
+        raise ValueError(f"at most {MAX_SECTION_LEVELS} levels per call, got {len(levels)}")
+    values: list[float] = []
+    for level in levels:
+        if (
+            isinstance(level, bool)
+            or not isinstance(level, (int, float))
+            or not math.isfinite(level)
+        ):
+            raise ValueError(f"every level must be a finite number, not {level!r}")
+        values.append(float(level))
+    return values
+
+
+def _section_bbox(bbox: Any) -> tuple[list[float], list[float]] | None:
+    if bbox is None:
+        return None
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 6:
+        raise ValueError("bbox must be [xmin, ymin, zmin, xmax, ymax, zmax]")
+    lo = list(_vector3(list(bbox[:3]), "bbox", "min"))
+    hi = list(_vector3(list(bbox[3:]), "bbox", "max"))
+    if any(a > b for a, b in zip(lo, hi, strict=True)):
+        raise ValueError(f"bbox min must not exceed max: {list(bbox)}")
+    return lo, hi
+
+
+def _chain_summary(
+    chain: gm.SectionChain, u: gm.Point3, v: gm.Point3, fit: str | None, rounder
+) -> dict[str, Any]:
+    xs, ys, zs = zip(*chain.points, strict=True)
+    entry: dict[str, Any] = {
+        "closed": chain.closed,
+        "points": len(chain.points),
+        "length": gm.significant(gm.chain_length(chain.points, chain.closed)),
+        "bbox": [rounder(min(xs)), rounder(min(ys)), rounder(min(zs))]
+        + [rounder(max(xs)), rounder(max(ys)), rounder(max(zs))],
+    }
+    if chain.closed:
+        entry["area"] = gm.significant(gm.polygon_area_3d(chain.points))
+    if fit == "circle":
+        flat = gm.to_plane(chain.points, u, v)
+        circle = gm.fit_circle_2d(flat)
+        if circle is None:
+            entry["circle"] = None
+        else:
+            (cu, cv), radius, rms, _corners = circle
+            worst = gm.chord_deviation(flat, chain.closed, (cu, cv), radius)
+            # Back to 3D: the in-plane centre plus the plane's own offset.
+            n = gm.cross3(u, v)
+            offset = gm.dot3(chain.points[0], n)
+            centre = tuple(cu * u[i] + cv * v[i] + offset * n[i] for i in range(3))
+            entry["circle"] = {
+                "center": [rounder(c) for c in centre],
+                "radius": gm.significant(radius),
+                "rms": gm.significant(rms, 3),
+                "max_dev": gm.significant(worst, 3),
+            }
+    return entry
+
+
+def _nest(chains: list[gm.SectionChain], entries: list[dict[str, Any]], u, v) -> None:
+    """Mark each closed chain with the smallest closed chain around it."""
+    flat = [gm.to_plane(chain.points, u, v) if chain.closed else None for chain in chains]
+    for i, polygon in enumerate(flat):
+        if polygon is None:
+            continue
+        best = None
+        for j, other in enumerate(flat):
+            if j == i or other is None or entries[j]["area"] <= entries[i]["area"]:
+                continue
+            if gm.point_in_polygon_2d(polygon[0], other) and (
+                best is None or entries[j]["area"] < entries[best]["area"]
+            ):
+                best = j
+        entries[i]["inside"] = best
+
+
+def _section_geometry(
+    *,
+    node_path: str,
+    levels: Any,
+    axis: str | None = None,
+    normal: Any = None,
+    bbox: Any = None,
+    group: str | None = None,
+    space: str = "sop",
+    fit: str | None = None,
+    max_chains: int = 10,
+    dump_path: str | None = None,
+    **_,
+) -> dict[str, Any]:
+    """Plane sections of a polygon mesh: the chains where each plane cuts it.
+
+    One chain per connected run of cut faces, walked in order. Per chain:
+    closed or open, point count (one per mesh edge crossed), length, bounding
+    box, the enclosed area and the smallest closed chain around it (``inside``,
+    an index into the same level's list) for closed chains, and with
+    ``fit='circle'`` a least-squares circle. Chains are listed longest first;
+    the ordered points and the face each segment came from go to the dump.
+    """
+    started = time.perf_counter()
+    node_path = as_text(node_path, "node_path").strip()
+    unit, plane = _section_plane(axis, normal)
+    level_values = _section_levels(levels)
+    box = _section_bbox(bbox)
+    space_name = as_text(space, "space").strip().lower()
+    if space_name not in SURFACE_SPACES:
+        raise ValueError(f"space must be one of {list(SURFACE_SPACES)}, not '{space_name}'")
+    fit_name = None if fit is None else as_text(fit, "fit").strip().lower()
+    if fit_name is not None and fit_name not in SECTION_FITS:
+        raise ValueError(f"fit must be one of {list(SECTION_FITS)} or null, not {fit!r}")
+    chain_cap = max(0, min(as_int(max_chains, "max_chains"), 200))
+    group_name = as_text(group, "group").strip()
+    dump_target = as_text(dump_path, "dump_path").strip()
+
+    node = _get_sop_node(node_path, "node_path")
+    geo = _get_sop_geo(node_path)
+    total_prims = int(geo.intrinsicValue("primitivecount"))
+    scope = _region_scope(geo, node_path, group_name, "group")
+    _check_scope_size(
+        node_path, "node_path", len(scope) if scope is not None else total_prims, group_name
+    )
+
+    flat = geo.pointFloatAttribValues("P")
+    _require_finite_positions(flat, node_path)
+    parsed = extract_faces(_load_geo_document(geo))
+    faces = parsed["faces"]
+    if scope is not None:
+        faces = [face for face in faces if face[0] in scope]
+
+    import numpy
+
+    coordinates = numpy.asarray(flat, dtype=numpy.float64).reshape(-1, 3)
+    if space_name == "world":
+        matrix = _object_world_transform(node)
+        if matrix is not None:
+            m = numpy.asarray(matrix.asTuple(), dtype=numpy.float64).reshape(4, 4)
+            # HOM matrices act on row vectors: p' = p * M.
+            coordinates = coordinates @ m[:3, :3] + m[3, :3]
+    positions = coordinates.tolist()
+    heights_array = coordinates @ numpy.asarray(unit)
+    heights = heights_array.tolist()
+
+    used = sorted({p for _prim, pts in faces for p in pts})
+    if used:
+        span = coordinates[used]
+        extent = float(numpy.linalg.norm(span.max(axis=0) - span.min(axis=0)))
+        height_range = [float(heights_array[used].min()), float(heights_array[used].max())]
+    else:
+        extent, height_range = 0.0, None
+    # Coordinates keep six significant figures of the part's size, so a 3 mm
+    # hole in a 1 m part and a 3 m wall both read to what the geometry holds.
+    places = 6 - int(math.floor(math.log10(extent))) if extent > 0.0 else 6
+
+    def rounder(value: float) -> float:
+        return round(value, places)
+
+    # Faces the level can cut: lowest point below it and highest at or above.
+    if faces:
+        flat_ids = numpy.fromiter((p for _prim, pts in faces for p in pts), dtype=numpy.int64)
+        counts = numpy.fromiter((len(pts) for _prim, pts in faces), dtype=numpy.int64)
+        starts = numpy.concatenate(([0], numpy.cumsum(counts)[:-1]))
+        face_heights = heights_array[flat_ids]
+        low = numpy.minimum.reduceat(face_heights, starts)
+        high = numpy.maximum.reduceat(face_heights, starts)
+
+    report: dict[str, Any] = {
+        "node_path": node_path,
+        "space": space_name,
+        "plane": plane,
+        "faces_in_scope": len(faces),
+        "height_range": [rounder(h) for h in height_range] if height_range else None,
+    }
+    if group_name:
+        report["group"] = group_name
+    if box is not None:
+        report["bbox"] = box[0] + box[1]
+    skipped = {
+        key: len([p for p in parsed[key] if scope is None or p in scope])
+        for key in ("open_polylines", "other_prims")
+    }
+    if any(skipped.values()):
+        # Named, not hidden: only closed polygons are cut.
+        report["not_cut"] = {key: count for key, count in skipped.items() if count}
+    if fit_name:
+        report["fit"] = fit_name
+
+    _n, u, v = gm.plane_basis(unit)
+    level_blocks: list[dict[str, Any]] = []
+    dump_levels: list[dict[str, Any]] = []
+    for level in level_values:
+        if faces:
+            hit = numpy.nonzero((low < level) & (high >= level))[0].tolist()
+            candidates = [faces[i] for i in hit]
+        else:
+            candidates = []
+        segments = gm.section_segments(candidates, positions, heights, level, unit)
+        if box is not None:
+            segments = gm.clip_segments(segments, box[0], box[1])
+        chains, branch_points = gm.chain_segments(segments)
+        entries = [_chain_summary(chain, u, v, fit_name, rounder) for chain in chains]
+        order = sorted(range(len(chains)), key=lambda i: -entries[i]["length"])
+        chains = [chains[i] for i in order]
+        entries = [entries[i] for i in order]
+        _nest(chains, entries, u, v)
+        block: dict[str, Any] = {
+            "level": level,
+            "chain_count": len(chains),
+            "closed_count": sum(1 for chain in chains if chain.closed),
+            "chains": entries[:chain_cap],
+        }
+        if branch_points:
+            block["branch_points"] = branch_points
+        if len(entries) > chain_cap:
+            block["chains_omitted"] = len(entries) - chain_cap
+        level_blocks.append(block)
+        if dump_target:
+            dump_levels.append(
+                {
+                    "level": level,
+                    "chains": [
+                        {**entry, "ordered_points": chain.points, "segment_prims": chain.prims}
+                        for entry, chain in zip(entries, chains, strict=True)
+                    ],
+                }
+            )
+    report["levels"] = level_blocks
+    if height_range and any(
+        not height_range[0] <= level <= height_range[1] for level in level_values
+    ):
+        report["note"] = "some levels lie outside height_range, so nothing is there to cut"
+    if dump_target:
+        _write_dump(dump_target, {**report, "levels": dump_levels})
+        report["dump_path"] = dump_target
+    report["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+    return report
+
+
+register_handler("modeling.section_geometry", _section_geometry)

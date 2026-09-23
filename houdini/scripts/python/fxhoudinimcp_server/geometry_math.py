@@ -1163,3 +1163,281 @@ def udim_tiles(triangles: Sequence[UVTriangle]) -> list[int]:
             continue
         tiles.add(1001 + int(math.floor(u)) + 10 * int(math.floor(v)))
     return sorted(tiles)
+
+
+###### Plane sections
+#
+# A section is cut from the faces as they are, not from a triangulation: every
+# point of a chain is where the plane crosses one mesh edge, so a chain's point
+# count says how many edges the cut passes, and a planar face gives the same
+# straight segment either way.
+#
+# A point exactly on the plane counts as above it. Every face then changes
+# side an even number of times, a face that only touches the plane at a vertex
+# is cut at that vertex twice (a zero-length segment, dropped), and a crossing
+# that IS a vertex is keyed by the vertex, so chains join through it whichever
+# faces meet there. An edge crossing is keyed by its sorted point pair and
+# interpolated in that order, so the two faces sharing the edge produce the
+# same point bit for bit.
+
+SectionKey = tuple
+Segment = tuple[SectionKey, Point3, SectionKey, Point3, int]
+
+
+def normalize3(a: Point3) -> Point3:
+    length = length3(a)
+    if length == 0.0:
+        raise ValueError("a zero-length vector has no direction")
+    return (a[0] / length, a[1] / length, a[2] / length)
+
+
+def plane_basis(normal: Point3) -> tuple[Point3, Point3, Point3]:
+    """Unit normal n and in-plane unit axes u, v with u x v = n."""
+    n = normalize3(normal)
+    helper = (1.0, 0.0, 0.0) if abs(n[0]) < 0.9 else (0.0, 1.0, 0.0)
+    u = normalize3(cross3(helper, n))
+    return n, u, cross3(n, u)
+
+
+def section_segments(
+    faces: Sequence[tuple[int, Sequence[int]]],
+    positions: Sequence[Sequence[float]],
+    heights: Sequence[float],
+    level: float,
+    normal: Point3,
+) -> list[Segment]:
+    """Segments where the plane ``height == level`` cuts each face.
+
+    *heights* holds every point's height along the unit *normal*. Returns
+    ``(key_a, point_a, key_b, point_b, prim_id)`` per segment.
+    """
+    segments: list[Segment] = []
+    for prim_id, pts in faces:
+        count = len(pts)
+        if count < 3:
+            continue
+        crossings: list[tuple[SectionKey, Point3]] = []
+        for i in range(count):
+            a = pts[i]
+            b = pts[(i + 1) % count]
+            below_a = heights[a] < level
+            if below_a == (heights[b] < level):
+                continue
+            if not below_a and heights[a] == level:
+                crossings.append((("v", a), point_of(positions, a)))
+            elif below_a and heights[b] == level:
+                crossings.append((("v", b), point_of(positions, b)))
+            else:
+                lo, hi = (a, b) if a < b else (b, a)
+                d_lo = heights[lo] - level
+                t = d_lo / (d_lo - (heights[hi] - level))
+                p, q = point_of(positions, lo), point_of(positions, hi)
+                crossings.append(
+                    (
+                        ("e", lo, hi),
+                        (
+                            p[0] + t * (q[0] - p[0]),
+                            p[1] + t * (q[1] - p[1]),
+                            p[2] + t * (q[2] - p[2]),
+                        ),
+                    )
+                )
+        if len(crossings) > 2:
+            # A non-convex face is crossed four or more times; along the cut
+            # line the crossings alternate entering and leaving the face.
+            direction = cross3(normal, newell_normal(face_points(pts, positions)))
+            if length3(direction) == 0.0:
+                direction = sub3(crossings[-1][1], crossings[0][1])
+            crossings.sort(key=lambda item: dot3(item[1], direction))
+        for k in range(0, len(crossings) - 1, 2):
+            (key_a, point_a), (key_b, point_b) = crossings[k], crossings[k + 1]
+            if key_a != key_b:
+                segments.append((key_a, point_a, key_b, point_b, prim_id))
+    return segments
+
+
+def clip_segment_to_box(
+    p: Point3, q: Point3, lo: Sequence[float], hi: Sequence[float]
+) -> tuple[float, float] | None:
+    """Parameters (t0, t1) of the part of p->q inside the box, or None (Liang-Barsky)."""
+    t0, t1 = 0.0, 1.0
+    for axis in range(3):
+        d = q[axis] - p[axis]
+        if d == 0.0:
+            if p[axis] < lo[axis] or p[axis] > hi[axis]:
+                return None
+            continue
+        a = (lo[axis] - p[axis]) / d
+        b = (hi[axis] - p[axis]) / d
+        if a > b:
+            a, b = b, a
+        t0, t1 = max(t0, a), min(t1, b)
+        if t0 > t1:
+            return None
+    return t0, t1
+
+
+def _lerp3(p: Point3, q: Point3, t: float) -> Point3:
+    return (p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1]), p[2] + t * (q[2] - p[2]))
+
+
+def clip_segments(
+    segments: Sequence[Segment], lo: Sequence[float], hi: Sequence[float]
+) -> list[Segment]:
+    """The parts of *segments* inside the box; a cut end gets a key of its own."""
+    kept: list[Segment] = []
+    for index, (key_a, p, key_b, q, prim_id) in enumerate(segments):
+        span = clip_segment_to_box(p, q, lo, hi)
+        if span is None or span[1] <= span[0]:
+            continue
+        t0, t1 = span
+        new_p, new_q = p, q
+        if t0 > 0.0:
+            key_a, new_p = ("clip", index, 0), _lerp3(p, q, t0)
+        if t1 < 1.0:
+            key_b, new_q = ("clip", index, 1), _lerp3(p, q, t1)
+        kept.append((key_a, new_p, key_b, new_q, prim_id))
+    return kept
+
+
+@dataclass
+class SectionChain:
+    points: list[Point3]
+    prims: list[int]  # the face each segment came from, in walking order
+    closed: bool
+
+
+def chain_segments(segments: Sequence[Segment]) -> tuple[list[SectionChain], int]:
+    """Join segments that share an end. Returns (chains, branch points).
+
+    A branch point is a crossing where more than two segments meet: a
+    non-manifold edge, or faces folded onto each other. The walk passes through
+    it, and the count says the chains there are one reading of several. Walks
+    start at open ends first, so an open chain comes out whole.
+    """
+    unique: dict[tuple, Segment] = {}
+    for segment in segments:
+        a, b = segment[0], segment[2]
+        unique.setdefault((a, b) if a <= b else (b, a), segment)
+    edges = list(unique.values())
+    point_at: dict[SectionKey, Point3] = {}
+    incident: dict[SectionKey, list[int]] = {}
+    for index, (key_a, p, key_b, q, _prim) in enumerate(edges):
+        point_at.setdefault(key_a, p)
+        point_at.setdefault(key_b, q)
+        incident.setdefault(key_a, []).append(index)
+        incident.setdefault(key_b, []).append(index)
+    branch_points = sum(1 for items in incident.values() if len(items) > 2)
+
+    used = [False] * len(edges)
+    chains: list[SectionChain] = []
+    odd = [key for key, items in incident.items() if len(items) % 2 == 1]
+    even = [key for key, items in incident.items() if len(items) % 2 == 0]
+    for start in odd + even:
+        while any(not used[i] for i in incident[start]):
+            keys = [start]
+            prims: list[int] = []
+            current = start
+            while True:
+                step = next((i for i in incident[current] if not used[i]), None)
+                if step is None:
+                    break
+                used[step] = True
+                key_a, _p, key_b, _q, prim_id = edges[step]
+                current = key_b if key_a == current else key_a
+                keys.append(current)
+                prims.append(prim_id)
+            closed = len(keys) > 3 and keys[-1] == keys[0]
+            if closed:
+                keys.pop()
+            chains.append(
+                SectionChain(points=[point_at[key] for key in keys], prims=prims, closed=closed)
+            )
+    return chains, branch_points
+
+
+def chain_length(points: Sequence[Point3], closed: bool) -> float:
+    total = sum(length3(sub3(points[i + 1], points[i])) for i in range(len(points) - 1))
+    if closed and len(points) > 2:
+        total += length3(sub3(points[0], points[-1]))
+    return total
+
+
+def to_plane(points: Sequence[Point3], u: Point3, v: Point3) -> list[Point2]:
+    return [(dot3(p, u), dot3(p, v)) for p in points]
+
+
+def point_in_polygon_2d(point: Point2, polygon: Sequence[Point2]) -> bool:
+    """Even-odd rule; a point on the boundary may land either way."""
+    x, y = point
+    inside = False
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def fit_circle_2d(points: Sequence[Point2]) -> tuple[Point2, float, float, float] | None:
+    """Least-squares circle (Kasa): centre, radius, rms and max radial deviation.
+
+    None for fewer than three points or points on a line. Solved about the
+    centroid, which keeps the equations well conditioned far from the origin.
+    """
+    if len(points) < 3:
+        return None
+    n = float(len(points))
+    mx = sum(p[0] for p in points) / n
+    my = sum(p[1] for p in points) / n
+    sxx = sxy = syy = sxz = syz = sz = 0.0
+    for p in points:
+        x, y = p[0] - mx, p[1] - my
+        z = x * x + y * y
+        sxx += x * x
+        sxy += x * y
+        syy += y * y
+        sxz += x * z
+        syz += y * z
+        sz += z
+    # With centred coordinates the sums of x and y vanish, so the system for
+    # x^2 + y^2 + D x + E y + F = 0 splits into a 2x2 for D, E and F alone.
+    det = sxx * syy - sxy * sxy
+    scale = max(sxx, syy)
+    if scale == 0.0 or abs(det) <= 1e-12 * scale * scale:
+        return None
+    d = (-sxz * syy + syz * sxy) / det
+    e = (-syz * sxx + sxz * sxy) / det
+    f = -sz / n
+    cx, cy = -d / 2.0, -e / 2.0
+    r2 = cx * cx + cy * cy - f
+    if r2 <= 0.0:
+        return None
+    radius = math.sqrt(r2)
+    deviations = [abs(math.hypot(p[0] - mx - cx, p[1] - my - cy) - radius) for p in points]
+    rms = math.sqrt(sum(dev * dev for dev in deviations) / n)
+    return (cx + mx, cy + my), radius, rms, max(deviations)
+
+
+def chord_deviation(points: Sequence[Point2], closed: bool, centre: Point2, radius: float) -> float:
+    """Largest distance from the circle over the points AND the chord midpoints.
+
+    The corners of any regular polygon lie on a circle, so a fit through a
+    square's four corners is exact at the corners. The midpoints of its sides
+    are where it stops being round: about 0.29 r in from the circle, against
+    0.005 r for a 32-sided one.
+    """
+    count = len(points)
+    pairs = count if closed else count - 1
+    worst = 0.0
+    for i in range(count):
+        worst = max(
+            worst, abs(math.hypot(points[i][0] - centre[0], points[i][1] - centre[1]) - radius)
+        )
+    for i in range(pairs):
+        p, q = points[i], points[(i + 1) % count]
+        mid = ((p[0] + q[0]) / 2.0 - centre[0], (p[1] + q[1]) / 2.0 - centre[1])
+        worst = max(worst, abs(math.hypot(mid[0], mid[1]) - radius))
+    return worst

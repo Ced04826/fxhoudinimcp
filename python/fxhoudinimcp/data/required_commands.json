@@ -110,6 +110,7 @@
     "modeling.edit_points",
     "modeling.get_mesh_report",
     "modeling.get_uv_report",
+    "modeling.section_geometry",
     "nodes.change_node_type",
     "nodes.connect_nodes",
     "nodes.connect_nodes_batch",
