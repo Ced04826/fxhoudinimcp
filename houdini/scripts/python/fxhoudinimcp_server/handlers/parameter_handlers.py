@@ -855,11 +855,40 @@ register_handler("parameters.create_spare_parameters", _create_spare_parameters)
 
 _GET_PARMS_CAP = 60
 
+# Rows a network sweep returns before it reports `truncated`.
+_SWEEP_ROW_CAP = 2000
+
+
+def _parm_entry(parm: hou.Parm, include_defaults: bool) -> dict[str, Any]:
+    """One parameter as get_parameters reports it, for a node or a sweep row."""
+    data_parm = _data_parm_value(parm, parm.parmTemplate())
+    entry: dict[str, Any] = data_parm or {"value": _serialize_value(parm.eval())}
+    raw = parm.rawValue()
+    # Only worth reporting when it differs: an expression is the thing a
+    # caller most often needs to see and a literal is just noise.
+    if not data_parm and isinstance(raw, str) and raw != str(entry["value"]):
+        entry["raw_value"] = raw
+    if include_defaults:
+        entry["is_at_default"] = parm.isAtDefault()
+    return entry
+
+
+def _matches_patterns(parm: hou.Parm, lowered: list[str] | None) -> bool:
+    """Whether any lowered pattern is a substring of the parm's name or label."""
+    if lowered is None:
+        return True
+    name = parm.name().lower()
+    label = parm.parmTemplate().label().lower()
+    return any(p in name or p in label for p in lowered)
+
 
 def _get_parameters(
-    node_path: str,
+    node_path: str | None = None,
     patterns: list[str] | str | None = None,
     include_defaults: bool = False,
+    inside: str | None = None,
+    recursive: bool = False,
+    node_type: str | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Current values for every parameter matching any of several patterns.
@@ -869,12 +898,26 @@ def _get_parameters(
     trips. get_node_card reports names and defaults for a node *type*; this
     reports the live values on a specific node.
 
+    With *inside* instead of *node_path*, the same patterns are read across a
+    whole network and come back as one table of `rows`. "Every file parameter
+    of this material library, unexpanded" was find_nodes plus one
+    get_parameters per node: 68 calls in one session.
+
     Args:
         node_path: Node to read.
         patterns: Substrings matched against parameter name and label. Omit for
-            every non-hidden parameter, up to the cap.
+            every non-hidden parameter, up to the cap. Required with *inside*.
         include_defaults: Also report whether each value is still the default.
+        inside: A network to read instead of one node; answers `rows`.
+        recursive: With *inside*, every descendant, not only the children.
+        node_type: With *inside*, only nodes of this type name.
     """
+    if inside is not None:
+        if node_path is not None:
+            raise ValueError("Pass either node_path (one node) or inside (a network), not both.")
+        return _sweep_parameters(inside, patterns, include_defaults, recursive, node_type)
+    if node_path is None:
+        raise ValueError("node_path is required (or inside, to read a whole network).")
     node = hou.node(node_path)
     if node is None:
         raise hou.OperationFailed(f"Node not found: {node_path}")
@@ -886,24 +929,12 @@ def _get_parameters(
     values: dict[str, Any] = {}
     matched = 0
     for parm in node.parms():
-        name = parm.name()
-        if lowered is not None:
-            label = parm.parmTemplate().label().lower()
-            if not any(p in name.lower() or p in label for p in lowered):
-                continue
+        if not _matches_patterns(parm, lowered):
+            continue
         matched += 1
         if len(values) >= _GET_PARMS_CAP:
             continue
-        data_parm = _data_parm_value(parm, parm.parmTemplate())
-        entry: dict[str, Any] = data_parm or {"value": _serialize_value(parm.eval())}
-        raw = parm.rawValue()
-        # Only worth reporting when it differs: an expression is the thing a
-        # caller most often needs to see and a literal is just noise.
-        if not data_parm and isinstance(raw, str) and raw != str(entry["value"]):
-            entry["raw_value"] = raw
-        if include_defaults:
-            entry["is_at_default"] = parm.isAtDefault()
-        values[name] = entry
+        values[parm.name()] = _parm_entry(parm, include_defaults)
 
     return {
         "node_path": node_path,
@@ -913,6 +944,66 @@ def _get_parameters(
         "returned": len(values),
         "truncated": matched > len(values),
         "parameters": values,
+    }
+
+
+def _sweep_parameters(
+    inside: str,
+    patterns: list[str] | str | None,
+    include_defaults: bool,
+    recursive: bool,
+    node_type: str | None,
+) -> dict[str, Any]:
+    """get_parameters over the nodes of a network, as one table of rows."""
+    from fxhoudinimcp_server.handlers.node_handlers import _VALUELESS_PARM_TYPES
+
+    parent = hou.node(inside)
+    if parent is None:
+        raise hou.OperationFailed(f"Node not found: {inside}")
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    if not patterns:
+        raise ValueError(
+            "patterns is required with inside: every parameter of a whole network "
+            "is not an answer anyone can read. Name what to look for, e.g. ['file']."
+        )
+    lowered = [p.lower() for p in patterns]
+    nodes = parent.allSubChildren() if recursive else parent.children()
+    rows: list[dict[str, Any]] = []
+    matched = 0
+    scanned = 0
+    nodes_matched = 0
+    for node in nodes:
+        if node_type and node.type().name() != node_type:
+            continue
+        scanned += 1
+        hit = False
+        for parm in node.parms():
+            # A button or a folder matched by label has no value to report.
+            with contextlib.suppress(Exception):
+                if parm.parmTemplate().type().name() in _VALUELESS_PARM_TYPES:
+                    continue
+            if not _matches_patterns(parm, lowered):
+                continue
+            matched += 1
+            hit = True
+            if len(rows) >= _SWEEP_ROW_CAP:
+                continue
+            row: dict[str, Any] = {"node": node.path(), "parm": parm.name()}
+            row.update(_parm_entry(parm, include_defaults))
+            rows.append(row)
+        nodes_matched += hit
+    return {
+        "inside": parent.path(),
+        "recursive": bool(recursive),
+        "node_type": node_type,
+        "patterns": patterns,
+        "nodes_scanned": scanned,
+        "nodes_matched": nodes_matched,
+        "matched": matched,
+        "returned": len(rows),
+        "truncated": matched > len(rows),
+        "rows": rows,
     }
 
 

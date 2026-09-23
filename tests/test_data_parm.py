@@ -137,3 +137,19 @@ class TestReaders:
         entry = result["parameters"]["stash"]
         assert entry["value"] is None
         assert entry["data"]["is_set"] is False
+
+    def test_a_network_sweep_reports_data_the_same_way(self, monkeypatch):
+        parm, _ = _data_parm(_Geometry())
+        node = MagicMock()
+        node.path.return_value = "/obj/geo1/stash1"
+        node.parms.return_value = [parm]
+        parent = MagicMock()
+        parent.path.return_value = "/obj/geo1"
+        parent.children.return_value = [node]
+        monkeypatch.setattr(parameters.hou, "node", lambda path: parent)
+        result = parameters._get_parameters(inside="/obj/geo1", patterns=["stash"])
+        (row,) = result["rows"]
+        assert row["node"] == "/obj/geo1/stash1"
+        assert row["value"]["point_count"] == 8
+        assert row["data"]["is_set"] is True
+        assert "raw_value" not in row

@@ -392,9 +392,12 @@ async def create_spare_parameters(
 @mcp.tool()
 async def get_parameters(
     ctx: Context,
-    node_path: str,
+    node_path: str | None = None,
     patterns: list[str] | None = None,
     include_defaults: bool = False,
+    inside: str | None = None,
+    recursive: bool = False,
+    node_type: str | None = None,
 ) -> dict:
     """Read many parameter values at once, matched by name or label substring.
 
@@ -403,17 +406,30 @@ async def get_parameters(
     each, and unlike get_node_card these are the live values on this node rather
     than the defaults for its type.
 
+    Pass `inside` instead of `node_path` to read the same patterns across a
+    whole network in one call: "every file parm of this material library,
+    unexpanded" comes back as `rows` of {node, parm, value, raw_value}, up to
+    2000 rows. `raw_value` is the unexpanded text ($JOB/...), shown when it
+    differs from the value, exactly as for a single node.
+
     Args:
         node_path: Node to read.
         patterns: Substrings matched against parameter name and label. Omit for
-            everything, up to the cap.
+            everything, up to the cap. Required with `inside`.
         include_defaults: Also report whether each value is still the default.
+        inside: Network to read instead of a single node.
+        recursive: With `inside`, include every descendant, not only children.
+        node_type: With `inside`, only nodes of this type (e.g. "mtlximage").
     """
     bridge = _get_bridge(ctx)
-    params: dict[str, Any] = {
-        "node_path": node_path,
-        "include_defaults": include_defaults,
-    }
+    params: dict[str, Any] = {"include_defaults": include_defaults}
+    if node_path is not None:
+        params["node_path"] = node_path
     if patterns is not None:
         params["patterns"] = patterns
+    if inside is not None:
+        params["inside"] = inside
+        params["recursive"] = recursive
+        if node_type is not None:
+            params["node_type"] = node_type
     return await bridge.execute("parameters.get_parameters", params)

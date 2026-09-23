@@ -282,6 +282,23 @@ class TestEvidenceTools:
             },
         )
 
+    @pytest.mark.asyncio
+    async def test_get_parameters_across_a_network(self, mock_ctx, mock_bridge):
+        from fxhoudinimcp.tools.parameters import get_parameters
+
+        mock_bridge.execute.return_value = {"rows": []}
+        await get_parameters(mock_ctx, inside="/mat/lib", patterns=["file"], node_type="mtlximage")
+        mock_bridge.execute.assert_called_once_with(
+            "parameters.get_parameters",
+            {
+                "include_defaults": False,
+                "patterns": ["file"],
+                "inside": "/mat/lib",
+                "recursive": False,
+                "node_type": "mtlximage",
+            },
+        )
+
 
 class TestParityTools:
     @pytest.mark.asyncio
