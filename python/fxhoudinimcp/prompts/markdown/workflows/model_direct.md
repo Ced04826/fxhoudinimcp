@@ -71,7 +71,9 @@ is an installed Modeler HDA. No separate Boolean MCP tool is required.
    stretching, density and padding, assisted by a checker view. Report tiny
    overlap at texture scale instead of endlessly chasing numerical noise.
 4. Align reference and result. Use front/side/oblique and wireframe views for
-   proportions, depth, holes and topology. Basic shaded inspection may reveal
+   proportions, depth, holes and topology: one `capture_viewport` call with
+   those views, the part as target and `shading="smooth_wire"` frames each
+   view on the part and says whether it is fully in frame. Basic shaded inspection may reveal
    flipped normals or obvious pinching; strict matched-highlight/material
    comparison is outside basic modeling acceptance.
 

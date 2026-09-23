@@ -2,7 +2,7 @@ Houdini MCP: 212 tools across 25 categories. Full rules: get_workflow_guide("dis
 
 1. PLAN, THEN BUILD IN ONE CALL. 3+ nodes = one build_network; dry_run=True for types new this session. Batch reads and sets: every call costs ~50 ms of main-thread marshalling, call count decides the wait.
 2. LOOK IT UP, NEVER GUESS. get_node_card for parms and inputs; search_help + get_help_page for SideFX's own workflow pages (a shelf/ or workflow hit is the answer, read it first); get_workflow_guide(topic) before designing a setup.
-3. VERIFY, THEN CLAIM. verify_network after every change; capture_screenshot(settle_seconds=...) for the look. A user's question is answered before anything is changed. Two failed fixes = read the docs, not a third fix.
+3. VERIFY, THEN CLAIM. verify_network after every change; capture_viewport(targets=...) for the look; capture_screenshot for Karma. A user's question is answered before anything is changed. Two failed fixes = read the docs, not a third fix.
 4. DRAFT, THEN UPRES, with the user's yes.
 5. CACHE past ~3 s/frame, or when a draft sim will be upres'd: filecache, or rbdio/vellumio (vellumpack before a filecache). write_cache / start_render run in Houdini with its progress dialog and hold until done, however long; wait, call nothing else meanwhile, never poll the disk. background=True only if asked to keep working. Save the hip first.
 6. Tweakables on a CTRL null with spare parms.
