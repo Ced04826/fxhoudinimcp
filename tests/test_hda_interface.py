@@ -211,9 +211,6 @@ class _Definition:
         self.on_write = on_write
         self.writes = 0
 
-    def isEmbedded(self):
-        return self.library == "Embedded"
-
     def parmTemplateGroup(self):
         return _LiveGroup(self.stored)
 

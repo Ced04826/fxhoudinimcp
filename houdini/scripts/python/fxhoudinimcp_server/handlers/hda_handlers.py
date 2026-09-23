@@ -41,6 +41,15 @@ def _get_definition(node: hou.Node) -> hou.HDADefinition:
     return definition
 
 
+def _is_embedded(definition: hou.HDADefinition) -> bool:
+    """True for a definition stored in the hip file.
+
+    HOM has no isEmbedded() (checked on 22.0.429); an embedded definition
+    answers the literal "Embedded" for its library path.
+    """
+    return definition.libraryFilePath() == "Embedded"
+
+
 def _definition_to_dict(definition: hou.HDADefinition) -> dict:
     """Convert an HDA definition to a plain dict."""
     info = {
@@ -73,7 +82,7 @@ def _definition_to_dict(definition: hou.HDADefinition) -> dict:
         info["is_editable"] = None
 
     try:
-        info["embedded"] = definition.isEmbedded()
+        info["embedded"] = _is_embedded(definition)
     except Exception:
         info["embedded"] = None
 
@@ -1247,7 +1256,7 @@ def _edit_interface(node_path: str, ops: list, dry_run: bool, clear_first: bool)
     # backup beside it), so the library is held to the project root like
     # every other HDA file this server writes. An embedded definition lives
     # in the hip file and answers the literal "Embedded" for a path.
-    if not definition.isEmbedded():
+    if not _is_embedded(definition):
         require_inside_project_root(definition.libraryFilePath(), "HDA library")
     try:
         definition.setParmTemplateGroup(group)
