@@ -240,7 +240,12 @@ def _connectors_for_type(category_name: str, node_type) -> tuple[dict | None, st
     return connectors, None
 
 
-def _parm_names_for_type(scratch: hou.Node, node_type) -> tuple[set, set, dict, list, dict]:
+def _parm_names_for_type(
+    scratch: hou.Node,
+    node_type,
+    parm_types: dict | None = None,
+    factory_expressions: dict | None = None,
+) -> tuple[set, set, dict, list, dict]:
     """Instantiate a type once to learn its parm names, tuple names, menus and
     multiparm instance patterns.
 
@@ -251,9 +256,31 @@ def _parm_names_for_type(scratch: hou.Node, node_type) -> tuple[set, set, dict, 
     connectors (the same probe answers both questions, and probing is not
     free). Creation scripts run here on purpose: the build that follows runs
     them, so the names validated are the names the built node has.
+
+    The same probe fills two optional tables when they are passed:
+    *parm_types* maps each parm name to its template type name ("Int",
+    "Float", ...), which is how a string aimed at a numeric parm is caught
+    before the build starts; *factory_expressions* maps each parm and parm
+    tuple name whose components ship with an expression to {component:
+    expression}, so a dry run can name the literals that will not take.
     """
     probe = scratch.createNode(node_type.name())
     connectors = _connectors_of(probe)
+    if parm_types is not None:
+        for parm in probe.parms():
+            with contextlib.suppress(Exception):
+                parm_types[parm.name()] = parm.parmTemplate().type().name()
+    if factory_expressions is not None:
+        for parm_tuple in probe.parmTuples():
+            found = {
+                parm.name(): expression
+                for parm in parm_tuple
+                if (expression := _expression_of(parm)) is not None
+            }
+            if found:
+                factory_expressions[parm_tuple.name()] = found
+                for component, expression in found.items():
+                    factory_expressions[component] = {component: expression}
     parm_names = {p.name() for p in probe.parms()}
     tuple_names = {pt.name() for pt in probe.parmTuples()}
     menus: dict[str, list[str]] = {}
@@ -296,10 +323,156 @@ def _menu_error(parm_name: str, value: Any, tokens: list[str]) -> str | None:
     return None
 
 
-def _apply_parm(node: hou.Node, name: str, value: Any) -> None:
-    """Set a parm or parm tuple, broadcasting scalars and coercing floats."""
+def _expression_of(parm: hou.Parm) -> str | None:
+    """The expression *parm* holds, or None when it holds a plain value."""
+    try:
+        expression = parm.expression()
+    except Exception:
+        return None
+    return expression or None
+
+
+def _referenced_parm(parm: hou.Parm) -> str | None:
+    """Path of the parm a pure `ch()` reference points at, or None.
+
+    hou.Parm.set() writes THROUGH a bare channel reference: setting tx on a
+    node whose tx reads ch("../b1/sizex") changes b1's sizex, not tx.
+    """
+    with contextlib.suppress(Exception):
+        target = parm.getReferencedParm()
+        if target is not None and target.path() != parm.path():
+            return str(target.path())
+    return None
+
+
+# Everything a node spec may carry. An unknown key used to be dropped in
+# silence, so a spec with "children" built an empty container and reported
+# success.
+_SPEC_KEYS = frozenset(
+    {
+        "type",
+        "name",
+        "parms",
+        "expressions",
+        "exprs",
+        "inputs",
+        "flags",
+        "color",
+        "comment",
+        "override_expression",
+    }
+)
+
+# Keys of one dict entry of a spec's `inputs` list.
+_INPUT_KEYS = frozenset({"index", "input_name", "source", "source_output", "indirect_input"})
+
+# Template types that refuse a non-numeric literal. A string aimed at one of
+# these is almost always an expression the caller meant to set.
+_NUMERIC_TEMPLATES = frozenset({"Int", "Float", "Toggle"})
+
+_EXPRESSION_LANGUAGES = {"hscript": "Hscript", "python": "Python"}
+
+
+def _unknown_key_error(label: str, kind: str, key: str, known: frozenset) -> str:
+    """A did-you-mean refusal for a spec or input key build_network does not know."""
+    close = get_close_matches(str(key), sorted(known), n=3, cutoff=0.4)
+    hint = f" Did you mean: {close}?" if close else f" Known keys: {sorted(known)}."
+    return f"node {label}: unknown {kind} key '{key}'.{hint}"
+
+
+def _is_numeric_text(value: str) -> bool:
+    """Whether a string is just a number written out ('3', '-1.5')."""
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _expression_value(value: Any) -> str | None:
+    """The expression inside a `{"expr": "..."}` parm value, or None."""
+    if isinstance(value, dict) and "expr" in value:
+        return str(value["expr"])
+    return None
+
+
+def _expression_language(name: str):
+    """hou.exprLanguage for "hscript" / "python"; raises on anything else."""
+    key = str(name).strip().lower()
+    if key not in _EXPRESSION_LANGUAGES:
+        raise ValueError(f"expression language must be 'hscript' or 'python', got {name!r}")
+    return getattr(hou.exprLanguage, _EXPRESSION_LANGUAGES[key])
+
+
+def _spec_expressions(spec: dict) -> dict[str, str]:
+    """Every expression a spec asks for, from all three spellings.
+
+    The `expressions` block (or its alias `exprs`), plus any parm in `parms`
+    given as `{"expr": "..."}`: `parms` is where a caller reaches first, and a
+    bare expression string there used to fail the whole build.
+    """
+    found: dict[str, str] = {}
+    for block in (spec.get("expressions"), spec.get("exprs")):
+        for name, expression in (block or {}).items():
+            found[name] = str(expression)
+    for name, value in (spec.get("parms") or {}).items():
+        wrapped = _expression_value(value)
+        if wrapped is not None:
+            found[name] = wrapped
+    return found
+
+
+def _apply_parm(
+    node: hou.Node, name: str, value: Any, override_expression: bool = False
+) -> dict[str, dict[str, str]]:
+    """Set a parm or parm tuple, broadcasting scalars and coercing floats.
+
+    Answers what the write did to expressions, per component:
+    `expressions_kept` for an expression the literal did not replace (a Ray
+    SOP's factory `@N.x` on dir), `written_through` for a pure ch() reference
+    the value went through into the parm it reads, and `expressions_removed`
+    when *override_expression* cleared them first. Nothing is evaluated: an
+    eval outside a cook leaves errors on the node that the build's report
+    would then pick up.
+    """
     parm = node.parm(name)
     parm_tuple = node.parmTuple(name)
+    if isinstance(value, (list, tuple)) or parm is None:
+        components = list(parm_tuple) if parm_tuple is not None else []
+    else:
+        components = [parm]
+    before = {p.name(): e for p in components if (e := _expression_of(p)) is not None}
+    report: dict[str, dict[str, str]] = {}
+    through: dict[str, str] = {}
+    if before and override_expression:
+        for component in components:
+            if component.name() in before:
+                with contextlib.suppress(Exception):
+                    component.deleteAllKeyframes()
+        report["expressions_removed"] = before
+    elif before:
+        through = {
+            p.name(): target
+            for p in components
+            if p.name() in before and (target := _referenced_parm(p)) is not None
+        }
+    _set_parm_value(name, parm, parm_tuple, value)
+    if before and not override_expression:
+        for component in components:
+            after = _expression_of(component)
+            if after is None or component.name() not in before:
+                continue
+            if component.name() in through:
+                report.setdefault("written_through", {})[component.name()] = through[
+                    component.name()
+                ]
+            else:
+                report.setdefault("expressions_kept", {})[component.name()] = after
+    return report
+
+
+def _set_parm_value(name: str, parm, parm_tuple, value: Any) -> None:
+    """The plain write behind _apply_parm."""
     if isinstance(value, (list, tuple)):
         if parm_tuple is None:
             raise ValueError(f"'{name}' is not a parm tuple")
@@ -404,6 +577,18 @@ def build_network(
             type (str, required): node type name (unversioned ok).
             name (str): node name, referenceable by later specs.
             parms (dict): parameter values; lists set whole parm tuples.
+                A value written {"expr": "...", "language": "hscript" |
+                "python"} is set as an expression (hscript by default). A
+                string on a numeric parm is refused during validation and
+                answered with that spelling. A literal on a parm that holds
+                an expression (a Ray SOP's factory `@N.x` on dir) does not
+                replace it: the dry run lists these in
+                `expressions_in_the_way`, the build reports
+                `expressions_kept`.
+            expressions (dict): parm name -> expression, as a whole block
+                (alias: exprs). Names are validated like those in `parms`.
+            override_expression (bool): clear the expressions that literals
+                in `parms` land on, so the literals take.
             inputs (list): wiring. Entries are either a source string
                 (wired positionally) or {"index" | "input_name", "source",
                 "source_output"}; "input_name" is a connector name or
@@ -414,6 +599,8 @@ def build_network(
                 itself.
             flags (dict): display/render/bypass/template booleans.
             color (list[3]) and comment (str): network annotations.
+            Any other key, in a spec or in an input entry, is a validation
+            error with a did-you-mean, not a request dropped in silence.
         dry_run: Validate only; never mutates the scene.
         layout: Also lay out the whole parent network afterwards, which only
             happens when FXHOUDINIMCP_AUTO_LAYOUT is enabled. It does not gate
@@ -453,7 +640,21 @@ def build_network(
     resolved_types: dict[str, Any] = {}
 
     for index, spec in enumerate(nodes):
+        if not isinstance(spec, dict):
+            errors.append(f"node #{index}: spec must be a dict, got {type(spec).__name__}")
+            continue
         label = spec.get("name") or spec.get("type") or f"#{index}"
+        # A key this verb does not know is a request it cannot honour. Dropping
+        # it quietly is how a spec with "children" reported success for a
+        # subnet that was built empty.
+        for key in spec:
+            if key not in _SPEC_KEYS:
+                errors.append(_unknown_key_error(label, "spec", key, _SPEC_KEYS))
+        for entry in spec.get("inputs") or []:
+            if isinstance(entry, dict):
+                for key in entry:
+                    if key not in _INPUT_KEYS:
+                        errors.append(_unknown_key_error(label, "input", key, _INPUT_KEYS))
         type_name = spec.get("type")
         if not type_name:
             errors.append(f"node {label}: missing 'type'")
@@ -479,8 +680,11 @@ def build_network(
     # Learn parameter names by instantiating each unique type once (probe
     # nodes are destroyed immediately; display/render flags restored), so
     # bad parm names fail validation, not the build. Runs even when other
-    # errors exist: report everything in one pass.
+    # errors exist: report everything in one pass. The same probe records
+    # each parm's template type and the expressions the type ships with.
     parm_knowledge: dict[str, tuple[set, set, dict, list, dict]] = {}
+    template_knowledge: dict[str, dict[str, str]] = {}
+    expression_knowledge: dict[str, dict[str, dict[str, str]]] = {}
     # Connectors of a spec that names an input and sets parms, probed with
     # those parms applied (see _probe_connectors).
     spec_connectors: dict[int, dict] = {}
@@ -489,8 +693,17 @@ def build_network(
         render_before = parent.renderNode() if hasattr(parent, "renderNode") else None
         try:
             for type_name, node_type in resolved_types.items():
-                parm_knowledge[type_name] = _parm_names_for_type(parent, node_type)
+                template_knowledge[type_name] = {}
+                expression_knowledge[type_name] = {}
+                parm_knowledge[type_name] = _parm_names_for_type(
+                    parent,
+                    node_type,
+                    parm_types=template_knowledge[type_name],
+                    factory_expressions=expression_knowledge[type_name],
+                )
             for index, spec in enumerate(nodes):
+                if not isinstance(spec, dict):
+                    continue
                 node_type = resolved_types.get(spec.get("type"))
                 names_an_input = any(
                     isinstance(entry, dict) and entry.get("input_name")
@@ -519,16 +732,81 @@ def build_network(
             listed.append(connectors)
         return listed[0]
 
+    # Literals the spec aims at parms whose factory expression will outlive
+    # them, named before anything is built.
+    in_the_way: dict[str, dict[str, dict[str, str]]] = {}
+
     for index, spec in enumerate(nodes):
+        if not isinstance(spec, dict):
+            continue  # already reported above
         label = spec.get("name") or spec.get("type") or f"#{index}"
+        if not spec.get("override_expression"):
+            shipped = expression_knowledge.get(spec.get("type")) or {}
+            for parm_name, value in (spec.get("parms") or {}).items():
+                if _expression_value(value) is None and parm_name in shipped:
+                    in_the_way.setdefault(label, {})[parm_name] = shipped[parm_name]
         knowledge = parm_knowledge.get(spec.get("type"))
         if knowledge:
             parm_names, tuple_names, menus, instance_patterns, _ = knowledge
+            templates = template_knowledge.get(spec.get("type")) or {}
+            for parm_name in _spec_expressions(spec):
+                if parm_name in parm_names or _is_instance_parm(parm_name, instance_patterns):
+                    continue
+                if parm_name in tuple_names:
+                    # setExpression() is per component; the build would find
+                    # no parm by the tuple's name and roll everything back.
+                    components = sorted(p for p in parm_names if p.startswith(parm_name))
+                    errors.append(
+                        f"node {label}: '{parm_name}' is a parm tuple; an expression "
+                        f"goes on each component {components}"
+                    )
+                    continue
+                close = get_close_matches(parm_name, sorted(parm_names), n=3, cutoff=0.5)
+                hint = f" Did you mean: {close}?" if close else ""
+                errors.append(f"node {label}: no parm '{parm_name}' to put an expression on.{hint}")
             for parm_name, value in (spec.get("parms") or {}).items():
+                if isinstance(value, dict):
+                    # An expression wrapper; its parm name was checked above.
+                    unknown = sorted(set(value) - {"expr", "language"})
+                    if "expr" not in value:
+                        errors.append(
+                            f"node {label}: parm '{parm_name}' was given a dict without "
+                            f"'expr'. Write {{\"expr\": \"ch('../x')\"}} for an expression, "
+                            f"or a plain value."
+                        )
+                    elif unknown:
+                        errors.append(
+                            f"node {label}: parm '{parm_name}': unknown key(s) {unknown} "
+                            f"in the expression value (known: ['expr', 'language'])"
+                        )
+                    elif str(value.get("language", "hscript")).strip().lower() not in (
+                        _EXPRESSION_LANGUAGES
+                    ):
+                        errors.append(
+                            f"node {label}: parm '{parm_name}': expression language "
+                            f"{value['language']!r} is not 'hscript' or 'python'"
+                        )
+                    continue
                 if parm_name in menus:
                     problem = _menu_error(parm_name, value, menus[parm_name])
                     if problem:
                         errors.append(f"node {label}: {problem}")
+                elif (
+                    isinstance(value, str)
+                    and not _is_numeric_text(value)
+                    and templates.get(parm_name) in _NUMERIC_TEMPLATES
+                ):
+                    # Houdini's own refusal is "Cannot set a numeric parm to a
+                    # non-numeric value" plus a dump of the C++ overloads,
+                    # raised mid-build, so the whole graph rolled back. Caught
+                    # here instead, in terms of what the caller meant.
+                    errors.append(
+                        f"node {label}: parm '{parm_name}' is numeric "
+                        f"({templates[parm_name]}) and will not take the string "
+                        f"{value!r}. To set it as an expression, write "
+                        f'"{parm_name}": {{"expr": {value!r}}} or put it in the '
+                        f"spec's 'expressions' block."
+                    )
                 if (
                     parm_name not in parm_names
                     and parm_name not in tuple_names
@@ -603,39 +881,64 @@ def build_network(
     if errors:
         return {"success": False, "valid": False, "errors": errors, "created": []}
     if dry_run:
-        return {
+        result = {
             "success": True,
             "valid": True,
             "dry_run": True,
             "validated_nodes": len(nodes),
             "validated_types": sorted(t.name() for t in resolved_types.values()),
         }
+        if in_the_way:
+            result["expressions_in_the_way"] = in_the_way
+            result["warning"] = (
+                f"These parms hold an expression that a literal from the spec will not "
+                f"replace: {in_the_way}. Pass override_expression: true on the spec to "
+                f"clear it, or set the value as an expression."
+            )
+        return result
 
     ###### Phase 2: build (atomic — any failure rolls back)
 
     created: dict[str, hou.Node] = {}
+    # Per node path: what the literals in `parms` did to expressions.
+    parm_reports: dict[str, dict[str, dict[str, str]]] = {}
     try:
         for spec in nodes:
             node = parent.createNode(resolved_types[spec["type"]].name(), spec.get("name"))
             created[spec.get("name") or node.name()] = node
 
         for spec, node in zip(nodes, created.values(), strict=False):
+            override = bool(spec.get("override_expression"))
             for parm_name, value in (spec.get("parms") or {}).items():
+                if _expression_value(value) is not None:
+                    continue  # an {"expr": ...} value, set with the expressions below
                 try:
-                    _apply_parm(node, parm_name, value)
+                    written = _apply_parm(node, parm_name, value, override)
                 except Exception as exc:
                     raise RuntimeError(
                         f"{node.path()} parm '{parm_name}': {readable_message(exc)}"
                     ) from exc
+                for kind, found in written.items():
+                    parm_reports.setdefault(node.path(), {}).setdefault(kind, {}).update(found)
             # "build_network cannot set expressions" was a live session's stated
-            # reason for rebuilding a lantern rig in execute_python. It can.
-            for parm_name, expression in (spec.get("expressions") or {}).items():
+            # reason for rebuilding a lantern rig in execute_python. It can, from
+            # `expressions`, from `exprs`, or from an {"expr": ...} value in `parms`.
+            languages = {
+                name: value.get("language")
+                for name, value in (spec.get("parms") or {}).items()
+                if isinstance(value, dict)
+            }
+            for parm_name, expression in _spec_expressions(spec).items():
                 parm = node.parm(parm_name)
                 if parm is None:
                     raise RuntimeError(
                         f"{node.path()}: no parm '{parm_name}' to put an expression on"
                     )
-                parm.setExpression(str(expression))
+                language = languages.get(parm_name)
+                if language:
+                    parm.setExpression(expression, language=_expression_language(language))
+                else:
+                    parm.setExpression(expression)
             for position, entry in enumerate(spec.get("inputs") or []):
                 wire = _parse_input_entry(entry, position)
                 source_output = wire["source_output"]
@@ -696,8 +999,10 @@ def build_network(
         display.cook(force=False)
 
     reports = [_node_report(node) for node in created.values()]
+    for report in reports:
+        report.update(parm_reports.get(report["path"], {}))
     error_nodes = [r["path"] for r in reports if r["errors"]]
-    return {
+    result = {
         "success": True,
         "valid": True,
         "created": reports,
@@ -706,6 +1011,36 @@ def build_network(
         "error_nodes": error_nodes,
         "node_count": len(reports),
     }
+    # A literal that did not take is part of the spec this call did not
+    # build, so it is said at the top level, not only inside a node report:
+    # a bare set() used to leave a Ray SOP's @N.x in place and answer success.
+    kept = {
+        path: sorted(found["expressions_kept"])
+        for path, found in parm_reports.items()
+        if found.get("expressions_kept")
+    }
+    through = {
+        path: found["written_through"]
+        for path, found in parm_reports.items()
+        if found.get("written_through")
+    }
+    warnings: list[str] = []
+    if kept:
+        result["expressions_kept"] = kept
+        warnings.append(
+            f"Literal(s) in the spec did not take, the parameter kept its expression: "
+            f"{kept}. Pass override_expression: true on the spec to replace them."
+        )
+    if through:
+        result["written_through"] = through
+        warnings.append(
+            f"These parameters are pure channel references, so the value was written "
+            f"into the parameter each one reads, not into itself: {through}. Pass "
+            f"override_expression: true on the spec to break the link instead."
+        )
+    if warnings:
+        result["warning"] = " ".join(warnings)
+    return result
 
 
 ###### graph.verify_network
