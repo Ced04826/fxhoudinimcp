@@ -748,6 +748,7 @@ def _shoot(scene_viewer, viewport, state, base, view, corners, path, max_size, m
         "name": view["name"],
         "direction": view["direction"]
         or {"azimuth": view["azimuth"], "elevation": view["elevation"]},
+        "viewport_type": viewport.type().name(),
         "projection": "ortho" if placed["ortho"] else "persp",
         "pivot": [round(v, 6) for v in placed["pivot"]],
         # The camera looks along -back.
@@ -805,6 +806,17 @@ def _shoot(scene_viewer, viewport, state, base, view, corners, path, max_size, m
     return shot
 
 
+def _drawn(scene_viewer) -> dict[str, Any]:
+    """The viewer's network and its display node, for the receipt."""
+    facts: dict[str, Any] = {"viewer_network": None, "display_node": None}
+    with contextlib.suppress(Exception):
+        network = scene_viewer.pwd()
+        facts["viewer_network"] = network.path()
+        display = network.displayNode() if hasattr(network, "displayNode") else None
+        facts["display_node"] = display.path() if display is not None else None
+    return facts
+
+
 ###### Handler: viewport.capture_viewport
 
 
@@ -858,6 +870,9 @@ def capture_viewport(
     result: dict[str, Any] = {
         "viewport": viewport.name(),
         "viewport_px": [int(size[2]), int(size[3])],
+        # What the images show: the viewer's network and, inside a SOP
+        # network, the node whose geometry is drawn as the edited model.
+        **_drawn(scene_viewer),
         "camera_detached": None,
         "views": [],
         "problems": [],
