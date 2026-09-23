@@ -279,6 +279,9 @@ def json_safe(value: Any, _path: str = "$", _seen: tuple = (), _depth: int = 0) 
     """
     notes: dict[str, Any] = {"nonfinite": [], "coerced": [], "circular": []}
     counts: dict[str, int] = {"nonfinite": 0, "coerced": 0, "circular": 0}
+    # JSON keys are strings, so an int or finite float key written as its
+    # decimal text is what json.dumps itself does: counted, not a loss.
+    stringified = [0]
 
     def _note(category: str, path: str) -> None:
         counts[category] += 1
@@ -324,11 +327,16 @@ def json_safe(value: Any, _path: str = "$", _seen: tuple = (), _depth: int = 0) 
                 # hundred-thousand-character key must not produce a
                 # hundred-thousand-character note.
                 label = _shrink(_safe_str(key), _KEY_CHARS, _SAMPLE_DEPTH)
-                if not isinstance(key, str):
+                text = _safe_str(key)
+                if text in out:
+                    # Two keys that print the same (1 and "1") leave one value
+                    # behind whatever their types.
                     _note("coerced", f"{path}.<key {label}>")
-                out[_safe_str(key)] = _walk(
-                    entry, f"{path}.{label}", seen + (id(item),), depth + 1
-                )
+                elif type(key) is int or (type(key) is float and math.isfinite(key)):
+                    stringified[0] += 1
+                elif not isinstance(key, str):
+                    _note("coerced", f"{path}.<key {label}>")
+                out[text] = _walk(entry, f"{path}.{label}", seen + (id(item),), depth + 1)
             return out
         _note("coerced", path)
         return _safe_str(item)
@@ -340,6 +348,8 @@ def json_safe(value: Any, _path: str = "$", _seen: tuple = (), _depth: int = 0) 
             continue
         summary[category] = paths
         summary[f"{category}_count"] = counts[category]
+    if stringified[0]:
+        summary["keys_stringified"] = stringified[0]
     return safe, summary
 
 

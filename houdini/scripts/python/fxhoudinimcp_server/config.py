@@ -28,6 +28,22 @@ def auto_layout_enabled() -> bool:
     return value.strip().lower() not in _FALSY
 
 
+def focus_editor_enabled() -> bool:
+    """Whether handlers may point the network editor at the node they touched.
+
+    Reads ``FXHOUDINIMCP_FOCUS_EDITOR`` the way ``auto_layout_enabled`` reads
+    its flag. Off by default in this fork: moving the editor into the node's
+    network, making the node current and framing it also moves every pane
+    linked to that editor (viewer, parameters) and the selection, silently,
+    during unattended or scripted runs. Set to ``1`` to have the editor follow
+    the work. Node placement is not affected by this flag.
+    """
+    value = hou.getenv("FXHOUDINIMCP_FOCUS_EDITOR")
+    if value is None:
+        value = os.environ.get("FXHOUDINIMCP_FOCUS_EDITOR", "0")
+    return value.strip().lower() not in _FALSY
+
+
 def output_grace_seconds() -> float:
     """How long a clean render or cache write may take to show its file.
 

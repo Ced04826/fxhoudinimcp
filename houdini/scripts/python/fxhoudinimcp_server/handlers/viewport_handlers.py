@@ -925,6 +925,18 @@ def find_error_nodes(root_path: str = "/") -> dict:
 
     error_nodes = []
     warning_nodes = []
+    # A node whose errors() raises (hou.PermissionError on a locked asset's
+    # insides, for one) is neither clean nor erroring: it was not read. It is
+    # listed, and the scan carries on, instead of the whole call failing or the
+    # node passing as error-free.
+    unreadable_nodes = []
+
+    def _unreadable(node, what, exc):
+        path = "<unknown>"
+        with contextlib.suppress(Exception):
+            path = node.path()
+        logger.debug("Could not read %s of node '%s': %s", what, path, exc)
+        unreadable_nodes.append({"path": path, "error": f"{what}: {type(exc).__name__}: {exc}"})
 
     def _check_node(node):
         """Recursively check nodes for errors and warnings."""
@@ -939,8 +951,8 @@ def find_error_nodes(root_path: str = "/") -> dict:
                         "errors": list(errors),
                     }
                 )
-        except (hou.OperationFailed, hou.ObjectWasDeleted, AttributeError) as e:
-            logger.debug("Could not read errors for node '%s': %s", node.path(), e)
+        except (hou.Error, AttributeError) as e:
+            _unreadable(node, "errors()", e)
 
         try:
             warnings = node.warnings()
@@ -953,15 +965,15 @@ def find_error_nodes(root_path: str = "/") -> dict:
                         "warnings": list(warnings),
                     }
                 )
-        except (hou.OperationFailed, hou.ObjectWasDeleted, AttributeError) as e:
-            logger.debug("Could not read warnings for node '%s': %s", node.path(), e)
+        except (hou.Error, AttributeError) as e:
+            _unreadable(node, "warnings()", e)
 
         # Recurse into children
         try:
             for child in node.children():
                 _check_node(child)
-        except (hou.OperationFailed, hou.ObjectWasDeleted) as e:
-            logger.debug("Could not iterate children of node '%s': %s", node.path(), e)
+        except hou.Error as e:
+            _unreadable(node, "children()", e)
 
     _check_node(root)
 
@@ -970,6 +982,8 @@ def find_error_nodes(root_path: str = "/") -> dict:
         "warning_nodes": warning_nodes,
         "error_count": len(error_nodes),
         "warning_count": len(warning_nodes),
+        "unreadable_nodes": unreadable_nodes,
+        "unreadable_count": len(unreadable_nodes),
         "root_path": root_path,
     }
 

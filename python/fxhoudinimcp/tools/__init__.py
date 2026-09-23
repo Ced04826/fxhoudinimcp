@@ -13,6 +13,7 @@ from fxhoudinimcp.tools import (
     chops,  # noqa: F401
     code,  # noqa: F401
     context,  # noqa: F401
+    cook,  # noqa: F401
     cops,  # noqa: F401
     dops,  # noqa: F401
     geometry,  # noqa: F401

@@ -15,7 +15,7 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.config import layout_if_enabled, place_new_node
+from fxhoudinimcp_server.config import focus_editor_enabled, layout_if_enabled, place_new_node
 from fxhoudinimcp_server.dispatcher import register_handler
 
 # USD modules -- may not be available in all Houdini configurations
@@ -37,6 +37,8 @@ def _focus_network_editor(node: hou.Node) -> None:
         parent = node.parent()
         if parent is not None:
             layout_if_enabled(parent)
+        if not focus_editor_enabled():
+            return  # the switch is off: placement only, the panes stay put
         for pane_tab in hou.ui.paneTabs():
             if pane_tab.type() == hou.paneTabType.NetworkEditor:
                 if parent is not None:

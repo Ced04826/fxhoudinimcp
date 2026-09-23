@@ -104,6 +104,141 @@ def _is_instance_parm(name: str, patterns: list[re.Pattern]) -> bool:
     return any(p.match(name) for p in patterns)
 
 
+def _multiparm_start(folder) -> int | None:
+    """The first instance number of a multiparm block, from its template.
+
+    Read off the folder's ``multistartoffset`` tag (the Add SOP's points start
+    at 0). When the tag is absent this returns 1, which is ASSUMED to be
+    Houdini's default start, not read from anything. A tag that is not an
+    integer gives None: unknown, rather than a guess.
+    """
+    tags: Any = None
+    with contextlib.suppress(Exception):
+        tags = folder.tags()
+    raw = tags.get("multistartoffset") if isinstance(tags, dict) else None
+    if raw is None:
+        return 1
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return None
+
+
+def _multiparm_blocks(node_type) -> tuple[list[dict[str, Any]], list[re.Pattern]]:
+    """(outermost multiparm blocks, nested count patterns) of a node type.
+
+    Each block has its ``count_parm`` (the folder's own name), its ``start``
+    and ``patterns`` matching every instance parm inside it, with the first
+    ``#`` -- this block's instance number -- captured. A block nested inside
+    another has a count parm that is itself an instance name (``num#``); those
+    are only returned as patterns, for ordering: which ``#`` of a nested name
+    is whose instance number is not checked here. Never raises; a type whose
+    templates cannot be read has no blocks.
+    """
+    blocks: list[dict[str, Any]] = []
+    nested: list[re.Pattern] = []
+
+    def pattern(name: str, capture: bool) -> re.Pattern:
+        body = re.escape(name)
+        if capture:
+            body = body.replace(r"\#", r"(\d+)", 1)
+        body = body.replace(r"\#", r"\d+")
+        return re.compile(rf"^{body}[xyzwrgba]?$")
+
+    def inside(folder) -> list[re.Pattern]:
+        found: list[re.Pattern] = []
+        for child in folder.parmTemplates():
+            if "#" in child.name():
+                found.append(pattern(child.name(), capture=True))
+            if child.type() == hou.parmTemplateType.Folder:
+                if child.folderType() in _MULTIPARM_FOLDERS and "#" in child.name():
+                    nested.append(pattern(child.name(), capture=False))
+                found += inside(child)
+        return found
+
+    def walk(templates) -> None:
+        for template in templates:
+            if template.type() != hou.parmTemplateType.Folder:
+                continue
+            if template.folderType() in _MULTIPARM_FOLDERS and "#" not in template.name():
+                blocks.append(
+                    {
+                        "count_parm": template.name(),
+                        "start": _multiparm_start(template),
+                        "patterns": inside(template),
+                    }
+                )
+            else:
+                walk(template.parmTemplates())
+
+    try:
+        walk(node_type.parmTemplateGroup().entries())
+    except Exception:  # noqa: BLE001 - no blocks known is the safe answer
+        return [], []
+    return blocks, nested
+
+
+def _count_parms_first(parms: dict, blocks: tuple) -> list[tuple[str, Any]]:
+    """*parms* in spec order, except that multiparm counts come first.
+
+    An instance parm (``pt3``) set before its count (``points``) does not exist
+    yet, so the write failed or went nowhere. Outer counts, then nested counts,
+    then everything else; spec order within each group.
+    """
+    outer, nested = blocks
+    counts = {block["count_parm"] for block in outer}
+
+    def rank(item: tuple) -> int:
+        if item[0] in counts:
+            return 0
+        return 1 if any(p.match(item[0]) for p in nested) else 2
+
+    return sorted(parms.items(), key=rank)
+
+
+def _count_value(value: Any) -> int | None:
+    """A multiparm count the spec sets, or None when it is not a plain number."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            value = int(value.strip())
+    return max(0, value) if isinstance(value, int) else None
+
+
+def _instance_range_errors(label: str, parms: dict, blocks: tuple) -> list[str]:
+    """Instance parms whose number is outside the count the same spec sets.
+
+    Only checked when the spec sets the block's count: without it, how many
+    instances the node will have is not known here.
+    """
+    errors: list[str] = []
+    for block in blocks[0]:
+        if block["count_parm"] not in parms or block["start"] is None:
+            continue
+        count = _count_value(parms[block["count_parm"]])
+        if count is None:
+            continue
+        start = block["start"]
+        for name in parms:
+            for candidate in block["patterns"]:
+                match = candidate.match(name)
+                if match is None:
+                    continue
+                number = int(match.group(1))
+                if not start <= number <= start + count - 1:
+                    valid = f"{start}..{start + count - 1}" if count else "none"
+                    errors.append(
+                        f"node {label}: parm '{name}' is instance {number} of multiparm "
+                        f"'{block['count_parm']}', which this spec sets to {count} "
+                        f"instance(s) starting at {start} (valid: {valid})"
+                    )
+                break
+    return errors
+
+
 def _is_dynamic_menu(probe: hou.Node, parm: hou.Parm) -> bool:
     """A menu whose items depend on state a fresh probe cannot have.
 
@@ -859,6 +994,16 @@ def build_network(
         cached = _TYPE_KNOWLEDGE.get(_type_cache_key(category, node_type))
         if cached is not None:
             parm_knowledge[type_name] = cached
+    # Multiparm blocks per type, read off the templates (no probe node): the
+    # build sets counts before instances, and validation checks instance
+    # numbers against the count the same spec sets.
+    multiparm_info: dict[str, tuple] = {}
+
+    def multiparms_of(type_name: str) -> tuple:
+        if type_name not in multiparm_info:
+            multiparm_info[type_name] = _multiparm_blocks(resolved_types[type_name])
+        return multiparm_info[type_name]
+
     # Connectors of a spec that names an input and sets parms, probed with
     # those parms applied (see _probe_connectors). Not cached: the parms
     # decide the answer.
@@ -882,7 +1027,9 @@ def build_network(
             for index in connector_probes:
                 spec = nodes[index]
                 spec_connectors[index] = _probe_connectors(
-                    parent, resolved_types[spec["type"]], spec["parms"]
+                    parent,
+                    resolved_types[spec["type"]],
+                    dict(_count_parms_first(spec["parms"], multiparms_of(spec["type"]))),
                 )
         finally:
             _restore_network_flags(before_probing)
@@ -937,6 +1084,8 @@ def build_network(
                 errors += check_parm_value(
                     label, str(spec.get("type")), parm_name, parm_value, info
                 )
+        if isinstance(spec.get("parms"), dict) and spec.get("type") in resolved_types:
+            errors += _instance_range_errors(label, spec["parms"], multiparms_of(spec["type"]))
         node_type = resolved_types.get(spec.get("type"))
         max_inputs = node_type.maxNumInputs() if node_type else 0
         # None when the type did not resolve: that error is already reported,
@@ -1007,7 +1156,11 @@ def build_network(
             created[spec.get("name") or node.name()] = node
 
         for spec, node, parsed in zip(nodes, built, parsed_inputs, strict=True):
-            for parm_name, value in (spec.get("parms") or {}).items():
+            spec_parms = spec.get("parms") or {}
+            ordered = (
+                _count_parms_first(spec_parms, multiparms_of(spec["type"])) if spec_parms else []
+            )
+            for parm_name, value in ordered:
                 try:
                     _apply_parm(node, parm_name, value)
                 except Exception as exc:
@@ -1176,6 +1329,11 @@ def build_network(
 
     display = parent.displayNode() if hasattr(parent, "displayNode") else None
     queried = inspected[0] if inspected else None
+    queried_geometry = queried.get("geometry") if queried else None
+    if queried_geometry is not None:
+        # Carried once, at the top level where callers read it; the queried
+        # node's own row points there instead of repeating it.
+        queried["geometry"] = "see top-level geometry"
 
     # How much of the build was actually checked. "cooked": true over an empty
     # target list was the worst kind of answer -- a confident one about
@@ -1227,7 +1385,7 @@ def build_network(
         "node_count": len(reports),
         "input_policy": input_policy,
         "queried_node": queried["path"] if queried else None,
-        "geometry": queried.get("geometry") if queried else None,
+        "geometry": queried_geometry,
         "inspected": inspected,
         "error_nodes": error_nodes,
         "cook_errors": cook_errors,
@@ -1476,6 +1634,9 @@ def get_node_card(
                             "count_parm": folder.name(),
                             "label": folder.label(),
                             "folder_type": folder.folderType().name(),
+                            # First instance number: pt0 or pt1. From the
+                            # multistartoffset tag; 1 when the tag is absent.
+                            "start_offset": _multiparm_start(folder),
                             "instance_parms": [
                                 child.name()
                                 for child in folder.parmTemplates()

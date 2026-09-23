@@ -30,6 +30,7 @@ _HANDLER_MODULES = [
     "viewport_capture_handlers",
     "geometry_handlers",
     "modeling_handlers",
+    "cook_handlers",
     "lops_handlers",
     "top_handlers",
     "cop_handlers",

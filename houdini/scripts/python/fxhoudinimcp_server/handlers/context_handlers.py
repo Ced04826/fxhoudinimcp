@@ -733,14 +733,27 @@ def _get_node_errors_detailed(
     import os as _os
 
     results: list[dict] = []
+    # A node whose errors() or warnings() raises was not read, so it is not
+    # error-free either: listed here rather than left out of the count.
+    unreadable: list[dict] = []
 
     def _analyze_node(node: hou.Node) -> None:
         errors = []
         warnings = []
-        with contextlib.suppress(Exception):
+        failures = []
+        try:
             errors = list(node.errors())
-        with contextlib.suppress(Exception):
+        except Exception as exc:  # noqa: BLE001 - reported below, not swallowed
+            failures.append(f"errors(): {type(exc).__name__}: {exc}")
+        try:
             warnings = list(node.warnings())
+        except Exception as exc:  # noqa: BLE001 - reported below, not swallowed
+            failures.append(f"warnings(): {type(exc).__name__}: {exc}")
+        if failures:
+            path = "<unknown>"
+            with contextlib.suppress(Exception):
+                path = node.path()
+            unreadable.append({"path": path, "error": "; ".join(failures)})
 
         if not errors and not warnings:
             return
@@ -797,6 +810,8 @@ def _get_node_errors_detailed(
         "scanned_path": node_path or root_path,
         "error_node_count": len(results),
         "details": results,
+        "unreadable_nodes": unreadable,
+        "unreadable_count": len(unreadable),
     }
 
 

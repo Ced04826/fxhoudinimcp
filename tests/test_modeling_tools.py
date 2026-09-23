@@ -52,9 +52,11 @@ from fxhoudinimcp_server.handlers.modeling_handlers import (  # noqa: E402
     find_poles,
     folded_quads,
     geometry_fingerprint,
+    nonfinite_points,
     position_report,
     provenance_report,
     quad_fold_flags,
+    read_numeric_attribute,
     replace_comment_line,
     topology_report,
     valence_map,
@@ -368,6 +370,162 @@ class TestGeoDocumentParsing:
         parsed = extract_faces(document, with_vertices=True)
         assert parsed["faces"] == [(0, [7, 5, 6])]
         assert parsed["face_vertices"] == [[2, 0, 1]]
+
+
+class TestGeoDocumentAttributes:
+    """Attribute values read from the document the corners came from.
+
+    The three storage forms follow Houdini's own reader, hgeo.py; the paged
+    examples are written out by hand from its layout rather than produced by an
+    encoder, so a decoder and an encoder cannot agree on the same mistake.
+    """
+
+    def _document(self, owner_key, values_block, vertexcount=0, pointcount=0, name="uv"):
+        entry = [
+            ["scope", "public", "type", "numeric", "name", name, "options", {}],
+            ["size", values_block[1], "storage", "fpreal32", "values", values_block],
+        ]
+        return [
+            "pointcount",
+            pointcount,
+            "vertexcount",
+            vertexcount,
+            "primitivecount",
+            0,
+            "attributes",
+            [owner_key, [entry]],
+        ]
+
+    def test_tuples(self):
+        document = self._document(
+            "vertexattributes",
+            ["size", 3, "storage", "fpreal32", "tuples", [[0, 1, 0], [2, 3, 0]]],
+            vertexcount=2,
+        )
+        assert read_numeric_attribute(document, "vertex", "uv") == (3, [0, 1, 0, 2, 3, 0])
+
+    def test_one_array_per_component(self):
+        document = self._document(
+            "vertexattributes",
+            ["size", 2, "storage", "fpreal32", "arrays", [[0, 2, 4], [1, 3, 5]]],
+            vertexcount=3,
+        )
+        assert read_numeric_attribute(document, "vertex", "uv") == (2, [0, 1, 2, 3, 4, 5])
+
+    def test_paged_with_a_constant_page_in_the_middle(self):
+        """Five elements in pages of two; page 1 is one tuple shared by two."""
+        block = [
+            "size",
+            3,
+            "storage",
+            "fpreal32",
+            "packing",
+            [3],
+            "pagesize",
+            2,
+            "constantpageflags",
+            [[False, True, False]],
+            "rawpagedata",
+            [0, 0, 0, 1, 1, 1, 7, 8, 9, 4, 4, 4],
+        ]
+        document = self._document("vertexattributes", block, vertexcount=5)
+        size, flat = read_numeric_attribute(document, "vertex", "uv")
+        assert size == 3
+        assert [flat[i : i + 3] for i in range(0, 15, 3)] == [
+            [0, 0, 0],
+            [1, 1, 1],
+            [7, 8, 9],
+            [7, 8, 9],
+            [4, 4, 4],
+        ]
+
+    def test_paged_subvectors_are_stored_one_after_the_other(self):
+        """Packing [1, 2]: on page 0 the first component is constant, the rest vary;
+        page 1 is a short last page where both vary."""
+        block = [
+            "size",
+            3,
+            "storage",
+            "fpreal32",
+            "packing",
+            [1, 2],
+            "pagesize",
+            2,
+            "constantpageflags",
+            [[True, False], []],
+            "rawpagedata",
+            [9, 10, 11, 20, 21, 5, 30, 31],
+        ]
+        document = self._document("vertexattributes", block, vertexcount=3)
+        assert read_numeric_attribute(document, "vertex", "uv") == (
+            3,
+            [9, 10, 11, 9, 20, 21, 5, 30, 31],
+        )
+
+    def test_paged_without_constant_flags_or_packing(self):
+        block = ["size", 2, "storage", "fpreal32", "pagesize", 2, "rawpagedata", [0, 1, 2, 3, 4, 5]]
+        document = self._document("vertexattributes", block, vertexcount=3)
+        assert read_numeric_attribute(document, "vertex", "uv") == (2, [0, 1, 2, 3, 4, 5])
+
+    def test_point_attributes_are_sized_by_the_point_count(self):
+        document = self._document(
+            "pointattributes",
+            ["size", 3, "storage", "fpreal32", "tuples", [[0, 0, 0], [1, 0, 0]]],
+            pointcount=2,
+            name="P",
+        )
+        assert read_numeric_attribute(document, "point", "P") == (3, [0, 0, 0, 1, 0, 0])
+        assert read_numeric_attribute(document, "vertex", "P") is None
+
+    def test_an_absent_attribute_is_none(self):
+        document = self._document(
+            "vertexattributes",
+            ["size", 2, "storage", "fpreal32", "tuples", [[0, 1]]],
+            vertexcount=1,
+        )
+        assert read_numeric_attribute(document, "vertex", "uv2") is None
+        assert read_numeric_attribute(["pointcount", 0], "vertex", "uv") is None
+
+    def test_values_that_do_not_cover_every_element_are_refused(self):
+        document = self._document(
+            "vertexattributes",
+            ["size", 2, "storage", "fpreal32", "tuples", [[0, 1]]],
+            vertexcount=2,
+        )
+        with pytest.raises(ValueError, match="2 numbers for 2 elements"):
+            read_numeric_attribute(document, "vertex", "uv")
+
+    def test_paged_data_that_does_not_add_up_is_refused(self):
+        block = ["size", 2, "storage", "fpreal32", "pagesize", 2, "rawpagedata", [0, 1, 2]]
+        document = self._document("vertexattributes", block, vertexcount=2)
+        with pytest.raises(ValueError, match="ends before its last page"):
+            read_numeric_attribute(document, "vertex", "uv")
+        extra = ["size", 2, "storage", "fpreal32", "pagesize", 2, "rawpagedata", [0, 1, 2, 3, 4]]
+        with pytest.raises(ValueError, match="pages account for 4"):
+            read_numeric_attribute(
+                self._document("vertexattributes", extra, vertexcount=2), "vertex", "uv"
+            )
+
+    def test_an_unknown_storage_is_refused(self):
+        document = self._document(
+            "vertexattributes", ["size", 2, "storage", "fpreal32", "blob", []], vertexcount=1
+        )
+        with pytest.raises(ValueError, match="no 'tuples', 'arrays' or 'rawpagedata'"):
+            read_numeric_attribute(document, "vertex", "uv")
+
+
+class TestNonFinitePoints:
+    def test_a_clean_list_has_none(self):
+        assert nonfinite_points([0.0, 1.0, 2.0, 3.0, 4.0, 5.0]) == []
+
+    def test_nan_and_both_infinities_are_named_by_point(self):
+        nan, inf = float("nan"), float("inf")
+        flat = [0.0, 0.0, 0.0, nan, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, -inf, 0.0, 0.0, 0.0, inf]
+        assert nonfinite_points(flat) == [1, 3, 4]
+
+    def test_a_sum_that_overflows_is_not_a_bad_point(self):
+        """The fast screen overflows on huge finite values; the walk clears them."""
+        assert nonfinite_points([1e308, 1e308, 1e308, 1e308, 0.0, 0.0]) == []
 
 
 ###### The MCP wrapper
@@ -995,6 +1153,7 @@ class TestGetUVReportTool:
                 "node_path": "/obj/geo1/uvlayout1",
                 "uv_attribute": "uv",
                 "allow_stacking": False,
+                "check_overlaps": True,
                 "max_list": 20,
             },
         )
@@ -1014,12 +1173,14 @@ class TestGetUVReportTool:
             stretch_threshold=1.5,
             max_list=5,
             dump_path="/tmp/uv.json",
+            check_overlaps=False,
         )
         _command, params = mock_bridge.execute.call_args.args
         assert params == {
             "node_path": "/obj/geo1/uvlayout1",
             "uv_attribute": "uv2",
             "allow_stacking": True,
+            "check_overlaps": False,
             "max_list": 5,
             "group": "shell",
             "overlap_area_tolerance": 1e-10,
@@ -1054,8 +1215,10 @@ class TestGetUVReportTool:
             "stretch_threshold",
             "max_list",
             "dump_path",
+            "check_overlaps",
         }
         assert properties["allow_stacking"]["type"] == "boolean"
+        assert properties["check_overlaps"]["type"] == "boolean"
         # Optional arguments arrive as anyOf[type, null]; the type still has to
         # be there, or a client will send a string where a pixel count belongs.
         optional = {

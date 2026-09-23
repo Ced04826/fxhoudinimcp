@@ -17,6 +17,7 @@ what the live probe is for.
 from __future__ import annotations
 
 # Built-in
+import array
 import json
 import math
 import os
@@ -167,6 +168,61 @@ class StubMatrix:
         return hash(self.translate)
 
 
+def _raw_pages(rows, size, pagesize=2):
+    """Encode rows the paged way: subvectors [1, size - 1], constant pages folded.
+
+    A page of two is small enough that every fixture spans several pages and
+    ends on a short one, which is where a decoder goes wrong.
+    """
+    packing = [1, size - 1] if size > 1 else [1]
+    starts = [0, 1]
+    raw, flags = [], [[] for _ in packing]
+    for first in range(0, len(rows), pagesize):
+        page = rows[first : first + pagesize]
+        for sub, width in enumerate(packing):
+            parts = [row[starts[sub] : starts[sub] + width] for row in page]
+            constant = all(part == parts[0] for part in parts)
+            flags[sub].append(constant)
+            for part in parts[:1] if constant else parts:
+                raw.extend(part)
+    return [
+        "packing",
+        packing,
+        "pagesize",
+        pagesize,
+        "constantpageflags",
+        flags,
+        "rawpagedata",
+        raw,
+    ]
+
+
+def _attribute_entry(name, elements, storage, size=None):
+    """One ``[definition, data]`` attribute entry as a .geo file carries it."""
+    size = size or (len(elements[0]) if elements else 2)
+    rows = [[float(value) for value in element] for element in elements]
+    if storage == "tuples":
+        block = ["tuples", rows]
+    elif storage == "arrays":
+        block = ["arrays", [[row[component] for row in rows] for component in range(size)]]
+    else:
+        assert storage == "rawpagedata", storage
+        block = _raw_pages(rows, size)
+    return [
+        ["scope", "public", "type", "numeric", "name", name, "options", {}],
+        [
+            "size",
+            size,
+            "storage",
+            "fpreal32",
+            "defaults",
+            ["size", 1, "storage", "fpreal64", "values", [0]],
+            "values",
+            ["size", size, "storage", "fpreal32", *block],
+        ],
+    ]
+
+
 class StubGeometry:
     """Points, polygons, one optional UV attribute, one prim int attribute.
 
@@ -174,10 +230,24 @@ class StubGeometry:
     handlers' own parser reads this back: the round trip is part of what is
     being tested. Anything the handlers do not call is simply absent, so a
     wrong call raises instead of returning a mock that looks like an answer.
+
+    ``vertex_uv`` holds one UV per corner, face by face -- the order the file
+    lists them in. ``memory_order`` says which of those corners each in-memory
+    vertex slot holds, which is the order HOM's ``vertexFloatAttribValues``
+    returns. They differ after a Reverse, a Mirror, or a deletion whose freed
+    slots a later face reused; None means they agree, as on an untouched mesh.
     """
 
     def __init__(
-        self, points=(), faces=(), vertex_uv=None, point_uv=None, prim_groups=None, curves=()
+        self,
+        points=(),
+        faces=(),
+        vertex_uv=None,
+        point_uv=None,
+        prim_groups=None,
+        curves=(),
+        memory_order=None,
+        storage="tuples",
     ):
         self.points_list = [list(map(float, p)) for p in points]
         self.faces = [list(face) for face in faces]
@@ -186,6 +256,9 @@ class StubGeometry:
         self.curves = [list(curve) for curve in curves]
         self.vertex_uv = list(vertex_uv) if vertex_uv else None
         self.point_uv = list(point_uv) if point_uv else None
+        self.memory_order = list(memory_order) if memory_order is not None else None
+        # How saveToFile stores attribute values: "tuples", "arrays" or "rawpagedata".
+        self.storage = storage
         self.groups = dict(prim_groups or {})
         self.prim_attribs: dict[str, list[int]] = {}
         self.point_float_attribs: dict[str, list[float]] = {}
@@ -200,10 +273,36 @@ class StubGeometry:
 
     ###### Reading
 
+    def slot_order(self):
+        """The file corner held by each in-memory vertex slot."""
+        if self.memory_order is not None:
+            return list(self.memory_order)
+        return list(range(sum(len(face) for face in self.faces)))
+
     def saveToFile(self, path):
         indices = [point for face in self.faces for point in face]
         curve_start = len(indices)
         indices += [point for curve in self.curves for point in curve]
+
+        # Values in file order, as Houdini writes them: vertex attributes by
+        # the file's vertex numbers, which run face by face.
+        attributes = [
+            "pointattributes",
+            [_attribute_entry("P", self.points_list, self.storage, size=3)]
+            + (
+                [_attribute_entry("uv", self.point_uv, self.storage)]
+                if self.point_uv is not None
+                else []
+            ),
+        ]
+        if self.vertex_uv is not None:
+            size = len(self.vertex_uv[0]) if self.vertex_uv else 2
+            corners = list(self.vertex_uv) + [(0.0,) * size] * (len(indices) - curve_start)
+            attributes = [
+                "vertexattributes",
+                [_attribute_entry("uv", corners, self.storage, size=size)],
+                *attributes,
+            ]
         primitives = [
             [
                 ["type", "Polygon_run"],
@@ -242,6 +341,8 @@ class StubGeometry:
             len(self.faces) + len(self.curves),
             "topology",
             ["pointref", ["indices", indices]],
+            "attributes",
+            attributes,
             "primitives",
             primitives,
         ]
@@ -270,9 +371,16 @@ class StubGeometry:
             return list(self.point_int_attribs[name])
         raise AssertionError(f"unexpected point attribute read: {name}")
 
+    def pointFloatAttribValuesAsString(self, name):
+        return array.array("f", self.pointFloatAttribValues(name)).tobytes()
+
     def vertexFloatAttribValues(self, name):
+        """In memory order, like HOM -- not the order the file lists corners in."""
         assert name == "uv" and self.vertex_uv is not None
-        return [value for uv in self.vertex_uv for value in uv]
+        return [value for corner in self.slot_order() for value in self.vertex_uv[corner]]
+
+    def vertexFloatAttribValuesAsString(self, name):
+        return array.array("f", self.vertexFloatAttribValues(name)).tobytes()
 
     def primIntAttribValues(self, name):
         return list(self.prim_attribs.get(name, []))
@@ -290,6 +398,9 @@ class StubGeometry:
         if name in self.point_int_attribs:
             return StubAttrib(name, 1, INT)
         return None
+
+    def findPrimAttrib(self, name):
+        return StubAttrib(name, 1, INT) if name in self.prim_attribs else None
 
     def vertexAttribs(self):
         return [StubAttrib("uv", 2, FLOAT)] if self.vertex_uv else []
@@ -316,6 +427,10 @@ class StubGeometry:
 
     def merge(self, other):
         self.dirty = True
+        if self.memory_order is not None or other.memory_order is not None:
+            base = sum(len(face) for face in self.faces)
+            self.memory_order = self.slot_order() + [base + s for s in other.slot_order()]
+        self.storage = other.storage
         offset = len(self.points_list)
         self.points_list.extend([list(p) for p in other.points_list])
         self.faces.extend([[p + offset for p in face] for face in other.faces])
@@ -354,6 +469,13 @@ class StubGeometry:
                 for index in keep
                 for corner in range(len(self.faces[index]))
             ]
+        if self.memory_order is not None:
+            # The surviving corners keep their slots' relative order.
+            renumbered = {}
+            for index in keep:
+                for corner in range(len(self.faces[index])):
+                    renumbered[vertex_start[index] + corner] = len(renumbered)
+            self.memory_order = [renumbered[c] for c in self.memory_order if c in renumbered]
         for name, values in self.prim_attribs.items():
             self.prim_attribs[name] = [values[index] for index in keep]
         self.faces = [self.faces[index] for index in keep]
@@ -416,6 +538,13 @@ class StubVerb:
     corner's UV, which is the contract the handlers rely on. A face with fewer
     than three corners, or one marked degenerate by the fixture, produces no
     triangles -- the case the handlers have to report rather than hide.
+
+    The triangles' corners sit in memory in the order of the source slots they
+    came from: face by face in the order the faces' first slots come, and
+    within a triangle by source slot. An untouched input therefore gives an
+    output whose memory order is its file order; a reversed face gives
+    triangles whose second and third corners are swapped in memory -- the
+    pattern observed live on a Mirror SOP's output (S4, prim 2684).
     """
 
     def __init__(self):
@@ -437,25 +566,28 @@ class StubVerb:
         dest.vertex_uv = [] if source.vertex_uv is not None else None
         dest.point_uv = list(source.point_uv) if source.point_uv is not None else None
         dest.prim_attribs = {name: [] for name in source.prim_attribs}
+        dest.storage = source.storage
 
+        slot_of = {corner: slot for slot, corner in enumerate(source.slot_order())}
+        placement = []
         start = 0
         for index, face in enumerate(source.faces):
             corners = list(range(start, start + len(face)))
             start += len(face)
             if len(face) < 3 or index in source.drop_prims:
                 continue
+            first_slot = min(slot_of[corner] for corner in corners)
             for corner in range(1, len(face) - 1):
+                triangle = [corners[0], corners[corner], corners[corner + 1]]
+                for source_corner in triangle:
+                    placement.append((first_slot, corner, slot_of[source_corner], len(placement)))
                 dest.faces.append([face[0], face[corner], face[corner + 1]])
                 if dest.vertex_uv is not None:
-                    dest.vertex_uv.extend(
-                        [
-                            source.vertex_uv[corners[0]],
-                            source.vertex_uv[corners[corner]],
-                            source.vertex_uv[corners[corner + 1]],
-                        ]
-                    )
+                    dest.vertex_uv.extend(source.vertex_uv[c] for c in triangle)
                 for name, values in source.prim_attribs.items():
                     dest.prim_attribs[name].append(values[index])
+        order = [key[-1] for key in sorted(placement)]
+        dest.memory_order = None if order == list(range(len(order))) else order
 
 
 class StubMenuTemplate:
@@ -673,6 +805,55 @@ SIDE_BY_SIDE_UV = [
 
 def two_quads(**kwargs):
     return StubGeometry(TWO_QUADS_POINTS, TWO_QUADS_FACES, **kwargs)
+
+
+# Face 1 reversed in place: the prim lists its vertices backwards while they
+# keep their slots, so memory holds its corners as file corners 4, 7, 6, 5.
+REVERSED_FACE_1 = [0, 1, 2, 3, 4, 7, 6, 5]
+
+# A Mirror SOP's output: face 0, and its copy across x = 1 with the copy's
+# vertex order reversed to keep the normal. The copy carries the original's
+# UVs, so in UV it lies on face 0 with the opposite winding; in memory its
+# corners sit in the order they were copied, which is REVERSED_FACE_1.
+MIRROR_FACES = [[0, 1, 2, 3], [4, 5, 2, 1]]
+MIRROR_UV = [
+    (0.0, 0.0),
+    (1.0, 0.0),
+    (1.0, 1.0),
+    (0.0, 1.0),
+    (0.0, 0.0),
+    (0.0, 1.0),
+    (1.0, 1.0),
+    (1.0, 0.0),
+]
+
+#   A strip of three unit quads, mapped side by side into thirds of the tile.
+#
+#   3 - 2 - 5 - 7
+#   |   |   |   |
+#   0 - 1 - 4 - 6
+STRIP_POINTS = [
+    [0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [0.0, 0.0, 1.0],
+    [2.0, 0.0, 0.0],
+    [2.0, 0.0, 1.0],
+    [3.0, 0.0, 0.0],
+    [3.0, 0.0, 1.0],
+]
+STRIP_FACES = [[0, 1, 2, 3], [1, 4, 5, 2], [4, 6, 7, 5]]
+STRIP_UV = [
+    (column / 3.0 + du / 3.0, dv)
+    for column in range(3)
+    for du, dv in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+]
+# A face was deleted and the last face took over its slots: face 2's corners
+# come first in memory, then face 0's, then face 1's.
+STRIP_REUSED_SLOTS = [8, 9, 10, 11, 0, 1, 2, 3, 4, 5, 6, 7]
+
+# Everything in a UV receipt that describes the layout rather than the call.
+UV_MEASURES = ("counts", "winding", "overlaps", "area", "density", "anisotropy")
 
 
 ###### get_uv_report
@@ -894,6 +1075,166 @@ class TestUVReportGlue:
         # which is what a cut looks like.
         assert payload["island_per_triangle"] == [0, 0, 1, 1]
 
+    ###### Corners and UVs from one numbering
+    #
+    # The S4 defect: corners came from the .geo file, UVs from HOM's memory
+    # order, and after a Reverse, a Mirror or a deletion the two part company
+    # -- swapped corners, invented islands, stretch in the hundreds.
+
+    @staticmethod
+    def _memory_differs_from_file(geometry):
+        """Guard the guard: the stub's triangles really are out of file order,
+        so reading HOM's values against file corners would get them wrong."""
+        verb = StubVerb()
+        verb.setParms({"convex": 1, "numsides": 3})
+        triangulated = StubGeometry()
+        verb.execute(triangulated, [geometry])
+        in_file_order = [value for uv in triangulated.vertex_uv for value in uv]
+        return triangulated.vertexFloatAttribValues("uv") != in_file_order
+
+    def test_a_reversed_face_measures_the_same_as_an_untouched_one(self, houdini):
+        plain = mh._get_uv_report(
+            node_path=houdini("/obj/geo1/plain", two_quads(vertex_uv=SIDE_BY_SIDE_UV))
+        )
+        reversed_face = two_quads(vertex_uv=SIDE_BY_SIDE_UV, memory_order=REVERSED_FACE_1)
+        assert self._memory_differs_from_file(reversed_face)
+
+        report = mh._get_uv_report(node_path=houdini("/obj/geo1/reversed", reversed_face))
+        assert report["counts"] == {"faces": 2, "uv_triangles": 4, "islands": 1}
+        assert report["winding"]["mirrored_triangles"] == 0
+        assert report["anisotropy"]["max"] == approx(2.0, 1e-6)
+        for key in UV_MEASURES:
+            assert report[key] == plain[key], key
+
+    def test_a_reversed_face_in_a_group_keeps_its_corners(self, houdini):
+        """Scoping deletes faces from the copy first, which renumbers what is left."""
+        reversed_face = two_quads(vertex_uv=SIDE_BY_SIDE_UV, memory_order=REVERSED_FACE_1)
+        reversed_face.groups["right"] = [1]
+        report = mh._get_uv_report(node_path=houdini("/obj/geo1/uv", reversed_face), group="right")
+        assert report["counts"] == {"faces": 1, "uv_triangles": 2, "islands": 1}
+        assert report["winding"]["mirrored_triangles"] == 0
+        assert report["area"]["uv_area"] == approx(0.5)
+        assert report["anisotropy"]["max"] == approx(2.0, 1e-6)
+
+    @pytest.mark.parametrize("storage", ["tuples", "arrays", "rawpagedata"])
+    def test_a_mirrored_copy_is_read_through_its_own_corners(self, houdini, storage):
+        mirrored = StubGeometry(
+            TWO_QUADS_POINTS,
+            MIRROR_FACES,
+            vertex_uv=MIRROR_UV,
+            memory_order=REVERSED_FACE_1,
+            storage=storage,
+        )
+        assert self._memory_differs_from_file(mirrored)
+        report = mh._get_uv_report(node_path=houdini("/obj/geo1/mirror", mirrored))
+
+        # One island folded onto itself: the copy joins face 0 along the
+        # mirror edge, lies on it in UV, and runs the other way round.
+        assert report["counts"] == {"faces": 2, "uv_triangles": 4, "islands": 1}
+        assert report["winding"]["mirrored_triangles"] == 2
+        assert report["overlaps"]["stacked_pairs"] == 2
+        assert report["anisotropy"]["max"] == approx(1.0, 1e-6)
+        assert report["density"]["ratio_max"] == approx(1.0, 1e-6)
+
+        in_file_order = StubGeometry(TWO_QUADS_POINTS, MIRROR_FACES, vertex_uv=MIRROR_UV)
+        baseline = mh._get_uv_report(node_path=houdini("/obj/geo1/plain", in_file_order))
+        for key in UV_MEASURES:
+            assert report[key] == baseline[key], key
+
+    def test_faces_in_reused_slots_keep_their_own_uvs(self, houdini):
+        """After a deletion, memory order is not even face order."""
+        strip = StubGeometry(
+            STRIP_POINTS, STRIP_FACES, vertex_uv=STRIP_UV, memory_order=STRIP_REUSED_SLOTS
+        )
+        assert self._memory_differs_from_file(strip)
+        report = mh._get_uv_report(node_path=houdini("/obj/geo1/strip", strip))
+        assert report["counts"] == {"faces": 3, "uv_triangles": 6, "islands": 1}
+        assert report["winding"]["mirrored_triangles"] == 0
+        assert report["overlaps"]["pairs"] == 0
+        assert report["area"]["uv_area"] == approx(1.0)
+        # A unit quad in a third of the tile's width: three times denser in U.
+        assert report["anisotropy"]["max"] == approx(3.0, 1e-6)
+
+    def test_a_point_uv_is_unaffected_by_vertex_order(self, houdini):
+        point_uv = [(p[0] / 2.0, p[2]) for p in TWO_QUADS_POINTS]
+        geometry = two_quads(point_uv=point_uv, memory_order=REVERSED_FACE_1)
+        report = mh._get_uv_report(node_path=houdini("/obj/geo1/uv", geometry))
+        assert report["uv"]["owner"] == "point"
+        assert report["counts"]["islands"] == 1
+        assert report["anisotropy"]["max"] == approx(2.0, 1e-6)
+
+    ###### Skipping the overlap pass
+
+    def test_overlaps_can_be_skipped_and_say_so(self, houdini, tmp_path):
+        stacked = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] * 2
+        path = houdini("/obj/geo1/uv", two_quads(vertex_uv=stacked))
+        checked = mh._get_uv_report(node_path=path)
+        target = tmp_path / "uv.json"
+        skipped = mh._get_uv_report(node_path=path, check_overlaps=False, dump_path=str(target))
+
+        assert checked["overlaps"]["checked"] is True
+        assert checked["overlaps"]["pairs"] == 2
+        # Not a zero: nothing in the block can be read as "no overlaps".
+        assert skipped["overlaps"] == {
+            "checked": False,
+            "status": "not_checked",
+            "reason": "check_overlaps=False",
+        }
+        for key in ("counts", "winding", "area", "density", "anisotropy"):
+            assert skipped[key] == checked[key], key
+
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        assert "overlapping_pairs" not in payload
+        assert "stacked_pairs" not in payload
+
+    def test_an_overlap_pass_over_budget_is_not_checked_either(self, houdini, monkeypatch):
+        monkeypatch.setattr(mh, "UV_MAX_TRIANGLES", 1)
+        path = houdini("/obj/geo1/uv", two_quads(vertex_uv=SIDE_BY_SIDE_UV))
+        overlaps = mh._get_uv_report(node_path=path)["overlaps"]
+        assert overlaps["checked"] is False
+        assert overlaps["status"] == "skipped"
+        assert "pairs" not in overlaps
+
+    def test_check_overlaps_must_be_a_boolean(self, houdini):
+        path = houdini("/obj/geo1/uv", two_quads(vertex_uv=SIDE_BY_SIDE_UV))
+        with pytest.raises(ValueError, match="check_overlaps must be true or false"):
+            mh._get_uv_report(node_path=path, check_overlaps="no")
+
+    ###### What was measured
+
+    def test_the_fingerprint_names_the_geometry_and_its_layout(self, houdini):
+        report = mh._get_uv_report(
+            node_path=houdini("/obj/geo1/uv", two_quads(vertex_uv=SIDE_BY_SIDE_UV))
+        )
+        flat = array.array("f", [value for point in TWO_QUADS_POINTS for value in point])
+        fingerprint = report["fingerprint"]
+        # The same stamp edit_points leaves on its node for the same input.
+        assert fingerprint["geometry"] == mh.geometry_fingerprint(6, flat.tobytes())
+        assert fingerprint["prims"] == 2
+        assert len(fingerprint["uv"]) == 8
+
+        repacked = list(SIDE_BY_SIDE_UV)
+        repacked[0] = (0.01, 0.0)
+        other = mh._get_uv_report(
+            node_path=houdini("/obj/geo1/repacked", two_quads(vertex_uv=repacked))
+        )["fingerprint"]
+        assert other["geometry"] == fingerprint["geometry"]
+        assert other["uv"] != fingerprint["uv"]
+
+        moved = StubGeometry(
+            [[p[0], p[1] + 0.5, p[2]] for p in TWO_QUADS_POINTS],
+            TWO_QUADS_FACES,
+            vertex_uv=SIDE_BY_SIDE_UV,
+        )
+        moved_print = mh._get_uv_report(node_path=houdini("/obj/geo1/moved", moved))["fingerprint"]
+        assert moved_print["geometry"] != fingerprint["geometry"]
+        assert moved_print["uv"] == fingerprint["uv"]
+
+    def test_a_point_uv_is_fingerprinted_too(self, houdini):
+        point_uv = [(p[0] / 2.0, p[2]) for p in TWO_QUADS_POINTS]
+        report = mh._get_uv_report(node_path=houdini("/obj/geo1/uv", two_quads(point_uv=point_uv)))
+        assert len(report["fingerprint"]["uv"]) == 8
+
 
 ###### compare_surfaces
 
@@ -1055,7 +1396,7 @@ class TestCompareSurfacesGlue:
         broken = StubGeometry([[float("nan"), 0.0, 0.0], *TWO_QUADS_POINTS[1:]], TWO_QUADS_FACES)
         a = houdini("/obj/geo1/a", two_quads())
         b = houdini("/obj/geo1/b", broken)
-        with pytest.raises(OperationFailed, match="not a finite number"):
+        with pytest.raises(OperationFailed, match=r"b \(b\): 1 point has non-finite positions"):
             mh._compare_surfaces(a=a, b=b)
 
     def test_a_surface_with_no_area_is_refused(self, houdini):
@@ -1258,3 +1599,176 @@ class TestMeshReportQualityGlue:
             mh._get_mesh_report(node_path=path, thresholds={"nope": 1})
         with pytest.raises(ValueError, match="schema_version"):
             mh._get_mesh_report(node_path=path, schema_version=99)
+
+
+###### get_mesh_report: the receipt and its dump
+
+#   The 3x3 sheet with its lower-left quad split along 0-4, which leaves point
+#   4 an interior pole of valence 5; two flaps on edge 0-1 (three faces on one
+#   edge); a bow tie; and a triangle with its corners on one line.
+DEFECT_POINTS = [
+    [0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [2.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [1.0, 0.0, 1.0],
+    [2.0, 0.0, 1.0],
+    [0.0, 0.0, 2.0],
+    [1.0, 0.0, 2.0],
+    [2.0, 0.0, 2.0],
+    [0.0, 1.0, 0.0],
+    [0.0, -1.0, 0.0],
+    [5.0, 0.0, 0.0],
+    [6.0, 0.0, 0.0],
+    [6.0, 0.0, 1.0],
+    [5.0, 0.0, 1.0],
+    [8.0, 0.0, 0.0],
+    [9.0, 0.0, 0.0],
+    [10.0, 0.0, 0.0],
+]
+DEFECT_FACES = [
+    [0, 1, 4],
+    [0, 4, 3],
+    [1, 2, 5, 4],
+    [3, 4, 7, 6],
+    [4, 5, 8, 7],
+    [0, 1, 9],
+    [0, 1, 10],
+    [11, 12, 14, 13],
+    [15, 16, 17],
+]
+
+# About the call, not the geometry, and added after the dump is written.
+RECEIPT_ONLY = {"dump", "dump_error", "elapsed_ms"}
+
+
+def _missing_from(receipt, dump, where=""):
+    """Receipt key paths the dump lacks, or holds as a different type or a shorter list."""
+    missing = []
+    for key, value in receipt.items():
+        path = f"{where}.{key}" if where else key
+        if not where and key in RECEIPT_ONLY:
+            continue
+        if key not in dump:
+            missing.append(path)
+        elif type(dump[key]) is not type(value):
+            missing.append(f"{path} ({type(value).__name__} -> {type(dump[key]).__name__})")
+        elif isinstance(value, dict):
+            missing += _missing_from(value, dump[key], path)
+        elif isinstance(value, list) and len(dump[key]) < len(value):
+            missing.append(f"{path} (shorter)")
+    return missing
+
+
+class TestMeshReportDump:
+    def _report(self, houdini, tmp_path, **kwargs):
+        path = houdini("/obj/geo1/a", StubGeometry(DEFECT_POINTS, DEFECT_FACES))
+        target = tmp_path / "mesh.json"
+        report = mh._get_mesh_report(node_path=path, dump_path=str(target), **kwargs)
+        return report, json.loads(target.read_text(encoding="utf-8"))
+
+    def test_the_fixture_has_something_in_every_section(self, houdini, tmp_path):
+        report, _dump = self._report(houdini, tmp_path)
+        assert report["poles"]["count"] == 1
+        assert report["nonmanifold_edges"]["count"] == 1
+        # The collinear triangle, and the bow tie: its two lobes cancel to no area.
+        assert report["degenerate"]["count"] == 2
+        assert report["folded_quads"]["count"] == 1
+        assert report["pieces"]["count"] == 3
+
+    def test_every_receipt_key_is_in_the_dump(self, houdini, tmp_path):
+        report, dump = self._report(
+            houdini, tmp_path, max_list=1, quality_checks=["corner_angle", "triangulation"]
+        )
+        assert _missing_from(report, dump) == []
+
+    def test_the_dump_uncuts_what_the_receipt_cuts(self, houdini, tmp_path):
+        report, dump = self._report(houdini, tmp_path, max_list=1)
+        assert len(report["boundary"]["loop_sizes"]) == 1
+        assert dump["boundary"]["loop_sizes"] == sorted(
+            dump["boundary"]["loop_sizes"], reverse=True
+        )
+        assert len(dump["boundary"]["loop_sizes"]) == report["boundary"]["loops"]
+        assert len(dump["pieces"]["largest"]) == report["pieces"]["count"]
+
+    def test_poles_are_counts_in_the_receipt_and_points_in_the_dump(self, houdini, tmp_path):
+        report, dump = self._report(houdini, tmp_path, max_list=1000)
+        assert report["poles"] == {"count": 1, "by_valence": {"5": 1}}
+        assert dump["poles"]["count"] == 1
+        assert dump["poles"]["by_valence"] == {"5": 1}
+        assert dump["poles"]["points"] == [{"point": 4, "valence": 5, "P": [1.0, 0.0, 1.0]}]
+
+    def test_folded_quads_keep_the_receipt_shape_and_add_the_diagonals(self, houdini, tmp_path):
+        report, dump = self._report(houdini, tmp_path)
+        folded = dump["folded_quads"]
+        for key in ("count", "prims", "diag02", "diag13"):
+            assert folded[key] == report["folded_quads"][key], key
+        assert folded["prims"] == [7]
+        per_diagonal = set(folded.get("diag02_prims", [])) | set(folded.get("diag13_prims", []))
+        assert per_diagonal == {7}
+        assert len(folded.get("diag02_prims", [])) == folded["diag02"]
+        assert len(folded.get("diag13_prims", [])) == folded["diag13"]
+
+    def test_the_receipt_lists_nothing_at_max_list_zero_but_the_dump_does(self, houdini, tmp_path):
+        report, dump = self._report(houdini, tmp_path, max_list=0)
+        assert "prims" not in report["degenerate"]
+        assert "edges" not in report["nonmanifold_edges"]
+        assert dump["degenerate"]["prims"] == [7, 8]
+        assert dump["nonmanifold_edges"]["edges"] == [[0, 1]]
+
+
+###### Non-finite positions, before the .geo round trip
+
+
+def _with_bad_points(count):
+    """Two quads plus *count* loose points that are not numbers, the last one infinite."""
+    points = list(TWO_QUADS_POINTS)
+    points += [[float("nan"), 0.0, 0.0]] * (count - 1) + [[0.0, float("inf"), 0.0]]
+    return StubGeometry(points, TWO_QUADS_FACES, vertex_uv=SIDE_BY_SIDE_UV)
+
+
+class TestNonFinitePositions:
+    """A NaN breaks the JSON the round trip reads; every tool names the points first."""
+
+    EXPECTED = (
+        r"12 points have non-finite positions \(NaN/inf\): "
+        r"\[6, 7, 8, 9, 10, 11, 12, 13, 14, 15, \.\.\.\]\. Nothing was measured\."
+    )
+
+    def test_get_mesh_report(self, houdini):
+        path = houdini("/obj/geo1/bevel", _with_bad_points(12))
+        with pytest.raises(OperationFailed, match=r"/obj/geo1/bevel: " + self.EXPECTED):
+            mh._get_mesh_report(node_path=path)
+
+    def test_get_uv_report(self, houdini):
+        path = houdini("/obj/geo1/bevel", _with_bad_points(12))
+        with pytest.raises(OperationFailed, match=self.EXPECTED):
+            mh._get_uv_report(node_path=path)
+
+    def test_compare_surfaces(self, houdini):
+        a = houdini("/obj/geo1/a", two_quads())
+        b = houdini("/obj/geo1/bevel", _with_bad_points(12))
+        with pytest.raises(OperationFailed, match=self.EXPECTED):
+            mh._compare_surfaces(a=a, b=b)
+
+    def test_compare_geometry(self, houdini):
+        a = houdini("/obj/geo1/a", two_quads())
+        b = houdini("/obj/geo1/bevel", _with_bad_points(12))
+        with pytest.raises(OperationFailed, match=r"/obj/geo1/bevel: " + self.EXPECTED):
+            mh._compare_geometry(a=a, b=b)
+
+    def test_one_bad_point_reads_as_one(self, houdini):
+        path = houdini("/obj/geo1/bevel", _with_bad_points(1))
+        with pytest.raises(OperationFailed, match=r"1 point has non-finite positions .*: \[6\]\."):
+            mh._get_mesh_report(node_path=path)
+
+    def test_an_unreadable_round_trip_says_what_it_was(self, houdini):
+        """What the P check cannot see -- a NaN elsewhere -- still gets a sentence."""
+
+        class Unreadable:
+            def saveToFile(self, path):
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write('["attributes", [nan]]')
+
+        with pytest.raises(OperationFailed, match="could not be read back as JSON"):
+            mh._load_geo_document(Unreadable())

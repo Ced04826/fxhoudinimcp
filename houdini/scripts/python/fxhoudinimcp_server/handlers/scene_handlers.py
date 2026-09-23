@@ -15,6 +15,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.config import (
+    focus_editor_enabled,
     layout_if_enabled,
     require_inside_project_root,
     update_mode_name,
@@ -36,6 +37,8 @@ def _focus_network_editor(node: hou.Node) -> None:
         parent = node.parent()
         if parent is not None:
             layout_if_enabled(parent)
+        if not focus_editor_enabled():
+            return  # the switch is off: placement only, the panes stay put
         for pane_tab in hou.ui.paneTabs():
             if pane_tab.type() == hou.paneTabType.NetworkEditor:
                 if parent is not None:

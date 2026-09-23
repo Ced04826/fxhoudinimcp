@@ -28,7 +28,9 @@ async def get_mesh_report(
     Reports quads/tris/ngons, pieces, boundary edges and closed loops,
     non-manifold edges, degenerate faces, valence with interior poles, and quads
     folded across either diagonal. Counts always; id lists only when non-empty,
-    capped at max_list. dump_path receives the full lists as JSON.
+    capped at max_list. Poles are counted per valence; their point ids and
+    positions go only to dump_path, which gets the receipt's keys with every
+    list whole. NaN/inf positions are refused with the point ids.
 
     quality_checks adds per-face measurements the counts cannot express:
     "corner_angle" for corners outside the threshold band (a 179-degree corner
@@ -221,6 +223,7 @@ async def get_uv_report(
     max_list: int = 20,
     dump_path: str | None = None,
     schema_version: int | None = None,
+    check_overlaps: bool = True,
 ) -> dict:
     """UV acceptance check: islands, winding, overlaps, area, distortion.
 
@@ -242,7 +245,8 @@ async def get_uv_report(
     excluded, which sets scope_complete false and overlaps.scope to
     measured_faces_only. Limits: 500000 primitives after the group, 400000 UV
     triangles for the overlap pass; over budget overlaps.status says incomplete
-    or skipped, never a clean sheet.
+    or skipped, never a clean sheet. fingerprint names the geometry measured
+    (points@P digest as edit_points writes it, prims, UV digest).
 
     Args:
         node_path: SOP node path.
@@ -257,12 +261,14 @@ async def get_uv_report(
         max_list: Cap on ids and worst-overlap entries.
         dump_path: JSON file for every island, overlap and flagged prim.
         schema_version: Refuse unless the plugin writes this receipt version.
+        check_overlaps: False skips the costly overlap pass; overlaps then says checked: false.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {
         "node_path": node_path,
         "uv_attribute": uv_attribute,
         "allow_stacking": allow_stacking,
+        "check_overlaps": check_overlaps,
         "max_list": max_list,
     }
     if group is not None:

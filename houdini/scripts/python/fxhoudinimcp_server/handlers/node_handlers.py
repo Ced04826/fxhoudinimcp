@@ -18,6 +18,7 @@ import hou
 # Internal
 from fxhoudinimcp_server.config import (
     auto_layout_enabled,
+    focus_editor_enabled,
     layout_if_enabled,
     mark_placed,
     place_new_node,
@@ -52,12 +53,15 @@ def _focus_network_editor(node: hou.Node, place_unpositioned: bool = True) -> No
 
     Callers that created nothing pass ``place_unpositioned=False``, so a call
     that only rewires or flips a flag never relocates a node the user parked at
-    the origin.
+    the origin. The panning half only runs with ``FXHOUDINIMCP_FOCUS_EDITOR``
+    on (see ``focus_editor_enabled``); the layout half always runs.
     """
     try:
         parent = node.parent()
         if parent is not None:
             layout_if_enabled(parent, place_unpositioned)
+        if not focus_editor_enabled():
+            return
         for pane_tab in hou.ui.paneTabs():
             if pane_tab.type() == hou.paneTabType.NetworkEditor:
                 if parent is not None:
@@ -999,6 +1003,10 @@ def disconnect_node(
 ) -> dict:
     """Disconnect one or all inputs of a node.
 
+    With disconnect_all the inputs are read back afterwards: ``remaining``
+    lists what is still connected, and ``success`` is false (with ``error``)
+    when anything is, or when a disconnect failed part-way.
+
     Args:
         node_path: Path to the node whose inputs to disconnect.
         input_index: Specific input index to disconnect. Ignored if disconnect_all is True.
@@ -1012,9 +1020,44 @@ def disconnect_node(
     connected = sorted({conn.inputIndex() for conn in node.inputConnections()})
 
     if disconnect_all:
-        for i in connected:
-            node.setInput(i, None)
+
+        def _connection_source(conn) -> str | None:
+            # inputItem(), so a wire from a subnet's input connector is named too.
+            with contextlib.suppress(Exception):
+                return conn.inputItem().path()
+            return None
+
+        # Highest index first: a merge drops trailing empty slots as its inputs
+        # go, so walking upwards ran past the end ("tuple index out of range")
+        # after disconnecting only part of a 29-input merge. Then read the node
+        # back, because what is left is the evidence, not the loop finishing.
+        failure = None
+        for i in reversed(connected):
+            try:
+                node.setInput(i, None)
+            except Exception as exc:  # noqa: BLE001 - reported with what is left
+                failure = f"disconnecting input {i} failed: {readable_message(exc)}"
+                break
             disconnected.append(i)
+        remaining = None
+        try:
+            remaining = [
+                {"index": conn.inputIndex(), "source": _connection_source(conn)}
+                for conn in node.inputConnections()
+            ]
+        except Exception as exc:  # noqa: BLE001 - an unread state is not an empty one
+            failure = failure or f"reading the inputs back failed: {readable_message(exc)}"
+        if failure is None and remaining:
+            failure = f"{len(remaining)} input(s) still connected after disconnecting"
+        result = {
+            "success": failure is None,
+            "node_path": node_path,
+            "disconnected_inputs": disconnected,
+            "remaining": remaining,
+        }
+        if failure is not None:
+            result["error"] = failure
+        return result
     elif input_index is not None:
         if input_index in connected:
             node.setInput(input_index, None)

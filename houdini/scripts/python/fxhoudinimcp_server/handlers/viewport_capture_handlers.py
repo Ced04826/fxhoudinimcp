@@ -817,6 +817,72 @@ def _drawn(scene_viewer) -> dict[str, Any]:
     return facts
 
 
+def _show_targets(scene_viewer, described, follow, show_target, moved_flags) -> dict[str, Any]:
+    """Point the viewer at the targets and report whether it draws them.
+
+    The viewer draws the display node of the network it is in. A target in
+    another network, or one that is not its network's display node, gets
+    framed but not drawn, and the image shows whatever else sits there -- a
+    capture that looked like evidence and was not. *moved_flags* collects
+    {network: previous display node} for every display flag moved here.
+    """
+    nodes = [hou.node(path) for path in described if path != "bbox"]
+    sops = [n for n in nodes if n is not None and n.type().category().name() == "Sop"]
+    objects = [n for n in nodes if n is not None and n.type().category().name() == "Object"]
+    facts: dict[str, Any] = {}
+    if follow and sops:
+        networks = sorted({n.parent().path() for n in sops})
+        if len(networks) == 1:
+            if scene_viewer.pwd().path() != networks[0]:
+                scene_viewer.setPwd(hou.node(networks[0]))
+        else:
+            facts["note"] = f"the targets are in {len(networks)} networks; the viewer shows one"
+    network = scene_viewer.pwd()
+    drawn: dict[str, bool] = {}
+    for node in sops:
+        parent = node.parent()
+        display = parent.displayNode() if hasattr(parent, "displayNode") else None
+        showing = display is not None and display.path() == node.path()
+        if show_target and not showing and parent.path() == network.path():
+            moved_flags.setdefault(parent.path(), display.path() if display is not None else None)
+            node.setDisplayFlag(True)
+            display = parent.displayNode()
+            showing = display is not None and display.path() == node.path()
+        drawn[node.path()] = showing and parent.path() == network.path()
+    for node in objects:
+        drawn[node.path()] = bool(node.isDisplayFlagSet())
+    display = network.displayNode() if hasattr(network, "displayNode") else None
+    facts.update(
+        network=network.path(),
+        display_node=display.path() if display is not None else None,
+        targets_drawn=drawn,
+    )
+    return facts
+
+
+def _restore_targets(scene_viewer, viewer_network: str, moved_flags, restore_view: bool) -> list[str]:
+    """Put back the display flags moved and, with restore_view, the viewer's network."""
+    problems: list[str] = []
+    for network, previous in moved_flags.items():
+        if previous is None:
+            continue
+        with contextlib.suppress(Exception):
+            hou.node(previous).setDisplayFlag(True)
+        now = None
+        with contextlib.suppress(Exception):
+            now = hou.node(network).displayNode()
+        if now is None or now.path() != previous:
+            problems.append(
+                f"the display flag in {network} is on {now.path() if now else None}, was on {previous}"
+            )
+    if restore_view and scene_viewer.pwd().path() != viewer_network:
+        with contextlib.suppress(Exception):
+            scene_viewer.setPwd(hou.node(viewer_network))
+        if scene_viewer.pwd().path() != viewer_network:
+            problems.append(f"the viewer is in {scene_viewer.pwd().path()}, was in {viewer_network}")
+    return problems
+
+
 ###### Handler: viewport.capture_viewport
 
 
@@ -831,11 +897,16 @@ def capture_viewport(
     prefix: str = "view",
     pane_name: str | None = None,
     restore_view: bool = True,
+    follow_targets: bool = True,
+    show_target: bool = False,
     **_: Any,
 ) -> dict[str, Any]:
     """Flipbook the Scene Viewer from one or more views, framed on a target.
 
     See the module docstring for what is captured and how framing is checked.
+    follow_targets points the viewer at the SOP targets' network for the
+    capture; show_target moves the display flag onto a SOP target that is not
+    its network's display node. Both are put back afterwards.
     """
     started = time.perf_counter()
     if not isinstance(max_size, int) or isinstance(max_size, bool) or not 256 <= max_size <= 4096:
@@ -866,6 +937,8 @@ def capture_viewport(
     size = viewport.size()
     state = _save_state(viewport)
     base = state["camera"]
+    viewer_network = scene_viewer.pwd().path()
+    moved_flags: dict[str, str | None] = {}
 
     result: dict[str, Any] = {
         "viewport": viewport.name(),
@@ -902,14 +975,19 @@ def capture_viewport(
         result["shading"] = _current_shading(viewport)
         for spec, name, (corners, described) in zip(specs, names, per_view, strict=True):
             path = os.path.join(output_dir, f"{safe_name(prefix)}_{name}.png").replace("\\", "/")
+            drawn = _show_targets(
+                scene_viewer, described, follow_targets, show_target, moved_flags
+            )
             shot = _shoot(
                 scene_viewer, viewport, state, base, spec, corners, path, max_size, float(margin)
             )
             shot["framed"] = described or None
+            shot["drawn"] = drawn
             result["views"].append(shot)
     finally:
         if restore_view:
             restore_problems = _restore_state(viewport, state, base)
+        restore_problems += _restore_targets(scene_viewer, viewer_network, moved_flags, restore_view)
 
     for shot in result["views"]:
         if not shot.get("file_exists"):
@@ -920,6 +998,14 @@ def capture_viewport(
             result["problems"].append(f"{shot['name']}: nothing is drawn where the target is")
         if shot.get("target_in_frame") is False:
             result["problems"].append(f"{shot['name']}: the target is not fully in frame")
+        drawn = shot.get("drawn") or {}
+        for target, showing in (drawn.get("targets_drawn") or {}).items():
+            if not showing:
+                result["problems"].append(
+                    f"{shot['name']}: {target} is framed but not drawn -- the viewer draws "
+                    f"{drawn.get('display_node')} in {drawn.get('network')}; set its display "
+                    f"flag or pass show_target=True"
+                )
         if shot.get("camera_not_as_set"):
             result["problems"].append(
                 f"{shot['name']}: the viewport camera did not take {shot['camera_not_as_set']}"
@@ -931,6 +1017,8 @@ def capture_viewport(
             result["restore_mismatches"] = mismatches
     else:
         result["restored"] = None
+        # Display flags this call moved are put back whatever restore_view says.
+        result["problems"] += restore_problems
     result["success"] = not result["problems"] and result["restored"] is not False
     result["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
     return result

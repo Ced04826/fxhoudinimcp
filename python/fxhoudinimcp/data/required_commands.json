@@ -31,6 +31,7 @@
     "context.get_scene_summary",
     "context.get_selection",
     "context.set_selection",
+    "cook.cook_node",
     "cops.create_cop_node",
     "cops.get_cop_geometry",
     "cops.get_cop_info",

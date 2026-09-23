@@ -25,6 +25,8 @@ async def capture_viewport(
     prefix: str = "view",
     pane_name: str | None = None,
     restore_view: bool = True,
+    follow_targets: bool = True,
+    show_target: bool = False,
 ) -> dict:
     """Capture what the Scene Viewer shows, from several views in one call,
     each framed so the target is whole and fills the image.
@@ -41,6 +43,13 @@ async def capture_viewport(
     Framing is solved from the camera parameters, then checked against the
     written pixels. The viewer's view type, cameras and shading are restored
     afterwards and read back (`restored`).
+
+    The viewer draws the display node of the network it is in, so a target
+    elsewhere would be framed but not drawn. The capture points the viewer
+    at the SOP targets' network (follow_targets) and checks each target is
+    what is drawn (`drawn.targets_drawn`); a target that is not its network's
+    display node is a problem unless show_target moves the display flag onto
+    it for the capture. Network and flags are put back afterwards.
 
     Look at the images with your file reader; nothing is inlined.
 
@@ -67,13 +76,18 @@ async def capture_viewport(
         prefix: File name prefix.
         pane_name: Scene Viewer pane tab; default the first one.
         restore_view: Put the viewer back as it was (default True).
+        follow_targets: Point the viewer at the SOP targets' network for the
+            capture (default True).
+        show_target: Move the display flag onto a SOP target that is not its
+            network's display node, for the capture only (default False).
 
     Returns per view: path, pixels, target_rect (image pixels, origin top
     left), target_in_frame, target_fill, drawn_fraction (share of the target
-    region actually drawn on), projection, looking_along, pivot, and
-    ortho_width or distance with fov_x_deg. success is false when an image
-    is missing or blank where the target is, a target is not fully in frame,
-    or the viewer could not be restored; problems says which.
+    region actually drawn on), drawn (network, display_node, targets_drawn),
+    projection, looking_along, pivot, and ortho_width or distance with
+    fov_x_deg. success is false when an image is missing or blank where the
+    target is, a target is not fully in frame or not drawn, or the viewer
+    could not be restored; problems says which.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {
@@ -82,6 +96,8 @@ async def capture_viewport(
         "margin": margin,
         "prefix": prefix,
         "restore_view": restore_view,
+        "follow_targets": follow_targets,
+        "show_target": show_target,
     }
     for key, value in (
         ("views", views),

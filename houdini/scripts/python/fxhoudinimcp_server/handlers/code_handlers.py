@@ -88,6 +88,9 @@ def _serialize_result(value: Any) -> Any:
 
 def _exception_line(exc: BaseException) -> str:
     """"ValueError: what went wrong", bounded, whatever the message contains."""
+    if isinstance(exc, SystemExit):
+        # str() of a bare SystemExit is empty; its exit code is the message.
+        return f"SystemExit: exit code {clip(exc.code, _MAX_MESSAGE_CHARS)}"
     try:
         message = clip(str(exc), _MAX_MESSAGE_CHARS)
     except Exception:  # noqa: BLE001 - a __str__ that raises is still an exception
@@ -211,15 +214,19 @@ def _execute_python(
     began = time.time()
     sys.stdout, sys.stderr = stdout_buf, stderr_buf
     try:
+        # BaseException, around the user's code only: `raise SystemExit` or
+        # sys.exit() in it used to escape the handler, and the caller got
+        # "Failed to dispatch to main thread" instead of a failed run with the
+        # output printed so far.
         try:
             exec(code, namespace)  # noqa: S102
-        except Exception as exc:
+        except BaseException as exc:  # noqa: BLE001 - reported as a failed run
             exec_error = traceback.format_exc()
             exec_exception = _exception_line(exc)
         if exec_error is None and return_expression is not None:
             try:
                 result = eval(return_expression, namespace)  # noqa: S307
-            except Exception as exc:
+            except BaseException as exc:  # noqa: BLE001 - reported as a failed eval
                 eval_error = traceback.format_exc()
                 eval_exception = _exception_line(exc)
     finally:
@@ -321,6 +328,10 @@ def _execute_python(
                     # returned. Each is located and counted.
                     response[key] = notes[category][:10]
                     response[f"{key}_count"] = notes[f"{category}_count"]
+            if notes.get("keys_stringified"):
+                # Number keys written as their text, as JSON requires. Not a
+                # loss, so it does not touch return_lossless; just counted.
+                response["return_keys_stringified"] = notes["keys_stringified"]
             # Lossless means the receipt holds the value, not a rendering of
             # it: no stringified objects, no nan turned into a word, no cycle
             # cut. Truncation is a separate question, answered separately.

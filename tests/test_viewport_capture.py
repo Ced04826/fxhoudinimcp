@@ -223,3 +223,47 @@ class TestToolWrappers:
         assert command == "viewport.capture_network_editor"
         assert params["network_path"] == "/obj/geo1"
         assert "node_path" not in params
+
+
+class TestTargetsAreDrawn:
+    """A framed target that the viewer does not draw is a problem, not a picture."""
+
+    def _sop(self, path, parent):
+        node = MagicMock()
+        node.path.return_value = path
+        node.type.return_value.category.return_value.name.return_value = "Sop"
+        node.parent.return_value = parent
+        node.setDisplayFlag.side_effect = lambda on: setattr(parent, "_display", node)
+        return node
+
+    def _network(self, path):
+        net = MagicMock()
+        net.path.return_value = path
+        net._display = None
+        net.displayNode.side_effect = lambda: net._display
+        return net
+
+    def test_the_viewer_follows_the_target_and_a_non_display_target_is_reported(self, monkeypatch):
+        other, net = self._network("/obj/geo1/other"), self._network("/obj/geo1/net")
+        shown = self._sop("/obj/geo1/net/out", net)
+        target = self._sop("/obj/geo1/net/mid", net)
+        net._display = shown
+        nodes = {"/obj/geo1/net/mid": target, "/obj/geo1/net": net, "/obj/geo1/other": other}
+        monkeypatch.setattr(vc.hou, "node", lambda path: nodes.get(path))
+        viewer = MagicMock()
+        viewer._pwd = other
+        viewer.pwd.side_effect = lambda: viewer._pwd
+        viewer.setPwd.side_effect = lambda node: setattr(viewer, "_pwd", node)
+
+        facts = vc._show_targets(viewer, ["/obj/geo1/net/mid"], True, False, {})
+        assert facts["network"] == "/obj/geo1/net"
+        assert facts["targets_drawn"] == {"/obj/geo1/net/mid": False}
+
+        moved = {}
+        facts = vc._show_targets(viewer, ["/obj/geo1/net/mid"], True, True, moved)
+        assert facts["targets_drawn"] == {"/obj/geo1/net/mid": True}
+        assert moved == {"/obj/geo1/net": "/obj/geo1/net/out"}
+
+    def test_a_bbox_alone_needs_no_drawing_check(self):
+        facts = vc._show_targets(MagicMock(), ["bbox"], True, False, {})
+        assert facts["targets_drawn"] == {}

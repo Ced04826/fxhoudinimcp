@@ -148,10 +148,16 @@ def extract_faces(document: list, with_vertices: bool = False) -> dict[str, Any]
     at all, so the caller can report them without pretending they are faces.
 
     With *with_vertices*, ``face_vertices`` comes back parallel to ``faces``,
-    holding each face's linear vertex numbers. Only the UV report needs them --
-    a vertex attribute like ``uv`` is indexed by those numbers, and reading it
-    per point instead is what loses a seam -- and on a large mesh they double
-    the memory of the parse, so they are off by default.
+    holding each face's vertex numbers as this file numbers them. Only the UV
+    report needs them -- a vertex attribute like ``uv`` is per corner, and
+    reading it per point instead is what loses a seam -- and on a large mesh
+    they double the memory of the parse, so they are off by default.
+
+    These numbers index the vertex attribute arrays of the *same document*
+    (see ``read_numeric_attribute``), never HOM's ``vertexFloatAttribValues``:
+    the file lists vertices face by face, while HOM returns them in the order
+    they sit in memory, and after a Reverse, a Mirror or a deletion the two
+    differ.
     """
     doc = _flat_pairs(document)
     topology = _flat_pairs(doc.get("topology"))
@@ -216,6 +222,172 @@ def extract_faces(document: list, with_vertices: bool = False) -> dict[str, Any]
         "vertex_count": int(doc.get("vertexcount", len(indices))),
         "declared_prim_count": int(doc.get("primitivecount", prim_id)),
     }
+
+
+###### .geo JSON attributes (no hou)
+#
+# The layout, as Houdini's own reader ($HFS/houdini/public/hgeo/hgeo.py) takes it:
+#
+#   document   [..., 'attributes', ['vertexattributes', [<entry>, ...],
+#                                   'pointattributes', [...], ...], ...]
+#   entry      [definition, data], both flat key/value lists
+#              definition  ['scope', 'public', 'type', 'numeric', 'name', 'uv', ...]
+#              data        ['size', 3, 'storage', 'fpreal32', 'defaults', [...],
+#                           'values', <values>]
+#   values     ['size', 3, 'storage', 'fpreal32', <one of the three below>]
+#              'tuples'       [[u, v, w], ...]            one tuple per element
+#              'arrays'       [[u, u, ...], [v, ...], ...] one array per component
+#              'rawpagedata'  flat numbers in pages, with 'packing', 'pagesize'
+#                             and optionally 'constantpageflags'
+#
+# Element i of a vertex attribute belongs to the file's vertex number i, the
+# same number extract_faces hands back, which is why reading both from one
+# document keeps corners and values lined up.
+
+_ATTRIBUTE_OWNERS = {
+    "vertex": "vertexattributes",
+    "point": "pointattributes",
+    "primitive": "primitiveattributes",
+    "detail": "globalattributes",
+}
+
+
+def _decode_raw_pages(
+    raw: list,
+    *,
+    size: int,
+    count: int,
+    packing: list[int],
+    pagesize: int,
+    constant_flags: list | None,
+) -> list[float]:
+    """Paged storage to element-major values.
+
+    Pages run in element order. Within a page each subvector of *packing* is
+    stored whole before the next one: every element's components for that
+    subvector, one element after another -- or, when the subvector's flag for
+    that page is set, a single tuple shared by the whole page.
+    """
+    if sum(packing) != size or any(width <= 0 for width in packing):
+        raise ValueError(f"packing {packing} does not add up to the tuple size {size}")
+    if pagesize <= 0:
+        raise ValueError(f"pagesize must be positive, not {pagesize}")
+
+    starts: list[int] = []
+    running = 0
+    for width in packing:
+        starts.append(running)
+        running += width
+
+    flags = constant_flags if isinstance(constant_flags, (list, tuple)) else []
+    flat = [0.0] * (count * size)
+    cursor = 0
+    for page in range((count + pagesize - 1) // pagesize):
+        first = page * pagesize
+        on_page = min(pagesize, count - first)
+        for sub, width in enumerate(packing):
+            sub_flags = flags[sub] if sub < len(flags) else []
+            constant = bool(sub_flags[page]) if page < len(sub_flags or []) else False
+            if constant:
+                shared = raw[cursor : cursor + width]
+                cursor += width
+            for element in range(first, first + on_page):
+                if constant:
+                    chunk = shared
+                else:
+                    chunk = raw[cursor : cursor + width]
+                    cursor += width
+                if len(chunk) != width:
+                    raise ValueError("raw page data ends before its last page")
+                base = element * size + starts[sub]
+                flat[base : base + width] = chunk
+    if cursor != len(raw):
+        raise ValueError(
+            f"raw page data holds {len(raw)} numbers but its pages account for {cursor}"
+        )
+    return flat
+
+
+def _flatten_attribute_values(values: dict[str, Any], size: int, count: int) -> list[float]:
+    """One storage block to element-major values: ``flat[i * size + c]``."""
+    tuples = values.get("tuples")
+    if isinstance(tuples, (list, tuple)):
+        flat: list[float] = []
+        for item in tuples:
+            if isinstance(item, (list, tuple)):
+                flat.extend(item)
+            else:
+                flat.append(item)
+        return flat
+
+    raw = values.get("rawpagedata")
+    if isinstance(raw, (list, tuple)):
+        packing = values.get("packing")
+        return _decode_raw_pages(
+            list(raw),
+            size=size,
+            count=count,
+            packing=[int(width) for width in packing] if packing else [size],
+            pagesize=int(values.get("pagesize", 0)),
+            constant_flags=values.get("constantpageflags"),
+        )
+
+    arrays = values.get("arrays")
+    if isinstance(arrays, (list, tuple)):
+        if len(arrays) == size and all(len(component) == count for component in arrays):
+            # One array per component; interleave them.
+            flat = [0.0] * (count * size)
+            for component, column in enumerate(arrays):
+                flat[component::size] = list(column)
+            return flat
+        if len(arrays) == 1 and len(arrays[0]) == count * size:
+            return list(arrays[0])
+        raise ValueError(
+            f"'arrays' storage holds {len(arrays)} arrays of lengths "
+            f"{[len(component) for component in arrays][:4]} for {count} elements of size {size}"
+        )
+
+    raise ValueError(
+        f"no 'tuples', 'arrays' or 'rawpagedata' in the values block (keys: {sorted(values)})"
+    )
+
+
+def read_numeric_attribute(document: list, owner: str, name: str) -> tuple[int, list[float]] | None:
+    """A numeric attribute from a parsed ``.geo`` document, or None if absent.
+
+    Returns ``(size, flat)`` with ``flat[i * size + c]`` the component *c* of
+    element *i*, elements numbered as the file numbers them. A block this
+    parser cannot read, or one whose length does not match the element count,
+    raises rather than returning values that would be lined up wrongly.
+    """
+    doc = _flat_pairs(document)
+    attributes = _flat_pairs(doc.get("attributes"))
+    count_key = {"vertex": "vertexcount", "point": "pointcount", "primitive": "primitivecount"}
+    count = int(doc.get(count_key[owner], 0)) if owner in count_key else 1
+
+    for entry in attributes.get(_ATTRIBUTE_OWNERS[owner]) or []:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        definition = _flat_pairs(entry[0])
+        if definition.get("name") != name:
+            continue
+        if definition.get("type") != "numeric":
+            raise ValueError(
+                f"{owner} attribute '{name}' is stored as '{definition.get('type')}', not numeric"
+            )
+        data = _flat_pairs(entry[1])
+        values = _flat_pairs(data.get("values"))
+        size = int(values.get("size", data.get("size", 1)))
+        if size <= 0:
+            raise ValueError(f"{owner} attribute '{name}' declares size {size}")
+        flat = _flatten_attribute_values(values, size, count)
+        if len(flat) != count * size:
+            raise ValueError(
+                f"{owner} attribute '{name}' holds {len(flat)} numbers for {count} elements "
+                f"of size {size} ({count * size} expected)"
+            )
+        return size, flat
+    return None
 
 
 ###### Topology maths (no hou, no numpy -- unit-tested without Houdini)
@@ -458,14 +630,60 @@ def _get_sop_geo(node_path: str) -> hou.Geometry:
     return geo
 
 
+def nonfinite_points(flat: Any) -> list[int]:
+    """Point numbers whose flat xyz position holds a NaN or an infinity.
+
+    The sum is the screen: it is finite whenever every term is, so a clean mesh
+    costs one pass in C. Only a bad value -- or a sum that overflowed on
+    absurdly large but finite coordinates -- sends it through the per-point walk.
+    """
+    if math.isfinite(sum(flat)):
+        return []
+    isfinite = math.isfinite
+    return [
+        index // 3
+        for index in range(0, len(flat) - 2, 3)
+        if not (isfinite(flat[index]) and isfinite(flat[index + 1]) and isfinite(flat[index + 2]))
+    ]
+
+
+def _require_finite_positions(flat: Any, where: str) -> None:
+    """Refuse geometry with non-finite positions before the ``.geo`` round trip.
+
+    Houdini writes a NaN or an infinity into the JSON as a token no JSON reader
+    accepts, so without this the caller gets a parse error that names neither
+    the node nor the points -- the usual source being a PolyBevel that failed.
+    """
+    bad = nonfinite_points(flat)
+    if not bad:
+        return
+    shown = ", ".join(str(point) for point in bad[:10])
+    more = ", ..." if len(bad) > 10 else ""
+    subject = f"{len(bad)} points have" if len(bad) != 1 else "1 point has"
+    raise hou.OperationFailed(
+        f"{where}: {subject} non-finite positions (NaN/inf): [{shown}{more}]. Nothing was measured."
+    )
+
+
 def _load_geo_document(geo: hou.Geometry) -> list:
-    """Save the geometry to a temporary .geo and read it back as JSON."""
+    """Save the geometry to a temporary .geo and read it back as JSON.
+
+    Callers check P for non-finite values first (``_require_finite_positions``);
+    the error here covers what that cannot see, such as a NaN in another
+    attribute.
+    """
     handle, path = tempfile.mkstemp(prefix="fxmcp-mesh-", suffix=".geo", dir=tempfile.gettempdir())
     os.close(handle)
     try:
         geo.saveToFile(path)
         with open(path, encoding="utf-8") as stream:
-            return json.load(stream)
+            try:
+                return json.load(stream)
+            except ValueError as exc:
+                raise hou.OperationFailed(
+                    f"The geometry's .geo copy could not be read back as JSON ({exc}). A NaN "
+                    "or infinite attribute value is the usual cause. Nothing was measured."
+                ) from None
     finally:
         with contextlib.suppress(OSError):
             os.remove(path)
@@ -623,6 +841,13 @@ def _build_mesh_report(
         node_path, "node_path", scoped_prims, group_name if named_prim_group is not None else ""
     )
 
+    # Positions: one bulk read, checked before the round trip that a NaN would
+    # break, then reshaped by numpy. numpy ships with Houdini's Python; the
+    # pure-Python helpers above take the .tolist() form, which is also faster
+    # to index in the per-face loops than numpy rows are.
+    flat = geo.pointFloatAttribValues("P")
+    _require_finite_positions(flat, node_path)
+
     parsed = extract_faces(_load_geo_document(geo))
     faces = parsed["faces"]
     open_polylines = parsed["open_polylines"]
@@ -636,12 +861,8 @@ def _build_mesh_report(
         open_polylines = [prim_id for prim_id in open_polylines if prim_id in scope]
         other_prims = [prim_id for prim_id in other_prims if prim_id in scope]
 
-    # Positions: one bulk read, reshaped by numpy. numpy ships with Houdini's
-    # Python; the pure-Python helpers above take the .tolist() form, which is
-    # also faster to index in the per-face loops than numpy rows are.
     import numpy
 
-    flat = geo.pointFloatAttribValues("P")
     coordinates = numpy.asarray(flat, dtype=numpy.float64).reshape(-1, 3)
     positions = coordinates.tolist()
 
@@ -695,62 +916,90 @@ def _build_mesh_report(
     if not group_name and loose > 0:
         counts["loose_points"] = loose
 
-    # Every list below is omitted when it would be empty, and when max_list is 0:
-    # a key whose value is [] costs the reader a decision and tells them nothing.
-    boundary: dict[str, Any] = {"edges": len(boundary_edges), "loops": len(loop_sizes)}
-    if loop_sizes and max_list:
-        boundary["loop_sizes"] = loop_sizes[:max_list]
-    if open_chains:
-        boundary["open_chains"] = open_chains
+    by_valence: dict[str, int] = {}
+    for _point, count in poles:
+        key = str(count)
+        by_valence[key] = by_valence.get(key, 0) + 1
 
-    nonmanifold_report: dict[str, Any] = {"count": len(nonmanifold)}
-    if nonmanifold and max_list:
-        nonmanifold_report["edges"] = [list(edge) for edge in nonmanifold[:max_list]]
+    def body(cap: int | None) -> dict[str, Any]:
+        """The report with every id list cut at *cap*; None keeps them whole.
 
-    degenerate_report: dict[str, Any] = {"count": len(bad_faces)}
-    if bad_faces and max_list:
-        degenerate_report["prims"] = bad_faces[:max_list]
+        The receipt and the dump both come from here, so they share every key
+        and its meaning: the dump is the receipt with its lists uncut, plus the
+        per-point and per-diagonal lists only a file has room for. A list is
+        omitted when it would be empty, and in the receipt when max_list is 0:
+        a key whose value is [] costs the reader a decision and tells them
+        nothing.
+        """
 
-    poles_report: dict[str, Any] = {"count": len(poles)}
-    if poles:
-        by_valence: dict[str, int] = {}
-        for _point, count in poles:
-            key = str(count)
-            by_valence[key] = by_valence.get(key, 0) + 1
-        poles_report["by_valence"] = by_valence
-        if max_list:
-            poles_report["points"] = [
-                {"point": point, "valence": count, "P": [round(v, 6) for v in positions[point]]}
-                for point, count in poles[:max_list]
-            ]
+        def listed(values: list) -> list | None:
+            if not values or cap == 0:
+                return None
+            return list(values) if cap is None else list(values[:cap])
 
-    folded_report: dict[str, Any] = {
-        "count": len(folded),
-        "diag02": len(diag02),
-        "diag13": len(diag13),
-    }
-    if folded and max_list:
-        folded_report["prims"] = folded[:max_list]
+        boundary: dict[str, Any] = {"edges": len(boundary_edges), "loops": len(loop_sizes)}
+        if (sizes := listed(loop_sizes)) is not None:
+            boundary["loop_sizes"] = sizes
+        if open_chains:
+            boundary["open_chains"] = open_chains
 
-    report: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
-        "node_path": node_path,
-        "scope": scope_label,
-        "counts": counts,
-        "pieces": {"count": piece_count, "largest": piece_sizes[:5]},
-        "boundary": boundary,
-        "nonmanifold_edges": nonmanifold_report,
-        "degenerate": degenerate_report,
-        "valence": histogram,
-        "poles": poles_report,
-        "folded_quads": folded_report,
-        "bbox": {
-            "min": [round(v, 6) for v in bbox_min],
-            "max": [round(v, 6) for v in bbox_max],
-            "size": [round(v, 6) for v in size],
-            "diag": round(diagonal, 6),
-        },
-    }
+        nonmanifold_report: dict[str, Any] = {"count": len(nonmanifold)}
+        if (edges := listed(nonmanifold)) is not None:
+            nonmanifold_report["edges"] = [list(edge) for edge in edges]
+
+        degenerate_report: dict[str, Any] = {"count": len(bad_faces)}
+        if (prims := listed(bad_faces)) is not None:
+            degenerate_report["prims"] = prims
+
+        # Counts only in the receipt: a pole is worth a look in the viewport,
+        # not twenty coordinates in the reply. Which points they are goes to
+        # the dump.
+        poles_report: dict[str, Any] = {"count": len(poles)}
+        if poles:
+            poles_report["by_valence"] = dict(by_valence)
+            if cap is None:
+                poles_report["points"] = [
+                    {"point": point, "valence": count, "P": positions[point]}
+                    for point, count in poles
+                ]
+
+        folded_report: dict[str, Any] = {
+            "count": len(folded),
+            "diag02": len(diag02),
+            "diag13": len(diag13),
+        }
+        if (prims := listed(folded)) is not None:
+            folded_report["prims"] = prims
+        if cap is None:
+            if diag02:
+                folded_report["diag02_prims"] = list(diag02)
+            if diag13:
+                folded_report["diag13_prims"] = list(diag13)
+
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "node_path": node_path,
+            "scope": scope_label,
+            "counts": dict(counts),
+            "pieces": {
+                "count": piece_count,
+                "largest": list(piece_sizes) if cap is None else piece_sizes[:5],
+            },
+            "boundary": boundary,
+            "nonmanifold_edges": nonmanifold_report,
+            "degenerate": degenerate_report,
+            "valence": dict(histogram),
+            "poles": poles_report,
+            "folded_quads": folded_report,
+            "bbox": {
+                "min": [round(v, 6) for v in bbox_min],
+                "max": [round(v, 6) for v in bbox_max],
+                "size": [round(v, 6) for v in size],
+                "diag": round(diagonal, 6),
+            },
+        }
+
+    report = body(max_list)
 
     # The checks walk every corner, so they run once at whichever cap is
     # larger and the receipt takes a truncated view of the same answer.
@@ -780,19 +1029,7 @@ def _build_mesh_report(
         }
 
     if dump_target:
-        payload = {
-            "node_path": node_path,
-            "scope": scope_label,
-            "piece_sizes": piece_sizes,
-            "boundary_loop_sizes": loop_sizes,
-            "nonmanifold_edges": [list(edge) for edge in nonmanifold],
-            "degenerate_prims": bad_faces,
-            "folded_quads": {"diag02": diag02, "diag13": diag13},
-            "poles": [
-                {"point": point, "valence": count, "P": positions[point]} for point, count in poles
-            ],
-            "valence": histogram,
-        }
+        payload = body(None)
         if quality:
             payload["quality"] = quality
         try:
@@ -918,7 +1155,11 @@ def _get_mesh_report(
 
     Counts are always reported; id lists appear only when something is wrong and
     are capped at *max_list*, so a clean mesh answers in a few hundred
-    characters. Pass *dump_path* to receive every id in a JSON file.
+    characters. Poles are counted per valence only; which points they are is in
+    the dump. Pass *dump_path* to receive a JSON file with the receipt's keys
+    and every list whole, plus the pole points and the per-diagonal fold lists.
+
+    Geometry with a NaN or infinite position is refused, naming the points.
 
     *quality_checks* adds per-face measurements the counts cannot express:
     ``corner_angle`` for corners outside the threshold band, ``triangulation``
@@ -1568,14 +1809,16 @@ def _int_attrib_values(geo: hou.Geometry, name: str, kind: str) -> list[int] | N
     return list(reader(name))
 
 
-def _geo_snapshot(geo: hou.Geometry) -> dict[str, Any]:
+def _geo_snapshot(geo: hou.Geometry, node_path: str) -> dict[str, Any]:
     """Faces, counts, positions, and provenance attributes from one SOP."""
+    positions = list(geo.pointFloatAttribValues("P"))
+    _require_finite_positions(positions, node_path)
     parsed = extract_faces(_load_geo_document(geo))
     return {
         "faces": parsed["faces"],
         "point_count": int(geo.intrinsicValue("pointcount")),
         "prim_count": int(geo.intrinsicValue("primitivecount")),
-        "positions": list(geo.pointFloatAttribValues("P")),
+        "positions": positions,
         "sourcept": _int_attrib_values(geo, "sourcept", "point"),
         "sourceprim": _int_attrib_values(geo, "sourceprim", "prim"),
     }
@@ -1658,8 +1901,8 @@ def _compare_geometry(
 
     geo_a = _get_sop_geo(a_path)
     geo_b = _get_sop_geo(b_path)
-    snap_a = _geo_snapshot(geo_a)
-    snap_b = _geo_snapshot(geo_b)
+    snap_a = _geo_snapshot(geo_a, a_path)
+    snap_b = _geo_snapshot(geo_b, b_path)
     report = _compare_snapshots(snap_a, snap_b, tolerance=tol, max_list=cap)
     report["a"] = a_path
     report["b"] = b_path
@@ -1768,6 +2011,10 @@ def _triangulate(
     refused rather than dropped: a surface check that quietly skips the faces
     it could not handle is a check that passes for the wrong reason.
     """
+    # The whole input, not just the scope: the copy keeps every point, and one
+    # NaN anywhere in it is enough to break the round trip below.
+    _require_finite_positions(geo.pointFloatAttribValues("P"), f"{node_path} ({label})")
+
     work = _tagged_copy(geo, keep, total_prims, matrix)
     triangulated = hou.Geometry()
     _divide_verb().execute(triangulated, [work])
@@ -1778,7 +2025,12 @@ def _triangulate(
             "there is nothing to measure."
         )
 
-    parsed = extract_faces(_load_geo_document(triangulated), with_vertices=bool(uv_attribute))
+    document = _load_geo_document(triangulated)
+    parsed = extract_faces(document, with_vertices=bool(uv_attribute))
+    if not uv_attribute:
+        # Only the UV read needs the parse past this point; on a large mesh it
+        # is most of the memory in use.
+        document = []
     faces = parsed["faces"]
     stragglers = len(parsed["open_polylines"]) + len(parsed["other_prims"])
     not_triangles = [prim_id for prim_id, points in faces if len(points) != 3]
@@ -1836,7 +2088,7 @@ def _triangulate(
             uv_attribute,
             faces,
             parsed["face_vertices"],
-            parsed["vertex_count"],
+            document,
         )
     return result
 
@@ -1847,7 +2099,7 @@ def _corner_uvs(
     name: str,
     faces: list,
     face_vertices: list[list[int]],
-    vertex_count: int,
+    document: list,
 ) -> tuple[list[list[tuple[float, float]]], str, int]:
     """Each triangle corner's own UV, from a vertex or a point attribute.
 
@@ -1855,6 +2107,13 @@ def _corner_uvs(
     point carries one UV for every face using it, so there are no seams to
     preserve -- true, and worth saying in the receipt rather than leaving the
     reader to assume the mesh was cut.
+
+    A vertex UV is read from the same ``.geo`` document the corners came from,
+    so both use the file's vertex numbers. HOM's ``vertexFloatAttribValues``
+    returns vertices in memory order, which after a Reverse, a Mirror or a
+    deletion is not the order the file lists them in: indexing one with the
+    other swapped corners and invented islands and stretch. HOM is still what
+    finds the attribute and checks its type, because it names the candidates.
     """
     attrib = geo.findVertexAttrib(name)
     owner = "vertex"
@@ -1878,13 +2137,23 @@ def _corner_uvs(
 
     size = attrib.size()
     if owner == "vertex":
-        values = list(geo.vertexFloatAttribValues(name))
-        expected = vertex_count * size
-        if len(values) != expected:
+        try:
+            found = read_numeric_attribute(document, "vertex", name)
+        except ValueError as exc:
             raise hou.OperationFailed(
-                f"'{name}' on {node_path} returned {len(values)} values for {vertex_count} "
-                f"vertices at {size} components each ({expected} expected), so corners and "
-                "UVs cannot be lined up. Nothing was reported."
+                f"'{name}' on {node_path} could not be read from the .geo copy ({exc}), so "
+                "corners and UVs cannot be lined up. Nothing was reported."
+            ) from None
+        if found is None:
+            raise hou.OperationFailed(
+                f"'{name}' is a vertex attribute on {node_path}, but the .geo copy of its "
+                "triangulation carries no vertex attribute of that name, so corners and UVs "
+                "cannot be lined up. Nothing was reported."
+            )
+        size, values = found
+        if size < 2:
+            raise hou.OperationFailed(
+                f"'{name}' on {node_path} was saved with {size} component(s); a UV needs two."
             )
         return (
             [
@@ -2544,6 +2813,7 @@ def _get_uv_report(
     max_list: int = 20,
     dump_path: str | None = None,
     schema_version: int | None = None,
+    check_overlaps: bool = True,
     **_,
 ) -> dict[str, Any]:
     """UV quality of a polygon mesh: islands, winding, overlaps, distortion.
@@ -2567,9 +2837,19 @@ def _get_uv_report(
     singular values of each triangle's mapping -- the one that catches a shape
     squashed along one axis at unchanged area. A triangle whose UVs collapse
     to a line or a point has neither, and is counted as collapsed.
+
+    The overlap pass is most of the cost on a large mesh. ``check_overlaps=False``
+    skips it, and the overlaps block then says ``checked: false`` instead of
+    carrying numbers that would read as zero overlaps.
+
+    ``fingerprint`` names the geometry measured: its point count and a digest
+    of P in the form edit_points uses, the primitive count, and a digest of the
+    UV values, so two receipts can be told apart when only a layout changed.
     """
     started = time.perf_counter()
     _check_schema_version(schema_version)
+    if not isinstance(check_overlaps, bool):
+        raise ValueError(f"check_overlaps must be true or false, not {check_overlaps!r}")
 
     path = as_text(node_path, "node_path").strip()
     if not path:
@@ -2644,15 +2924,19 @@ def _get_uv_report(
     if nonfinite:
         excluded["nonfinite_uv_faces"] = len(nonfinite)
 
-    overlaps, found, unintended = _uv_overlap_block(
-        triangles,
-        area_tolerance=area_tolerance,
-        stack_eps=stack_eps,
-        allow_stacking=allow_stacking,
-        resolution=resolution,
-        cap=cap,
-        scope_complete=not excluded,
-    )
+    if check_overlaps:
+        overlaps, found, unintended = _uv_overlap_block(
+            triangles,
+            area_tolerance=area_tolerance,
+            stack_eps=stack_eps,
+            allow_stacking=allow_stacking,
+            resolution=resolution,
+            cap=cap,
+            scope_complete=not excluded,
+        )
+    else:
+        overlaps = {"checked": False, "status": "not_checked", "reason": "check_overlaps=False"}
+        found, unintended = None, []
 
     area_block: dict[str, Any] = {
         "uv_area": gm.significant(stats["uv_area"]),
@@ -2664,10 +2948,26 @@ def _get_uv_report(
         area_block["texture_resolution"] = resolution
         area_block["uv_area_px2"] = gm.significant(stats["uv_area"] * resolution * resolution)
 
+    # Of the node's geometry as a whole, like the P check: the scope is named
+    # beside it, and a digest of a subset would match nothing a caller holds.
+    read_uvs = (
+        geo.vertexFloatAttribValuesAsString
+        if triangulated["uv_owner"] == "vertex"
+        else geo.pointFloatAttribValuesAsString
+    )
+    fingerprint = {
+        "geometry": geometry_fingerprint(
+            int(geo.intrinsicValue("pointcount")), geo.pointFloatAttribValuesAsString("P")
+        ),
+        "prims": total_prims,
+        "uv": hashlib.blake2b(read_uvs(attribute), digest_size=4).hexdigest(),
+    }
+
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "node_path": path,
         "scope": group_name or "all",
+        "fingerprint": fingerprint,
         "uv": {
             "attribute": attribute,
             "owner": triangulated["uv_owner"],
@@ -2720,9 +3020,12 @@ def _get_uv_report(
             "collapsed_uv_prims": collapsed,
             "nonfinite_uv_prims": nonfinite,
             "untriangulated_prims": triangulated["untriangulated"],
-            "overlapping_pairs": sorted(unintended, key=lambda e: -e["area"]),
-            "stacked_pairs": found["stacked"] if found else [],
         }
+        if found is not None:
+            # Absent rather than empty when the pass did not run: an empty
+            # list here would read as a layout with no overlaps.
+            payload["overlapping_pairs"] = sorted(unintended, key=lambda e: -e["area"])
+            payload["stacked_pairs"] = found["stacked"]
         try:
             _write_dump(dump_target, payload)
         except OSError as exc:
@@ -2757,6 +3060,7 @@ def _uv_overlap_block(
     if len(triangles) > UV_MAX_TRIANGLES:
         return (
             {
+                "checked": False,
                 "status": "skipped",
                 "scope": scope,
                 "reason": (
@@ -2784,6 +3088,7 @@ def _uv_overlap_block(
         unintended_pairs += found["stacked_count"]
 
     block: dict[str, Any] = {
+        "checked": True,
         "status": "incomplete" if found["truncated"] else "complete",
         "scope": scope,
         "allow_stacking": bool(allow_stacking),
