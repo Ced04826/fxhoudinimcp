@@ -654,18 +654,150 @@ register_handler("geometry.sample_geometry", _sample_geometry)
 ###### geometry.get_prim_intrinsics
 
 
+def _intrinsic_row(prim, names: list[str] | None) -> dict[str, Any]:
+    """One prim's intrinsics, all of them or just the ones asked for."""
+    wanted = names if names is not None else list(prim.intrinsicNames())
+    row: dict[str, Any] = {}
+    for name in wanted:
+        try:
+            row[name] = _vec_to_list(prim.intrinsicValue(name))
+        except Exception:
+            row[name] = None
+    return row
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _extremes(values: list[Any], rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """min/max/avg over the numeric entries, and the prim each extreme is on."""
+    numbers = [v for v in values if _is_number(v)]
+    if not numbers:
+        return None
+    low = min(numbers)
+    high = max(numbers)
+    return {
+        "min": low,
+        "max": high,
+        "avg": sum(numbers) / len(numbers),
+        "min_prim": rows[values.index(low)]["prim_index"],
+        "max_prim": rows[values.index(high)]["prim_index"],
+    }
+
+
+def _intrinsic_table(
+    geo: hou.Geometry,
+    indices: list[int],
+    names: list[str] | None,
+    total_prims: int,
+) -> dict[str, Any]:
+    """A table of intrinsics over many prims, with extremes per column.
+
+    Finding the packed prims whose `bounds` ran away used to cost one call
+    per prim: 281 calls, about 14 s at 50 ms each.
+    """
+    rows: list[dict[str, Any]] = []
+    for index in indices:
+        prim = geo.prim(index)
+        row = {"prim_index": index, "prim_type": prim.type().name()}
+        row.update(_intrinsic_row(prim, names))
+        rows.append(row)
+
+    columns = names if names is not None else sorted({k for r in rows for k in r} - {"prim_index"})
+    stats: dict[str, Any] = {}
+    for column in columns:
+        values = [r.get(column) for r in rows]
+        scalar = _extremes(values, rows)
+        if scalar is not None:
+            stats[column] = scalar
+            continue
+        # A vector intrinsic (`bounds` is six floats): one min/max over whole
+        # lists answers nothing, so each component gets its own extremes and
+        # the prim they belong to.
+        vectors = [v for v in values if isinstance(v, (list, tuple))]
+        if not vectors or len({len(v) for v in vectors}) != 1:
+            continue
+        components: list[dict[str, Any]] = []
+        for component in range(len(vectors[0])):
+            column_values = [v[component] if isinstance(v, (list, tuple)) else None for v in values]
+            extremes = _extremes(column_values, rows)
+            if extremes is not None:
+                components.append({"index": component, **extremes})
+        if components:
+            stats[column] = {"components": components}
+    return {
+        "total_prims": total_prims,
+        "prim_count": len(rows),
+        "intrinsics": names,
+        "prims": rows,
+        "stats": stats,
+    }
+
+
+#: Rows one batched call returns. Beyond it the caller gets a window and is
+#: told there is more, rather than a reply nobody can read.
+_INTRINSIC_ROW_CAP = 2000
+
+
 def _get_prim_intrinsics(
     *,
     node_path: str,
     prim_index: int | None = None,
+    prim_indices: list[int] | None = None,
+    prim_range: list[int] | None = None,
+    intrinsics: list[str] | None = None,
 ) -> dict[str, Any]:
     """Get intrinsic values for primitives.
 
-    If prim_index is None, return a summary across all primitives.
-    Otherwise return intrinsics for the specified primitive.
+    If prim_index is None and nothing else narrows the request, return a
+    summary across all primitives. With prim_index, return the intrinsics of
+    that one primitive.
+
+    prim_indices or prim_range read many prims in one call and answer with a
+    table (`prims`) plus `stats`: min/max/avg per intrinsic and the prim each
+    extreme belongs to. `intrinsics` narrows the columns; given alone, it
+    sweeps every prim for those intrinsics.
     """
     geo = _get_sop_geo(node_path)
     total_prims = geo.intrinsicValue("primitivecount")
+    names = [str(n) for n in intrinsics] if intrinsics else None
+
+    indices: list[int] | None = None
+    if prim_indices is not None or prim_range is not None:
+        if prim_indices is not None and prim_range is not None:
+            raise hou.OperationFailed("Pass prim_indices or prim_range, not both.")
+        if prim_range is not None:
+            if len(prim_range) != 2:
+                raise hou.OperationFailed("prim_range must be [start, end] (end inclusive).")
+            start, end = int(prim_range[0]), int(prim_range[1])
+            # Refuse before building the list: [0, 10**9] would allocate
+            # a billion ints on Houdini's main thread just to reject them.
+            if start < 0 or end >= total_prims or start > end:
+                raise hou.OperationFailed(
+                    f"prim_range {[start, end]} out of range "
+                    f"(0..{total_prims - 1}, start <= end) on {node_path}"
+                )
+            indices = list(range(start, end + 1))
+        else:
+            indices = [int(i) for i in prim_indices]
+        out_of_range = [i for i in indices if i < 0 or i >= total_prims]
+        if out_of_range:
+            raise hou.OperationFailed(
+                f"Prim index/indices {out_of_range[:10]} out of range "
+                f"(0..{total_prims - 1}) on {node_path}"
+            )
+    elif names and prim_index is None:
+        # One or two intrinsics across every prim.
+        indices = list(range(total_prims))
+
+    if indices is not None:
+        table = _intrinsic_table(geo, indices[:_INTRINSIC_ROW_CAP], names, total_prims)
+        table["node_path"] = node_path
+        if len(indices) > _INTRINSIC_ROW_CAP:
+            table["truncated"] = True
+            table["requested_count"] = len(indices)
+        return table
 
     if prim_index is not None:
         if prim_index < 0 or prim_index >= total_prims:
@@ -673,17 +805,11 @@ def _get_prim_intrinsics(
                 f"Prim index {prim_index} out of range (0..{total_prims - 1}) on {node_path}"
             )
         prim = geo.prim(prim_index)
-        intrinsic_names = prim.intrinsicNames()
-        intrinsics: dict[str, Any] = {}
-        for name in intrinsic_names:
-            val = prim.intrinsicValue(name)
-            intrinsics[name] = _vec_to_list(val)
-
         return {
             "node_path": node_path,
             "prim_index": prim_index,
             "prim_type": prim.type().name(),
-            "intrinsics": intrinsics,
+            "intrinsics": _intrinsic_row(prim, names),
         }
 
     # Summary mode: aggregate intrinsics across (a sample of) the prims.
