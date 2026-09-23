@@ -178,6 +178,9 @@ class ExpandingParm(FakeParm):
         self._raw = value
         self._value = value.replace("$HIP", "/hip")
 
+    def unexpandedString(self):  # noqa: N802 - HOM spelling
+        return self._raw if self._raw is not None else self._value
+
 
 class ReferencingParm(FakeParm):
     """A parameter carrying a channel reference, behaving the way HOM does.
@@ -191,8 +194,11 @@ class ReferencingParm(FakeParm):
         super().__init__(name, expression=f'ch("{source.path()}")', **kwargs)
         self.source = source
 
+    def getReferencedParm(self):  # noqa: N802 - HOM spelling
+        return self.source if self._expression is not None else self
+
     def eval(self):
-        return self.source.eval()
+        return self.source.eval() if self._expression is not None else self._value
 
     def set(self, value, follow_parm_reference=True):  # noqa: FBT002 - HOM's own default
         self.set_calls.append(value)
@@ -244,6 +250,11 @@ class FakeParmTuple:
     def eval(self):
         return tuple(parm.eval() for parm in self._parms)
 
+    def set(self, values):
+        # HOM's ParmTuple.set() reaches each component's own set().
+        for parm, value in zip(self._parms, values, strict=True):
+            parm.set(value)
+
 
 class FakeNode:
     def __init__(self, parms: list, tuples: dict | None = None, path: str = "/obj/geo1/box1"):
@@ -272,6 +283,10 @@ def hou_stub(monkeypatch):
     monkeypatch.setattr(hou, "frame", lambda: 12.0, raising=False)
     monkeypatch.setattr(hou, "time", lambda: 0.5, raising=False)
     monkeypatch.setattr(hou, "fps", lambda: 24.0, raising=False)
+    # Real exception classes: an `except hou.PermissionError` against the
+    # MagicMock stub would itself raise.
+    for name in ("PermissionError", "OperationFailed"):
+        monkeypatch.setattr(hou, name, type(name, (Exception,), {}), raising=False)
     return hou
 
 
@@ -337,6 +352,9 @@ class FakeSopParm:
         if hook is not None:
             hook(self._node)
 
+    def setExpression(self, expression, language=None):  # noqa: N802 - HOM spelling
+        self._node.expressions[self._name] = (expression, language)
+
 
 class FakeSop:
     """Enough hou.Node for build_network, plus switches for HOM refusing."""
@@ -350,6 +368,7 @@ class FakeSop:
         self.error_text: list = []
         self.destroyed = False
         self.cooked = 0
+        self.expressions: dict = {}
 
     def name(self):
         return self._name
@@ -809,13 +828,19 @@ def _box_node():
 
 
 class TestParameterWrites:
+    """Upstream's write (#85) with the fork's reply layer on top.
+
+    The write itself no longer refuses: it writes, then says whether an
+    expression kept the value out, whether a ch() reference carried it to
+    another node, and what a String parameter holds unexpanded. The fork adds
+    return_values / max_value_chars and expression_policy as an alias of
+    override_expression.
+    """
+
     def test_a_plain_write_reports_the_read_back_value(self, hou_stub, monkeypatch):
         node = _node(monkeypatch, _box_node())
         result = parameter_handlers._set_parameter("/obj/geo1/box1", "scale", 2.5)
-        assert result["success"] is True
-        assert result["new_value"] == 2.5
-        assert result["set"][0]["matches_requested"] is True
-        assert result["context"] == {"frame": 12.0, "time": 0.5, "fps": 24.0}
+        assert result == {"node_path": "/obj/geo1/box1", "parm_name": "scale", "new_value": 2.5}
         assert node.parm("scale").eval() == 2.5
 
     def test_a_list_sets_the_whole_tuple(self, hou_stub, monkeypatch):
@@ -824,10 +849,12 @@ class TestParameterWrites:
         assert result["new_value"] == [1.0, 2.0, 3.0]
         assert [p.eval() for p in node.parmTuple("size")] == [1.0, 2.0, 3.0]
 
-    def test_a_scalar_broadcasts_across_a_tuple(self, hou_stub, monkeypatch):
+    def test_a_scalar_on_a_tuple_name_is_refused_with_its_components(self, hou_stub, monkeypatch):
+        """Upstream does not broadcast a scalar across a tuple; it names the parms."""
         node = _node(monkeypatch, _box_node())
-        parameter_handlers._set_parameter("/obj/geo1/box1", "size", 4.0)
-        assert [p.eval() for p in node.parmTuple("size")] == [4.0, 4.0, 4.0]
+        with pytest.raises(ValueError, match="sizex"):
+            parameter_handlers._set_parameter("/obj/geo1/box1", "size", 4.0)
+        assert [p.set_calls for p in node.parmTuple("size")] == [[], [], []]
 
     def test_the_wrong_component_count_changes_nothing(self, hou_stub, monkeypatch):
         node = _node(monkeypatch, _box_node())
@@ -840,87 +867,84 @@ class TestParameterWrites:
         with pytest.raises(ValueError, match="sizex"):
             parameter_handlers._set_parameter("/obj/geo1/box1", "sizx", 1.0)
 
-    def test_preserve_refuses_an_expression_and_leaves_it_alone(self, hou_stub, monkeypatch):
+    def test_a_kept_expression_is_named_not_refused(self, hou_stub, monkeypatch):
         parm = FakeParm("px", value=5.0, expression="$CEX")
-        node = _node(monkeypatch, FakeNode([parm]))
-        with pytest.raises(ValueError, match=r"\$CEX"):
-            parameter_handlers._set_parameter("/obj/geo1/xform1", "px", 0)
+        _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
+        result = parameter_handlers._set_parameter("/obj/geo1/xform1", "px", 0.0)
+        assert parm.set_calls == [0.0]
         assert parm.expression() == "$CEX"
-        assert parm.set_calls == []
-        assert node.parm("px").eval() == 5.0
+        assert result["new_value"] == 5.0
+        assert result["expression_kept"] is True
+        assert result["expression"] == "$CEX"
+        assert result["requested"] == 0.0
 
     def test_replace_clears_the_expression_then_writes(self, hou_stub, monkeypatch):
         parm = FakeParm("px", value=5.0, expression="$CEX")
-        _node(monkeypatch, FakeNode([parm]))
+        _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
         result = parameter_handlers._set_parameter(
             "/obj/geo1/xform1", "px", 0.0, expression_policy="replace"
         )
-        assert result["success"] is True
-        assert result["set"][0]["expression_cleared"] is True
-        assert result["set"][0]["cleared"][0]["previous_expression"] == "$CEX"
+        assert result["expression_removed"] == "$CEX"
         assert result["new_value"] == 0.0
+        assert "expression_kept" not in result
         assert parm.deleted == 1
 
-    def test_a_write_that_does_not_take_is_reported_as_not_matching(
+    def test_a_write_that_does_not_take_still_reads_back_the_real_value(
         self, hou_stub, monkeypatch
     ):
-        """The $CEX case as it actually behaved: accepted, and still wrong."""
+        """No expression to name: the read-back value is the evidence."""
         parm = StubbornParm("px", value=5.0)
-        _node(monkeypatch, FakeNode([parm]))
+        _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
         result = parameter_handlers._set_parameter("/obj/geo1/xform1", "px", 0.0)
         assert parm.set_calls == [0.0]
-        assert result["set"][0]["matches_requested"] is False
-        assert result["set"][0]["requested"] == 0.0
         assert result["new_value"] == 5.0
+        assert "expression_kept" not in result
 
     def test_a_float_written_plainly_carries_no_raw_value_noise(self, hou_stub, monkeypatch):
-        """Houdini's raw text for 2.0 is "2"; the receipt must not call that news."""
+        """Houdini's raw text for 2.0 is "2"; only String parms echo raw text."""
         parm = FakeParm("scale", 1.0, raw="2")
         _node(monkeypatch, FakeNode([parm]))
-        entry = parameter_handlers._set_parameter("/obj/geo1/box1", "scale", 2.0)["set"][0]
-        assert "raw_value" not in entry
-        assert "value_is_expanded" not in entry
+        result = parameter_handlers._set_parameter("/obj/geo1/box1", "scale", 2.0)
+        assert "raw_value" not in result
 
     def test_a_variable_in_a_string_is_not_called_an_expression(self, hou_stub, monkeypatch):
-        parm = ExpandingParm("file", value="", accepts=(str,))
-        _node(monkeypatch, FakeNode([parm]))
+        template = MagicMock()
+        template.type.return_value = hou.parmTemplateType.String
+        parm = ExpandingParm("file", value="", accepts=(str,), template=template)
+        _node(monkeypatch, FakeNode([parm], path="/obj/geo1/file1"))
         result = parameter_handlers._set_parameter("/obj/geo1/file1", "file", "$HIP/geo/x.bgeo")
-        entry = result["set"][0]
-        assert entry["new_value"] == "/hip/geo/x.bgeo"
-        assert entry["raw_value"] == "$HIP/geo/x.bgeo"
-        assert entry["value_is_expanded"] is True
-        assert "expression" not in entry
-        # The value read back is not the string that was written, and the
-        # receipt says so rather than leaving a caller to compare them itself.
-        assert entry["matches_requested"] is False
+        assert result["new_value"] == "/hip/geo/x.bgeo"
+        assert result["raw_value"] == "$HIP/geo/x.bgeo"
+        assert "expression" not in result
+        assert "expression_kept" not in result
 
     def test_an_hscript_expression_is_reported_as_one(self, hou_stub, monkeypatch):
         parm = FakeParm("tx", value=10.0, expression="$F * 2")
-        _node(monkeypatch, FakeNode([parm]))
+        _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
         result = parameter_handlers._set_parameters(
             "/obj/geo1/xform1", {"tx": 3.0}, expression_policy="replace"
         )
-        assert result["success"] is True
-        assert result["set"][0]["cleared"][0]["previous_expression"] == "$F * 2"
+        assert result["errors"] == []
+        assert result["set"][0]["expression_removed"] == "$F * 2"
+        assert result["set"][0]["new_value"] == 3.0
 
-    def test_a_locked_parameter_is_refused_not_unlocked(self, hou_stub, monkeypatch):
-        parm = FakeParm("sizex", locked=True)
+    def test_a_locked_parameter_is_reported_not_unlocked(self, hou_stub, monkeypatch):
+        class LockedParm(FakeParm):
+            def set(self, value, follow_parm_reference=True):  # noqa: FBT002
+                raise RuntimeError(f"{self.name()} is locked")
+
+        parm = LockedParm("sizex", locked=True)
         _node(monkeypatch, FakeNode([parm]))
-        result = parameter_handlers._set_parameters(
-            "/obj/geo1/box1", {"sizex": 2.0}, expression_policy="replace"
-        )
-        assert result["success"] is False
+        result = parameter_handlers._set_parameters("/obj/geo1/box1", {"sizex": 2.0})
         assert "locked" in result["errors"][0]["error"]
-        assert parm.set_calls == []
+        assert result["set"] == []
+        assert parm.isLocked() is True
 
-    def test_a_batch_reports_each_failure_and_still_applies_the_rest(
-        self, hou_stub, monkeypatch
-    ):
+    def test_a_batch_reports_each_failure_and_still_applies_the_rest(self, hou_stub, monkeypatch):
         node = _node(monkeypatch, _box_node())
         result = parameter_handlers._set_parameters(
             "/obj/geo1/box1", {"sizex": 2.0, "nope": 1.0, "sizey": 3.0}
         )
-        assert result["success"] is False
         assert len(result["errors"]) == 1
         assert {entry["parm_name"] for entry in result["set"]} == {"sizex", "sizey"}
         assert node.parm("sizex").eval() == 2.0
@@ -935,13 +959,14 @@ class TestParameterWrites:
             parameter_handlers._set_parameters(
                 "/obj/geo1/box1", {"sizex": 2.0}, return_values="everything"
             )
+        with pytest.raises(ValueError, match="max_value_chars"):
+            parameter_handlers._set_parameter("/obj/geo1/box1", "sizex", 2.0, max_value_chars=0)
         assert node.parm("sizex").set_calls == []
 
     def test_a_component_that_refuses_the_value_names_itself(self, hou_stub, monkeypatch):
         parm = FakeParm("file", value="x", accepts=(str,))
         _node(monkeypatch, FakeNode([parm]))
         result = parameter_handlers._set_parameters("/obj/geo1/file1", {"file": 5})
-        assert result["success"] is False
         assert "file" in result["errors"][0]["error"]
 
     def test_a_long_value_is_summarised_rather_than_clipped(self, hou_stub, monkeypatch):
@@ -949,11 +974,10 @@ class TestParameterWrites:
         _node(monkeypatch, FakeNode([parm]))
         long_code = "// vex\n" + "f@x = 1;\n" * 400
         result = parameter_handlers._set_parameter("/obj/geo1/wrangle1", "snippet", long_code)
-        entry = result["set"][0]
-        assert "new_value" not in entry
-        assert entry["new_value_summary"]["complete"] is False
-        assert entry["new_value_summary"]["chars"] > 3000
-        assert entry["new_value_summary"]["sha1"]
+        assert "new_value" not in result
+        assert result["new_value_summary"]["complete"] is False
+        assert result["new_value_summary"]["chars"] > 3000
+        assert result["new_value_summary"]["sha1"]
 
     def test_full_asks_for_the_whole_value(self, hou_stub, monkeypatch):
         parm = FakeParm("snippet", value="", accepts=(str,))
@@ -962,7 +986,7 @@ class TestParameterWrites:
         result = parameter_handlers._set_parameter(
             "/obj/geo1/wrangle1", "snippet", long_code, return_values="full"
         )
-        assert result["set"][0]["new_value"] == long_code
+        assert result["new_value"] == long_code
 
     def test_none_returns_a_count_not_the_names(self, hou_stub, monkeypatch):
         _node(monkeypatch, _box_node())
@@ -971,7 +995,7 @@ class TestParameterWrites:
         )
         assert result["set"] == []
         assert result["set_count"] == 2
-        assert result["success"] is True
+        assert result["errors"] == []
 
     def test_none_still_names_what_failed(self, hou_stub, monkeypatch):
         _node(monkeypatch, _box_node())
@@ -985,6 +1009,110 @@ class TestParameterWrites:
         _node(monkeypatch, _box_node())
         with pytest.raises(ValueError, match="non-empty"):
             parameter_handlers._set_parameters("/obj/geo1/box1", {})
+
+
+class TestExpressionPolicyAlias:
+    """expression_policy is an older spelling of override_expression."""
+
+    def test_replace_is_override_expression(self, hou_stub, monkeypatch):
+        replies = []
+        for kwargs in ({"expression_policy": "replace"}, {"override_expression": True}):
+            parm = FakeParm("px", value=5.0, expression="$CEX")
+            _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
+            replies.append(
+                parameter_handlers._set_parameter("/obj/geo1/xform1", "px", 0.0, **kwargs)
+            )
+            assert parm.deleted == 1
+        assert replies[0] == replies[1]
+
+    def test_preserve_is_the_plain_write(self, hou_stub, monkeypatch):
+        parm = FakeParm("px", value=5.0, expression="$CEX")
+        _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
+        result = parameter_handlers._set_parameters(
+            "/obj/geo1/xform1", {"px": 0.0}, expression_policy="Preserve"
+        )
+        assert parm.deleted == 0
+        assert result["expressions_kept"] == ["px"]
+
+    def test_preserve_with_override_is_a_contradiction(self, hou_stub, monkeypatch):
+        parm = FakeParm("px", value=5.0, expression="$CEX")
+        _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
+        with pytest.raises(ValueError, match="contradicts override_expression"):
+            parameter_handlers._set_parameter(
+                "/obj/geo1/xform1",
+                "px",
+                0.0,
+                override_expression=True,
+                expression_policy="preserve",
+            )
+        with pytest.raises(ValueError, match="contradicts override_expression"):
+            parameter_handlers._set_parameters(
+                "/obj/geo1/xform1",
+                {"px": 0.0},
+                override_expression=True,
+                expression_policy="preserve",
+            )
+        assert parm.set_calls == []
+        assert parm.deleted == 0
+
+    def test_an_unknown_token_is_refused(self, hou_stub, monkeypatch):
+        parm = FakeParm("px", value=5.0, expression="$CEX")
+        _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
+        with pytest.raises(ValueError, match="expression_policy"):
+            parameter_handlers._set_parameter(
+                "/obj/geo1/xform1", "px", 0.0, expression_policy="keep"
+            )
+        assert parm.set_calls == []
+
+
+class TestReturnValuesOnTheNewReply:
+    def test_none_keeps_only_the_entries_that_report_an_expression(self, hou_stub, monkeypatch):
+        driven = FakeParm("px", value=5.0, expression="$CEX")
+        plain = FakeParm("sizex", value=1.0)
+        _node(monkeypatch, FakeNode([driven, plain], path="/obj/geo1/xform1"))
+        result = parameter_handlers._set_parameters(
+            "/obj/geo1/xform1", {"px": 0.0, "sizex": 2.0}, return_values="none"
+        )
+        assert result["set_count"] == 2
+        assert [entry["parm_name"] for entry in result["set"]] == ["px"]
+        assert result["set"][0]["expression_kept"] is True
+        assert result["expressions_kept"] == ["px"]
+        assert "did not take" in result["warning"]
+
+    def test_none_on_a_single_write_drops_only_plain_values(self, hou_stub, monkeypatch):
+        _node(monkeypatch, _box_node())
+        plain = parameter_handlers._set_parameter(
+            "/obj/geo1/box1", "scale", 2.0, return_values="none"
+        )
+        assert plain == {"node_path": "/obj/geo1/box1", "parm_name": "scale"}
+
+        parm = FakeParm("px", value=5.0, expression="$CEX")
+        _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
+        kept = parameter_handlers._set_parameter(
+            "/obj/geo1/xform1", "px", 0.0, return_values="none"
+        )
+        assert kept["expression_kept"] is True
+        assert kept["expression"] == "$CEX"
+
+    def test_summary_compacts_requested_too(self, hou_stub, monkeypatch):
+        long_code = "f@x = 1;\n" * 400
+        parm = FakeParm("snippet", value="", expression="chs('../code')", accepts=(str,))
+        _node(monkeypatch, FakeNode([parm], path="/obj/geo1/wrangle1"))
+        result = parameter_handlers._set_parameters("/obj/geo1/wrangle1", {"snippet": long_code})
+        entry = result["set"][0]
+        assert entry["expression_kept"] is True
+        assert "requested" not in entry
+        assert entry["requested_summary"]["chars"] > 3000
+        assert entry["requested_summary"]["complete"] is False
+
+    def test_max_value_chars_sets_the_threshold(self, hou_stub, monkeypatch):
+        _node(monkeypatch, _box_node())
+        result = parameter_handlers._set_parameter(
+            "/obj/geo1/box1", "size", [1.0, 2.0, 3.0], max_value_chars=5
+        )
+        assert "new_value" not in result
+        assert result["new_value_summary"]["kind"] == "list"
+        assert result["new_value_summary"]["count"] == 3
 
 
 ###### execute_python: bounded output, honest metadata
@@ -1089,11 +1217,15 @@ class TestExecutePython:
         assert result["return_value"] is None
 
     def test_repr_and_none_formats(self):
-        as_repr = code_handlers._execute_python("", return_expression="[1, 2]", return_format="repr")
+        as_repr = code_handlers._execute_python(
+            "", return_expression="[1, 2]", return_format="repr"
+        )
         assert as_repr["return_value"] == "[1, 2]"
         assert as_repr["return_serialization"] == "repr"
 
-        as_none = code_handlers._execute_python("", return_expression="[1, 2]", return_format="none")
+        as_none = code_handlers._execute_python(
+            "", return_expression="[1, 2]", return_format="none"
+        )
         assert as_none["return_value"] is None
         assert as_none["return_type"] == "list"
         assert as_none["return_omitted"] is True
@@ -1146,9 +1278,7 @@ class TestExecutePython:
     def test_a_dump_that_cannot_be_written_is_not_an_execution_failure(self, tmp_path):
         blocker = tmp_path / "blocker"
         blocker.write_text("not a directory", encoding="utf-8")
-        result = code_handlers._execute_python(
-            "print('done')", dump_path=str(blocker / "run.json")
-        )
+        result = code_handlers._execute_python("print('done')", dump_path=str(blocker / "run.json"))
         assert result["execution_success"] is True
         assert result["success"] is True
         assert result["dump_failed"] is True
@@ -1230,10 +1360,13 @@ class TestToolWrappers:
             "node_path": "/obj/geo1/xform1",
             "parm_name": "px",
             "value": 0.0,
+            "override_expression": False,
             "expression_policy": "replace",
             "return_values": "summary",
         }
 
+        # The alias is only sent when given, so the bridge sees upstream's
+        # arguments plus return_values.
         await set_parameters(
             mock_ctx,
             node_path="/obj/geo1/box1",
@@ -1243,7 +1376,7 @@ class TestToolWrappers:
         assert mock_bridge.execute.call_args[0][1] == {
             "node_path": "/obj/geo1/box1",
             "params": {"sizex": 2.0},
-            "expression_policy": "preserve",
+            "override_expression": False,
             "return_values": "full",
         }
 
@@ -1486,6 +1619,46 @@ def _build(network, **kwargs):
     return graph_handlers.build_network(parent_path=network.path(), **kwargs)
 
 
+class TestExpressionValuesPassTheShapeCheck:
+    """An {"expr": ...} value in parms is an expression, not a value.
+
+    The shape check refuses any dict ("takes a value, not an object"); an
+    expression wrapper has to get past it to upstream's own validation.
+    """
+
+    def test_the_dry_run_accepts_an_expr_value(self, network):
+        result = _build(
+            network,
+            nodes=[{"type": "box", "name": "b", "parms": {"scale": {"expr": "$F"}}}],
+            dry_run=True,
+        )
+        assert result["valid"] is True, result.get("errors")
+
+    def test_a_dict_without_expr_gets_upstreams_error_only(self, network):
+        result = _build(
+            network,
+            nodes=[{"type": "box", "name": "b", "parms": {"scale": {"value": 2}}}],
+            dry_run=True,
+        )
+        assert result["valid"] is False
+        assert any("without 'expr'" in error for error in result["errors"])
+        assert not any("not an object" in error for error in result["errors"])
+
+    def test_the_build_sets_it_as_an_expression(self, network):
+        result = _build(
+            network,
+            nodes=[
+                {
+                    "type": "box",
+                    "name": "b",
+                    "parms": {"scale": {"expr": "$F", "language": "hscript"}},
+                }
+            ],
+        )
+        assert result["success"] is True, result.get("errors")
+        assert network.node("b").expressions["scale"][0] == "$F"
+
+
 class TestExactInputEnforcement:
     """An environment that auto-wires new nodes is the reason "exact" exists."""
 
@@ -1567,18 +1740,14 @@ class TestExactInputEnforcement:
         assert network.children() == [], "a failed enforcement must not leave nodes behind"
 
     def test_a_reconnect_that_fails_rolls_the_build_back(self, network):
-        result = _build(
-            network, input_policy="exact", nodes=self._steal(network, refuse=True)
-        )
+        result = _build(network, input_policy="exact", nodes=self._steal(network, refuse=True))
         assert result["success"] is False
         assert "could not be set back" in " ".join(result["errors"])
         assert network.children() == []
 
     def test_wiring_that_silently_refuses_to_stick_is_not_called_success(self, network):
         """setInput returning without raising is not evidence of anything."""
-        result = _build(
-            network, input_policy="exact", nodes=self._steal(network, ignore=True)
-        )
+        result = _build(network, input_policy="exact", nodes=self._steal(network, ignore=True))
         assert result["success"] is False
         assert result["exact_inputs_verified"] is False
         mismatch = result["input_mismatches"][0]
@@ -1643,12 +1812,10 @@ class TestExactInputEnforcement:
 
 
 class TestVerificationScope:
-    """"cooked: true" about an empty target list was a confident non-answer."""
+    """ "cooked: true" about an empty target list was a confident non-answer."""
 
     def test_no_targets_means_unknown_not_healthy(self, network):
-        result = _build(
-            network, inspect_nodes=[], nodes=[{"type": "box", "name": "b"}]
-        )
+        result = _build(network, inspect_nodes=[], nodes=[{"type": "box", "name": "b"}])
         assert result["cooked"] is None
         assert result["healthy"] is None
         assert result["verification"]["targets_inspected"] == 0
@@ -1656,9 +1823,7 @@ class TestVerificationScope:
         assert "nothing about cooking is known" in result["verification"]["note"]
 
     def test_unresolved_targets_only_means_unknown(self, network):
-        result = _build(
-            network, inspect_nodes=["nowhere"], nodes=[{"type": "box", "name": "b"}]
-        )
+        result = _build(network, inspect_nodes=["nowhere"], nodes=[{"type": "box", "name": "b"}])
         assert result["cooked"] is None
         assert result["healthy"] is None
         assert result["verification"]["targets_unresolved"] == ["nowhere"]
@@ -1696,9 +1861,7 @@ class TestVerificationScope:
     def test_the_scope_names_which_targets_were_chosen(self, network):
         default = _build(network, nodes=[{"type": "box", "name": "b"}])
         assert default["verification"]["scope"] == "terminals"
-        requested = _build(
-            network, inspect_nodes=["c"], nodes=[{"type": "box", "name": "c"}]
-        )
+        requested = _build(network, inspect_nodes=["c"], nodes=[{"type": "box", "name": "c"}])
         assert requested["verification"]["scope"] == "requested"
 
     def test_a_node_error_is_reported_bounded(self, network):
@@ -1773,17 +1936,19 @@ class TestStrictAndDumpPromises:
 
 
 class TestBoundedErrorAndExpressionText:
-    HUGE = "ch(\"/obj/x/y\") + " * 6000  # ~100 000 characters of expression
+    HUGE = 'ch("/obj/x/y") + ' * 6000  # ~100 000 characters of expression
 
-    def test_a_refusal_does_not_quote_the_whole_expression(self, hou_stub, monkeypatch):
+    def test_a_kept_expression_is_named_without_quoting_all_of_it(self, hou_stub, monkeypatch):
         parm = FakeParm("px", 5.0, expression=self.HUGE)
         _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
-        with pytest.raises(ValueError) as caught:
-            parameter_handlers._set_parameter("/obj/geo1/xform1", "px", 0.0)
-        message = str(caught.value)
+        result = parameter_handlers._set_parameter("/obj/geo1/xform1", "px", 0.0)
         assert len(self.HUGE) > 90000
-        assert len(message) < 1000, len(message)
-        assert "chars, sha1" in message, "the size and a fingerprint stand in for the rest"
+        assert result["expression_kept"] is True
+        assert "expression" not in result
+        # The size and a fingerprint stand in for the rest.
+        assert result["expression_summary"]["chars"] > 90000
+        assert result["expression_summary"]["sha1"]
+        assert _size(result) < 3000, _size(result)
 
     def test_clearing_reports_an_excerpt_of_what_it_removed(self, hou_stub, monkeypatch):
         parm = FakeParm("px", 5.0, expression=self.HUGE)
@@ -1791,11 +1956,11 @@ class TestBoundedErrorAndExpressionText:
         result = parameter_handlers._set_parameter(
             "/obj/geo1/xform1", "px", 0.0, expression_policy="replace"
         )
-        cleared = result["set"][0]["cleared"][0]
-        assert cleared["previous_expression_chars"] == len(self.HUGE)
-        assert cleared["previous_expression_truncated"] is True
-        assert cleared["previous_expression_sha1"]
-        assert len(cleared["previous_expression"]) <= 400
+        removed = result["expression_removed_summary"]
+        assert "expression_removed" not in result
+        assert removed["complete"] is False
+        assert removed["sha1"]
+        assert len(removed["head"]) <= 400
         assert _size(result) < 3000, _size(result)
 
     def test_a_surviving_expression_is_read_back_bounded(self, hou_stub, monkeypatch):
@@ -1804,9 +1969,10 @@ class TestBoundedErrorAndExpressionText:
         result = parameter_handlers._set_parameter(
             "/obj/geo1/xform1", "px", 0.0, expression_policy="replace"
         )
-        entry = result["set"][0]
-        assert entry["expression_truncated"] is True
-        assert len(entry["expression"]) < 600
+        # Clearing reported nothing wrong and the expression is still there:
+        # the read-back is what notices.
+        assert result["expression_kept"] is True
+        assert result["expression_summary"]["complete"] is False
         assert _size(result) < 4000, _size(result)
 
     def test_a_write_error_quoting_its_value_is_bounded(self, hou_stub, monkeypatch):
@@ -1816,7 +1982,7 @@ class TestBoundedErrorAndExpressionText:
 
         _node(monkeypatch, FakeNode([LoudParm("sizex")]))
         result = parameter_handlers._set_parameters("/obj/geo1/box1", {"sizex": 1.0})
-        assert result["success"] is False
+        assert result["set"] == []
         assert len(result["errors"][0]["error"]) < 700, len(result["errors"][0]["error"])
 
     def test_a_huge_exception_message_does_not_land_whole(self, tmp_path):
@@ -1839,9 +2005,7 @@ class TestBoundedErrorAndExpressionText:
         assert len(payload["error"]) > 500000
 
     def test_both_ends_of_a_clipped_traceback_survive(self):
-        result = code_handlers._execute_python(
-            "def a():\n    raise KeyError('K' * 300000)\na()"
-        )
+        result = code_handlers._execute_python("def a():\n    raise KeyError('K' * 300000)\na()")
         assert result["error"].startswith("Traceback (most recent call last)")
         assert "chars elided" in result["error"]
         assert result["error_summary"].startswith("KeyError: ")
@@ -1858,32 +2022,36 @@ class TestBoundedErrorAndExpressionText:
 
 
 class TestChannelReferenceSafety:
-    def test_a_write_never_follows_a_channel_reference(self, hou_stub, monkeypatch):
-        source = FakeParm("sizex", 7.0)
+    def test_replace_breaks_a_channel_reference_instead_of_following_it(
+        self, hou_stub, monkeypatch
+    ):
+        source = FakeParm("src", 7.0)
         referencing = ReferencingParm("sizex", source)
         _node(monkeypatch, FakeNode([referencing], path="/obj/geo1/box2"))
         result = parameter_handlers._set_parameter(
             "/obj/geo1/box2", "sizex", 3.0, expression_policy="replace"
         )
-        assert result["success"] is True
-        assert referencing.followed is False, "follow_parm_reference must be passed as False"
+        assert result["expression_removed"] == 'ch("/obj/fake/src")'
+        assert result["new_value"] == 3.0
+        assert "written_through" not in result
         # The node the caller never named is untouched.
         assert source.set_calls == []
         assert source.eval() == 7.0
 
-    def test_preserve_refuses_a_referenced_parameter_outright(self, hou_stub, monkeypatch):
-        source = FakeParm("sizex", 7.0)
+    def test_a_plain_write_names_the_parameter_it_went_through(self, hou_stub, monkeypatch):
+        """Upstream writes with HOM's default and says where the value landed."""
+        source = FakeParm("src", 7.0)
         referencing = ReferencingParm("sizex", source)
         _node(monkeypatch, FakeNode([referencing], path="/obj/geo1/box2"))
-        with pytest.raises(ValueError, match=r"ch\("):
-            parameter_handlers._set_parameter("/obj/geo1/box2", "sizex", 3.0)
-        assert referencing.set_calls == []
-        assert source.eval() == 7.0
+        result = parameter_handlers._set_parameter("/obj/geo1/box2", "sizex", 3.0)
+        assert result["written_through"] == "/obj/fake/src"
+        assert "expression_kept" not in result
+        assert source.eval() == 3.0
 
-    def test_a_plain_write_passes_the_flag_too(self, hou_stub, monkeypatch):
+    def test_a_plain_write_uses_houdinis_default_set(self, hou_stub, monkeypatch):
         node = _node(monkeypatch, _box_node())
         parameter_handlers._set_parameter("/obj/geo1/box1", "scale", 2.0)
-        assert node.parm("scale").followed is False
+        assert node.parm("scale").followed is True
 
     def test_a_build_without_the_keyword_refuses_rather_than_following(self):
         class OldHoudiniParm(FakeParm):
@@ -1897,21 +2065,22 @@ class TestChannelReferenceSafety:
 
 
 class TestClearingFailures:
-    def test_a_channel_that_will_not_clear_stops_the_write(self, hou_stub, monkeypatch):
-        source = FakeParm("sizex", 7.0)
+    def test_a_channel_that_will_not_clear_is_reported_as_kept(self, hou_stub, monkeypatch):
+        source = FakeParm("src", 7.0)
         parm = UnclearableParm("sizex", expression=f'ch("{source.path()}")')
         _node(monkeypatch, FakeNode([parm], path="/obj/geo1/box2"))
         result = parameter_handlers._set_parameters(
             "/obj/geo1/box2", {"sizex": 3.0}, expression_policy="replace"
         )
-        assert result["success"] is False
-        assert "could not clear" in result["errors"][0]["error"]
-        # Nothing was written, so nothing could have gone through the reference.
-        assert parm.set_calls == []
+        # Not an error: the write happened and did not take, and the reply
+        # says so rather than claiming the expression was removed.
+        assert result["errors"] == []
+        assert result["expressions_kept"] == ["sizex"]
+        assert "expression_removed" not in result["set"][0]
         assert parm.expression() == f'ch("{source.path()}")'
         assert source.set_calls == []
 
-    def test_one_unclearable_component_stops_that_whole_write(self, hou_stub, monkeypatch):
+    def test_one_unclearable_component_is_named_in_a_tuple_write(self, hou_stub, monkeypatch):
         good = FakeParm("sizex", 1.0)
         bad = UnclearableParm("sizey", 1.0, expression="$F")
         third = FakeParm("sizez", 1.0)
@@ -1920,45 +2089,50 @@ class TestClearingFailures:
         result = parameter_handlers._set_parameters(
             "/obj/geo1/box1", {"size": [2.0, 3.0, 4.0]}, expression_policy="replace"
         )
-        assert result["success"] is False
-        assert third.set_calls == [], "no component may be written once one refused"
+        assert result["expressions_kept"] == ["size"]
+        components = result["set"][0]["expression_components"]
+        assert [c["component"] for c in components] == ["sizey"]
+        assert third.set_calls == [4.0]
 
 
 class TestReplacePreflight:
-    """Obvious nonsense is refused BEFORE an expression is deleted for it."""
+    """What a value Houdini refuses does under override_expression.
 
-    def test_a_dictionary_value_does_not_cost_the_expression(self, hou_stub, monkeypatch):
+    Upstream clears the expression and then writes, with no type pre-flight:
+    the refusal is reported in `errors`, and the expression is already gone.
+    These pin that order so a change to it is noticed.
+    """
+
+    def test_a_dictionary_value_is_reported_as_an_error(self, hou_stub, monkeypatch):
         parm = FakeParm("px", 5.0, expression="$CEX")
         _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
         result = parameter_handlers._set_parameters(
             "/obj/geo1/xform1", {"px": {"x": 1}}, expression_policy="replace"
         )
-        assert result["success"] is False
-        assert "scalar" in result["errors"][0]["error"]
-        assert parm.deleted == 0
-        assert parm.expression() == "$CEX"
+        assert result["set"] == []
+        assert "dict" in result["errors"][0]["error"]
+        assert parm.deleted == 1
 
-    def test_a_null_value_does_not_cost_the_expression(self, hou_stub, monkeypatch):
+    def test_a_null_value_is_reported_as_an_error(self, hou_stub, monkeypatch):
         parm = FakeParm("px", 5.0, expression="$CEX")
         _node(monkeypatch, FakeNode([parm], path="/obj/geo1/xform1"))
         result = parameter_handlers._set_parameters(
             "/obj/geo1/xform1", {"px": None}, expression_policy="replace"
         )
-        assert result["success"] is False
-        assert "null" in result["errors"][0]["error"]
-        assert parm.deleted == 0
+        assert result["set"] == []
+        assert "NoneType" in result["errors"][0]["error"]
+        assert parm.deleted == 1
 
-    def test_a_word_written_to_a_numeric_parameter_is_refused_before_clearing(
-        self, hou_stub, monkeypatch
-    ):
-        parm = FakeParm("iterations", 1, expression="$F", template=FakeTemplate("Int"))
+    def test_a_word_written_to_a_numeric_parameter_is_reported(self, hou_stub, monkeypatch):
+        parm = FakeParm(
+            "iterations", 1, expression="$F", template=FakeTemplate("Int"), accepts=(int, float)
+        )
         _node(monkeypatch, FakeNode([parm], path="/obj/geo1/subdivide1"))
         result = parameter_handlers._set_parameters(
             "/obj/geo1/subdivide1", {"iterations": "quads"}, expression_policy="replace"
         )
-        assert result["success"] is False
-        assert "not a number" in result["errors"][0]["error"]
-        assert parm.deleted == 0
+        assert result["set"] == []
+        assert "iterations" in result["errors"][0]["error"]
 
     def test_a_menu_token_on_an_integer_menu_is_not_refused(self, hou_stub, monkeypatch):
         parm = FakeParm(
@@ -1966,14 +2140,14 @@ class TestReplacePreflight:
         )
         _node(monkeypatch, FakeNode([parm], path="/obj/geo1/polyfill1"))
         result = parameter_handlers._set_parameters("/obj/geo1/polyfill1", {"fillmode": "quads"})
-        assert result["success"] is True, result["errors"]
+        assert result["errors"] == []
         assert parm.set_calls == ["quads"]
 
     def test_a_numeric_string_on_a_numeric_parameter_is_not_refused(self, hou_stub, monkeypatch):
         parm = FakeParm("scale", 1.0, template=FakeTemplate("Float"), accepts=(str, float, int))
         _node(monkeypatch, FakeNode([parm]))
         result = parameter_handlers._set_parameters("/obj/geo1/box1", {"scale": "2.5"})
-        assert result["success"] is True, result["errors"]
+        assert result["errors"] == []
 
     def test_a_tuple_length_error_still_precedes_everything(self, hou_stub, monkeypatch):
         parm = FakeParm("px", 5.0, expression="$CEX")
@@ -1982,6 +2156,6 @@ class TestReplacePreflight:
         result = parameter_handlers._set_parameters(
             "/obj/geo1/xform1", {"p": [1.0, 2.0]}, expression_policy="replace"
         )
-        assert result["success"] is False
+        assert result["set"] == []
         assert "components" in result["errors"][0]["error"]
         assert parm.deleted == 0

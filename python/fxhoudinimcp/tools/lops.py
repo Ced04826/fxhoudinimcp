@@ -14,11 +14,16 @@ from fxhoudinimcp.server import _get_bridge, mcp
 
 
 @mcp.tool()
-async def get_stage_info(ctx: Context, node_path: str) -> dict:
-    """Get USD stage info from a LOP node.
+async def get_stage_info(ctx: Context, node_path: str = "/stage") -> dict:
+    """Get USD stage info from a LOP node, or from a LOP network.
+
+    Given a network such as "/stage", the answer is about what that network
+    displays: `display_node` (and `render_node`) name it, `resolved_from` is
+    "display_node", `viewport_delegate` names the Hydra delegate the Scene
+    Viewer draws with, and `frame` is the current frame.
 
     Args:
-        node_path: LOP node path.
+        node_path: LOP node or LOP network path (default "/stage").
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
@@ -35,6 +40,7 @@ async def get_usd_prim(
     node_path: str,
     prim_path: str,
     full: bool = False,
+    traverse_instance_proxies: bool = False,
 ) -> dict:
     """Get detailed info about a USD prim.
 
@@ -49,11 +55,18 @@ async def get_usd_prim(
         node_path: LOP node path.
         prim_path: USD prim path.
         full: Return array attributes in full instead of summarised.
+        traverse_instance_proxies: List the children that live on an
+            instanceable prim's prototype. Without it such a prim answers
+            `children: []` and is flagged `is_instanceable` with a
+            `hidden_descendants` count, so the empty list is not read as
+            "nothing inside".
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"node_path": node_path, "prim_path": prim_path}
     if full:
         params["full"] = True
+    if traverse_instance_proxies:
+        params["traverse_instance_proxies"] = True
     return await bridge.execute("lops.get_usd_prim", params)
 
 
@@ -65,8 +78,13 @@ async def list_usd_prims(
     prim_type: str | None = None,
     kind: str | None = None,
     depth: int | None = None,
+    traverse_instance_proxies: bool = False,
 ) -> dict:
     """List USD prims on a stage with filtering.
+
+    Instanced geometry is invisible to the default walk: an instanceable
+    prim has no children of its own, they belong to its prototype. Set
+    traverse_instance_proxies to list the prims under it.
 
     Args:
         node_path: LOP node path.
@@ -74,6 +92,8 @@ async def list_usd_prims(
         prim_type: USD type filter (e.g. "Mesh", "Xform").
         kind: Kind filter (e.g. "component", "group").
         depth: Max traversal depth.
+        traverse_instance_proxies: Descend into instanceable prims and list
+            the prims under their prototypes.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {
@@ -86,6 +106,8 @@ async def list_usd_prims(
         params["kind"] = kind
     if depth is not None:
         params["depth"] = depth
+    if traverse_instance_proxies:
+        params["traverse_instance_proxies"] = True
     return await bridge.execute("lops.list_usd_prims", params)
 
 
@@ -108,11 +130,18 @@ async def get_usd_attribute(
     big array by raising offset; pass full=True to get every element in
     `value` at once.
 
+    A time-sampled attribute (a PointInstancer's `positions`, `protoIndices`)
+    has nothing in its default slot: read with no time it answers null. With
+    no `time` given, the current frame is read instead, and the reply carries
+    `time`, `time_source`, `time_samples` and `time_range`, so `value: null`
+    never stands unexplained next to `is_authored: true`.
+
     Args:
         node_path: LOP node path.
         prim_path: USD prim path.
         attr_name: Attribute name.
-        time: Time code (frame number).
+        time: Time code (frame number). Omitted on a time-sampled attribute,
+            the current frame is used (the first sample outside the range).
         full: Return the whole array as `value`.
         offset: First element of the window for a long array.
         limit: Window size for a long array.
@@ -155,12 +184,18 @@ async def get_usd_prim_stats(
     ctx: Context,
     node_path: str,
     prim_path: str = "/",
+    traverse_instance_proxies: bool = False,
 ) -> dict:
     """Get prim counts by USD type under a root path.
+
+    Instanced geometry counts once per prototype, not per instance:
+    `instanceable_prims` says how many prims were counted without their
+    contents, and traverse_instance_proxies counts what is under them.
 
     Args:
         node_path: LOP node path.
         prim_path: Root prim path to gather stats from.
+        traverse_instance_proxies: Count prims under instanceable prototypes.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
@@ -168,6 +203,7 @@ async def get_usd_prim_stats(
         {
             "node_path": node_path,
             "prim_path": prim_path,
+            "traverse_instance_proxies": traverse_instance_proxies,
         },
     )
 
@@ -311,12 +347,15 @@ async def find_usd_prims(
     ctx: Context,
     node_path: str,
     pattern: str,
+    traverse_instance_proxies: bool = False,
 ) -> dict:
     """Search USD prims by path pattern.
 
     Args:
         node_path: LOP node path.
         pattern: Glob pattern (supports *, **) or substring.
+        traverse_instance_proxies: Search prims under instanceable
+            prototypes too; the default walk never visits them.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
@@ -324,6 +363,7 @@ async def find_usd_prims(
         {
             "node_path": node_path,
             "pattern": pattern,
+            "traverse_instance_proxies": traverse_instance_proxies,
         },
     )
 

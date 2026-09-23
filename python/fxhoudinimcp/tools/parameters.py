@@ -43,43 +43,51 @@ async def set_parameter(
     node_path: str,
     parm_name: str,
     value: Value,
-    expression_policy: str = "preserve",
+    override_expression: bool = False,
+    expression_policy: str | None = None,
     return_values: str = "summary",
 ) -> dict:
-    """Set a parameter value and read back what the node now evaluates to.
+    """Set a parameter value.
 
-    A list sets a whole vector parameter ("size", "t"); a scalar on a
-    vector name broadcasts across its components.
+    A parameter that holds an expression does NOT take a literal: Houdini
+    writes the value into a slot the expression keeps overriding. The reply
+    then carries `expression_kept: true` with the surviving `expression` and
+    what you `requested` (plus `same_as_evaluated` when the expression happens
+    to evaluate to that value right now) — read those before calling the write
+    done. Pass override_expression=True to clear the expression first.
 
-    The receipt reports the evaluated value, the raw text behind it, and
-    `matches_requested` when the two disagree — which is how you find out
-    that a parameter you just wrote is still being driven by an expression.
+    A parameter holding a BARE ch() reference is the opposite trap: Houdini
+    writes THROUGH it into the parameter it reads, so the value lands on
+    another node. The reply names that parameter in `written_through`.
+
+    A String parameter echoes `raw_value` (the unexpanded text, `$JOB/...`)
+    next to the expanded `new_value`.
 
     Args:
         node_path: Node path.
         parm_name: Parameter name.
         value: New value (int, float, string, bool, or list).
-        expression_policy: What to do when the parameter is already driven.
-            "preserve" (default) refuses and names the expression rather
-            than overwriting it. "replace" clears the keyframes and
-            expression on the addressed component first, then writes the
-            literal — a channel reference is cleared where it is written
-            and never followed to the parameter it points at.
+        override_expression: Remove an expression standing in the way,
+            instead of reporting that the write did not take.
+        expression_policy: Alias of override_expression: "replace" is
+            override_expression=True, "preserve" is the default report-only
+            write. Contradicting override_expression is an error.
         return_values: "summary" (default) compacts values over ~200
             characters to length/hash/samples, "full" returns them whole,
-            "none" skips the read-back and returns `set_count` plus errors.
+            "none" leaves the values out and keeps only what reports an
+            expression.
     """
     bridge = _get_bridge(ctx)
-    return await bridge.execute(
-        "parameters.set_parameter",
-        {
-            "node_path": node_path,
-            "parm_name": parm_name,
-            "value": value,
-            "expression_policy": expression_policy,
-            "return_values": return_values,
-        },
-    )
+    payload: dict[str, Any] = {
+        "node_path": node_path,
+        "parm_name": parm_name,
+        "value": value,
+        "override_expression": override_expression,
+        "return_values": return_values,
+    }
+    if expression_policy is not None:
+        payload["expression_policy"] = expression_policy
+    return await bridge.execute("parameters.set_parameter", payload)
 
 
 ###### parameters.set_parameters
@@ -90,36 +98,43 @@ async def set_parameters(
     ctx: Context,
     node_path: str,
     params: dict[str, Any],
-    expression_policy: str = "preserve",
+    override_expression: bool = False,
+    expression_policy: str | None = None,
     return_values: str = "summary",
 ) -> dict:
-    """Batch-set multiple parameters on a node, with read-back evidence.
+    """Batch-set multiple parameters on a node.
 
-    Identical rules to set_parameter, including list values for vector
-    parameters. Per-parameter failures are reported in `errors` and do not
-    stop the rest; `success` is false if any occurred.
+    Parameters that held an expression and therefore ignored the literal are
+    listed in `expressions_kept`, with a top-level `warning`: a batch whose
+    `errors` is empty can still contain a write that did not take. Values that
+    landed on ANOTHER node, because the parameter is a bare ch() reference
+    Houdini writes through, are in `written_through`. Each entry in `set`
+    carries the same keys as set_parameter's reply. Pass
+    override_expression=True to clear those expressions and links instead.
 
     Args:
         node_path: Node path.
         params: Mapping of parameter names to values.
-        expression_policy: "preserve" (default) refuses to overwrite an
-            existing expression or keyframes and says which; "replace"
-            clears them on the addressed component first.
-        return_values: "summary" (default), "full", or "none". "none" is
-            for large batches: no read-back, a `set_count`, the errors, and
-            only those entries that report a cleared expression or a
-            partial write.
+        override_expression: Remove expressions standing in the way.
+        expression_policy: Alias of override_expression: "replace" is
+            override_expression=True, "preserve" is the default report-only
+            write. Contradicting override_expression is an error.
+        return_values: "summary" (default) compacts values over ~200
+            characters to length/hash/samples, "full" returns them whole.
+            "none" is for large batches: `set_count`, the errors, and only
+            the entries that report an expression (kept, written through or
+            removed).
     """
     bridge = _get_bridge(ctx)
-    return await bridge.execute(
-        "parameters.set_parameters",
-        {
-            "node_path": node_path,
-            "params": params,
-            "expression_policy": expression_policy,
-            "return_values": return_values,
-        },
-    )
+    payload: dict[str, Any] = {
+        "node_path": node_path,
+        "params": params,
+        "override_expression": override_expression,
+        "return_values": return_values,
+    }
+    if expression_policy is not None:
+        payload["expression_policy"] = expression_policy
+    return await bridge.execute("parameters.set_parameters", payload)
 
 
 ###### parameters.get_parameter_schema
@@ -162,6 +177,7 @@ async def get_parm_references(
     parm_name: str | None = None,
     direction: str = "both",
     limit: int = 200,
+    include_node_level: bool | None = None,
 ) -> dict:
     """Who references a parameter, and what it references — in one call.
 
@@ -171,18 +187,25 @@ async def get_parm_references(
     backtick strings read, resolved to parameter paths (pure ch() links and
     richer expressions alike; `unresolved` names a written target that no
     longer exists). `node_dependents` / `node_references` give the
-    node-level view for this node only.
+    node-level view for this node only; `include_node_level` in the reply
+    says whether they were included.
 
     Args:
         node_path: Node to inspect.
         parm_name: One parameter instead of all of them.
         direction: "both", "incoming" or "outgoing".
         limit: Cap on reported entries.
+        include_node_level: Include node_dependents / node_references. Default:
+            on for a whole-node query, off when parm_name names one parameter;
+            on an asset with hundreds of children those lists run to about
+            100 KB and answer a question about the node, not the parameter.
     """
     bridge = _get_bridge(ctx)
     payload: dict[str, Any] = {"node_path": node_path, "direction": direction, "limit": limit}
     if parm_name is not None:
         payload["parm_name"] = parm_name
+    if include_node_level is not None:
+        payload["include_node_level"] = include_node_level
     return await bridge.execute("parameters.get_parm_references", payload)
 
 
@@ -435,9 +458,12 @@ async def create_spare_parameters(
 @mcp.tool()
 async def get_parameters(
     ctx: Context,
-    node_path: str,
+    node_path: str | None = None,
     patterns: list[str] | None = None,
     include_defaults: bool = False,
+    inside: str | None = None,
+    recursive: bool = False,
+    node_type: str | None = None,
 ) -> dict:
     """Read many parameter values at once, matched by name or label substring.
 
@@ -446,17 +472,30 @@ async def get_parameters(
     each, and unlike get_node_card these are the live values on this node rather
     than the defaults for its type.
 
+    Pass `inside` instead of `node_path` to read the same patterns across a
+    whole network in one call: "every file parm of this material library,
+    unexpanded" comes back as `rows` of {node, parm, value, raw_value}, up to
+    2000 rows. `raw_value` is the unexpanded text ($JOB/...), shown when it
+    differs from the value, exactly as for a single node.
+
     Args:
         node_path: Node to read.
         patterns: Substrings matched against parameter name and label. Omit for
-            everything, up to the cap.
+            everything, up to the cap. Required with `inside`.
         include_defaults: Also report whether each value is still the default.
+        inside: Network to read instead of a single node.
+        recursive: With `inside`, include every descendant, not only children.
+        node_type: With `inside`, only nodes of this type (e.g. "mtlximage").
     """
     bridge = _get_bridge(ctx)
-    params: dict[str, Any] = {
-        "node_path": node_path,
-        "include_defaults": include_defaults,
-    }
+    params: dict[str, Any] = {"include_defaults": include_defaults}
+    if node_path is not None:
+        params["node_path"] = node_path
     if patterns is not None:
         params["patterns"] = patterns
+    if inside is not None:
+        params["inside"] = inside
+        params["recursive"] = recursive
+        if node_type is not None:
+            params["node_type"] = node_type
     return await bridge.execute("parameters.get_parameters", params)

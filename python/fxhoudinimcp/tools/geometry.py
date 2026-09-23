@@ -278,17 +278,38 @@ async def get_prim_intrinsics(
     ctx: Context,
     node_path: str,
     prim_index: int | None = None,
+    prim_indices: list[int] | None = None,
+    prim_range: list[int] | None = None,
+    intrinsics: list[str] | None = None,
 ) -> dict:
-    """Get intrinsic values for primitives.
+    """Get intrinsic values for primitives: one, many, or all of them.
+
+    Read many prims in one call rather than one call per prim. `intrinsics`
+    alone sweeps every prim for those intrinsics and answers with a `prims`
+    table plus `stats` (min/max/avg and the prim index each extreme belongs
+    to, per component for a vector such as `bounds`); `prim_indices` or
+    `prim_range` narrow it to the prims you care about. Up to 2000 rows per
+    call; beyond that the reply says `truncated` and `requested_count`, and
+    `stats` cover only the rows returned: page with `prim_range`.
 
     Args:
         node_path: Node path.
-        prim_index: Primitive index, or None for a summary.
+        prim_index: One primitive index, or None for a summary.
+        prim_indices: Several primitive indices, read in one call.
+        prim_range: [start, end] (end inclusive) instead of a list.
+        intrinsics: Only these intrinsics, e.g. ["bounds", "packedfulltransform"].
+            With none of the index arguments, they are read for every prim.
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"node_path": node_path}
     if prim_index is not None:
         params["prim_index"] = prim_index
+    if prim_indices is not None:
+        params["prim_indices"] = prim_indices
+    if prim_range is not None:
+        params["prim_range"] = prim_range
+    if intrinsics is not None:
+        params["intrinsics"] = intrinsics
     return await bridge.execute("geometry.get_prim_intrinsics", params)
 
 
@@ -335,7 +356,8 @@ async def get_attrib_stats(
     Args:
         node_path: SOP node path.
         attribs: Attribute names. Omit for every attribute of the class.
-        attrib_class: "point", "prim" or "detail".
+        attrib_class: "point", "prim", "vertex" (uv and N usually live
+            there) or "detail".
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"node_path": node_path, "attrib_class": attrib_class}

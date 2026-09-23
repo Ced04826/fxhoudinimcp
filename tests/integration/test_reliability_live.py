@@ -22,15 +22,21 @@ class TestFailedBuildRollsBack:
     def test_nothing_is_left_behind(self, call):
         geo = _geo(call)
         before = {n.name() for n in hou.node(geo).children()}
-        # Validation cannot see this: the expression names a parm that only fails
-        # once the node exists, so the build fails on the third node.
+        # Validation cannot see this: a sphere has one output, but which outputs
+        # a node has is only known once it exists, so the build fails wiring the
+        # third node. (An expression on a missing parm used to be the trigger;
+        # validation now names that before anything is created.)
         result = call(
             "graph.build_network",
             parent_path=geo,
             nodes=[
                 {"name": "a", "type": "box"},
                 {"name": "b", "type": "sphere"},
-                {"name": "m", "type": "merge", "inputs": ["a", "b"], "expressions": {"nope": "1"}},
+                {
+                    "name": "m",
+                    "type": "merge",
+                    "inputs": ["a", {"source": "b", "source_output": 5}],
+                },
             ],
             allow_error=True,
         )
@@ -47,7 +53,9 @@ class TestFailedBuildRollsBack:
         call(
             "graph.build_network",
             parent_path=geo,
-            nodes=[{"name": "m", "type": "merge", "expressions": {"nope": "1"}}],
+            nodes=[
+                {"name": "m", "type": "merge", "inputs": [{"source": "mine", "source_output": 5}]}
+            ],
             allow_error=True,
         )
         undone = call("scene.undo")

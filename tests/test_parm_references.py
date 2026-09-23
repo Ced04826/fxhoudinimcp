@@ -178,7 +178,39 @@ class TestParmReferences:
         result = parameters._get_parm_references("/obj/src", limit=2)
         assert result["node_dependents"] == ["/obj/user0", "/obj/user1"]
         assert result["node_dependents_count"] == 5
+        assert result["include_node_level"] is True
         node.references.assert_called_once_with(include_children=False)
+
+    def test_asking_about_one_parm_leaves_the_node_lists_out(self, monkeypatch):
+        # On an asset with 947 children these lists were ~117 KB of a reply
+        # about one parameter.
+        tx = self._parm("/obj/src/tx")
+        many = [_node(f"/obj/user{i}") for i in range(1147)]
+        node = self._node_with(monkeypatch, [tx], dependents=many)
+        monkeypatch.setattr(parameters, "_resolve_parm", lambda path, name: tx)
+        result = parameters._get_parm_references("/obj/src", parm_name="tx")
+        assert result["include_node_level"] is False
+        assert "node_dependents" not in result
+        assert "node_references" not in result
+        node.references.assert_not_called()
+        # The dependents still decide whether the scene is scanned.
+        tx.parmsReferencingThis.assert_called_once()
+
+    def test_the_node_lists_can_be_asked_for_with_one_parm(self, monkeypatch):
+        tx = self._parm("/obj/src/tx")
+        self._node_with(monkeypatch, [tx], dependents=[_node("/obj/dst")])
+        monkeypatch.setattr(parameters, "_resolve_parm", lambda path, name: tx)
+        result = parameters._get_parm_references(
+            "/obj/src", parm_name="tx", include_node_level=True
+        )
+        assert result["include_node_level"] is True
+        assert result["node_dependents"] == ["/obj/dst"]
+
+    def test_the_node_lists_can_be_left_out_of_a_whole_node_query(self, monkeypatch):
+        self._node_with(monkeypatch, [], dependents=[_node("/obj/dst")])
+        result = parameters._get_parm_references("/obj/src", include_node_level=False)
+        assert result["include_node_level"] is False
+        assert "node_dependents" not in result
 
 
 ###### get_parm_template_tree

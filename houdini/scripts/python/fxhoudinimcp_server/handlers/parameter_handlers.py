@@ -19,16 +19,9 @@ import hou
 # Internal
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.handlers.state_receipt_helpers import (
-    clear_channels,
     clip,
-    component_type_error,
-    parm_state,
-    raw_differs,
     resolve_expression_policy,
-    set_parm_value,
-    tuple_length_error,
     value_receipt,
-    write_refusal,
 )
 from fxhoudinimcp_server.serialize import geometry_summary
 
@@ -223,251 +216,6 @@ def _get_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any]:
 register_handler("parameters.get_parameter", _get_parameter)
 
 
-###### Writing values: the core both set_parameter and set_parameters run on
-#
-# The two used to be separate implementations, and behaved differently in ways
-# nobody chose: the single write understood a list as a vector and the batch
-# did not, so the same request succeeded or failed depending on which command
-# carried it. Everything below is shared, so they cannot drift again.
-
-# Above this many characters a value is reported as length, hash and samples
-# rather than in full. Parameter values are normally three floats; the ones
-# that are not are file lists and VEX snippets, and a receipt that quietly
-# clips one of those is how a caller concludes a write did something it did not.
-_VALUE_CHARS = 200
-
-# Expressions and exception text go into the receipt as excerpts. Both can be
-# arbitrarily long -- a snippet-driven parameter, an exception whose message
-# quotes the value that caused it -- and neither is worth an unbounded receipt.
-_EXPRESSION_CHARS = 400
-
-_RETURN_MODES = ("summary", "full", "none")
-
-
-def _resolve_return_values(mode: Any) -> str:
-    """The return_values token, or a message naming the ones that exist."""
-    if mode is None:
-        return "summary"
-    if isinstance(mode, str) and mode.lower() in _RETURN_MODES:
-        return mode.lower()
-    raise ValueError(f"return_values must be one of {list(_RETURN_MODES)}, not {mode!r}")
-
-
-def _address(node: hou.Node, parm_name: str, value: Any) -> tuple:
-    """(components, is_tuple, error) for the thing this write addresses.
-
-    A list addresses a parm tuple and nothing else. A scalar addresses a
-    parameter, or broadcasts across a tuple when the name is the tuple's —
-    which is what build_network has always done and what a caller writing
-    ``{"t": 0}`` plainly means.
-    """
-    available = _available_parm_names(node)
-    if isinstance(value, (list, tuple)):
-        parm_tuple = node.parmTuple(parm_name)
-        if parm_tuple is None:
-            parm = node.parm(parm_name)
-            if parm is not None:
-                if len(value) != 1:
-                    return (), False, tuple_length_error(parm_name, 1, len(value))
-                return (parm,), False, None
-            close = get_close_matches(parm_name, available, n=3, cutoff=0.4)
-            hint = f" Did you mean: {close}?" if close else ""
-            return (), False, f"Parameter '{parm_name}' not found.{hint}"
-        if len(value) != len(parm_tuple):
-            return (), True, tuple_length_error(parm_name, len(parm_tuple), len(value))
-        return tuple(parm_tuple), True, None
-
-    parm = node.parm(parm_name)
-    if parm is not None:
-        return (parm,), False, None
-    parm_tuple = node.parmTuple(parm_name)
-    if parm_tuple is not None:
-        return tuple(parm_tuple), True, None
-    close = get_close_matches(parm_name, available, n=3, cutoff=0.4)
-    hint = f" Did you mean: {close}?" if close else ""
-    return (), False, f"Parameter '{parm_name}' not found.{hint}"
-
-
-def _matches(requested: Any, actual: Any) -> bool | None:
-    """Whether the node ended up with what was asked for, or None if unknowable.
-
-    The motivating case: writing 0 to a pivot that carries ``$CEX`` reported
-    success and the parameter went on evaluating to the expression's answer.
-    Comparing the read-back to the request is what makes that visible.
-    """
-    if isinstance(requested, (list, tuple)) or isinstance(actual, (list, tuple)):
-        if not isinstance(requested, (list, tuple)) or not isinstance(actual, (list, tuple)):
-            return None
-        if len(requested) != len(actual):
-            return False
-        verdicts = [_matches(a, b) for a, b in zip(requested, actual, strict=True)]
-        return None if None in verdicts else all(verdicts)
-    if isinstance(requested, bool) or isinstance(actual, bool):
-        if isinstance(requested, (bool, int)) and isinstance(actual, (bool, int)):
-            return bool(requested) == bool(actual)
-        return None
-    if isinstance(requested, (int, float)) and isinstance(actual, (int, float)):
-        return abs(float(requested) - float(actual)) <= 1e-6 * max(1.0, abs(float(requested)))
-    if isinstance(requested, str) and isinstance(actual, str):
-        return requested == actual
-    # A number written to a string parameter, or a menu token read back as an
-    # index: the write may be perfectly correct, and saying so would be a guess.
-    return None
-
-
-def _read_back(components: tuple, is_tuple: bool, mode: str, max_chars: int) -> dict[str, Any]:
-    """What the node evaluates to now, plus the raw text behind it."""
-    states = [parm_state(parm) for parm in components]
-    values = [_serialize_value(state["value"]) for state in states]
-    raws = [state["raw_value"] for state in states]
-    expressions = [state["expression"] for state in states]
-
-    entry: dict[str, Any] = {}
-    actual: Any = values if is_tuple else values[0]
-    receipt = value_receipt(actual, max_chars, full=mode == "full")
-    if receipt["complete"]:
-        entry["new_value"] = receipt["value"]
-    else:
-        # Deliberately no "new_value" key: a clipped value under the name a
-        # caller compares against is worse than no value at all.
-        entry["new_value_summary"] = {k: v for k, v in receipt.items() if k != "value"}
-
-    # Raw text only when it says something the value does not: an expression,
-    # or a literal like "$HIP/x.bgeo" that the value shows already expanded.
-    differs = any(raw_differs(raw, value) for raw, value in zip(raws, values, strict=True))
-    if differs:
-        raw_receipt = value_receipt(raws if is_tuple else raws[0], max_chars, full=mode == "full")
-        if raw_receipt["complete"]:
-            entry["raw_value"] = raw_receipt["value"]
-        else:
-            entry["raw_value_summary"] = {k: v for k, v in raw_receipt.items() if k != "value"}
-        if not any(expressions):
-            # No expression, yet the raw text differs: Houdini expanded a
-            # variable. Calling that an expression sent callers looking for one.
-            entry["value_is_expanded"] = True
-    if any(expressions):
-        # Clipped for the same reason the value is: an expression can be a
-        # whole VEX snippet, and three components of one triple the bill. The
-        # clip marker carries the real length and a hash of the whole thing.
-        clipped = [clip(item, _EXPRESSION_CHARS) if isinstance(item, str) else item
-                   for item in expressions]
-        entry["expression"] = clipped if is_tuple else clipped[0]
-        if any(isinstance(item, str) and len(item) > _EXPRESSION_CHARS for item in expressions):
-            entry["expression_truncated"] = True
-        entry["expression_language"] = next(
-            (state["expression_language"] for state in states if state["expression"]), None
-        )
-    keyframes = sum(state.get("keyframes") or 0 for state in states)
-    if keyframes:
-        entry["keyframes"] = keyframes
-    eval_errors = [state["eval_error"] for state in states if state.get("eval_error")]
-    if eval_errors:
-        entry["eval_errors"] = eval_errors
-    return entry
-
-
-def _write_parm(
-    node: hou.Node,
-    parm_name: str,
-    value: Any,
-    policy: str,
-    mode: str,
-    max_chars: int,
-) -> tuple:
-    """Apply one value. Returns (entry, error): exactly one of them is None.
-
-    Every check that can be made without touching the node is made first, so a
-    refusal leaves the parameter exactly as it was.
-    """
-    components, is_tuple, error = _address(node, parm_name, value)
-    if error:
-        return None, error
-
-    label = f"{node.path()}/{parm_name}"
-    requested = list(value) if isinstance(value, (list, tuple)) else [value] * len(components)
-
-    # Both pre-flight passes run over every component before any of them is
-    # touched, because "replace" deletes an expression before it writes:
-    # finding out at set() time that the value was a dictionary would leave
-    # the parameter stripped of what drove it and holding nothing new.
-    for index, parm in enumerate(components):
-        state = parm_state(parm)
-        component_label = label if len(components) == 1 else f"{label}[{index}]"
-        refusal = write_refusal(state, policy, component_label)
-        if refusal:
-            return None, refusal
-    for index, (parm, component) in enumerate(zip(components, requested, strict=True)):
-        component_label = label if len(components) == 1 else f"{label}[{index}]"
-        type_error = component_type_error(parm, component, component_label)
-        if type_error:
-            return None, type_error
-
-    entry: dict[str, Any] = {"parm_name": parm_name}
-    cleared: list[dict[str, Any]] = []
-    if policy == "replace":
-        for parm in components:
-            outcome = clear_channels(parm)
-            if outcome.get("clear_error"):
-                # The channel is still there. Writing now would go through the
-                # reference to whatever node it points at, so this write stops
-                # here and says which component refused to be cleared.
-                entry["cleared"] = cleared
-                return entry, (
-                    f"'{parm_name}' ({parm.name()}): could not clear the existing "
-                    f"expression or keyframes, so nothing was written: "
-                    f"{outcome['clear_error']}"
-                )
-            if outcome.get("cleared_expression") or outcome.get("cleared_keyframes"):
-                cleared.append(outcome)
-
-    # Component by component rather than ParmTuple.set(), so a failure names
-    # the component it happened on and the ones already written are reported
-    # as written rather than lost in one opaque exception.
-    applied = 0
-    write_error: str | None = None
-    for parm, component in zip(components, requested, strict=True):
-        try:
-            set_parm_value(parm, component)
-            applied += 1
-        except Exception as exc:  # noqa: BLE001 - reported, not raised
-            # An exception's message can quote the value that caused it, so it
-            # is as unbounded as the value was.
-            detail = clip(str(exc), _EXPRESSION_CHARS)
-            write_error = (
-                f"'{parm_name}' component {applied} ({parm.name()}): {detail}"
-                if len(components) > 1
-                else f"'{parm_name}': {detail}"
-            )
-            break
-
-    if mode != "none":
-        entry.update(_read_back(components, is_tuple, mode, max_chars))
-        if isinstance(value, (list, tuple)):
-            asked: Any = list(value)
-        elif is_tuple:
-            asked = [value] * len(components)
-        else:
-            asked = value
-        verdict = _matches(asked, entry.get("new_value"))
-        if verdict is False:
-            entry["matches_requested"] = False
-            asked_receipt = value_receipt(asked, max_chars, full=mode == "full")
-            entry["requested"] = (
-                asked_receipt["value"]
-                if asked_receipt["complete"]
-                else {k: v for k, v in asked_receipt.items() if k != "value"}
-            )
-        elif verdict is True:
-            entry["matches_requested"] = True
-    if cleared:
-        entry["expression_cleared"] = True
-        entry["cleared"] = cleared
-    if write_error:
-        entry["applied_components"] = applied
-        return entry, write_error
-    return entry, None
-
-
 ###### Handler: parameters.set_parameter
 
 
@@ -492,67 +240,350 @@ def _expression_driven(parms: list[hou.Parm]) -> str | None:
     return None
 
 
-def _set_tuple(node: hou.Node, parm_name: str, value: list | tuple) -> Any | None:
+def _expression_of(parm: hou.Parm) -> str | None:
+    """The expression *parm* holds, or None when it holds a plain value."""
+    try:
+        expression = parm.expression()
+    except Exception:
+        return None
+    return expression if isinstance(expression, str) and expression else None
+
+
+def _values_match(requested: Any, actual: Any) -> bool:
+    """Whether a write of *requested* is what *actual* now reads back as."""
+    if isinstance(requested, bool) or isinstance(actual, bool):
+        return bool(requested) == bool(actual)
+    if isinstance(requested, (int, float)) and isinstance(actual, (int, float)):
+        return abs(float(requested) - float(actual)) <= 1e-6 * max(1.0, abs(float(actual)))
+    return requested == actual
+
+
+def _referenced_parm(parm: hou.Parm) -> str | None:
+    """Path of the parm a pure `ch()` reference points at, or None.
+
+    A parm holding a bare channel reference is a window onto another parm, and
+    hou.Parm.set() writes THROUGH it: setting tx on a node whose tx reads
+    ch("../b1/sizex") changes b1's sizex, not tx. eval() then answers with the
+    value asked for, so the write looks like a plain success while another
+    node quietly moved.
+    """
+    with contextlib.suppress(Exception):
+        target = parm.getReferencedParm()
+        if target is not None and target.path() != parm.path():
+            return str(target.path())
+    return None
+
+
+_WRITTEN_THROUGH_NOTE = (
+    "This parameter is a pure channel reference, so the value was written into "
+    "the parameter it reads, not into this one. Break the link with "
+    "revert_parameter, or set the source directly, if that was not intended."
+)
+
+_EXPRESSION_KEPT_NOTE = (
+    "The parameter still holds its expression, so the literal did not take. "
+    "Set the parameter that drives it, replace the expression with "
+    "set_expression, or repeat this call with override_expression=true."
+)
+
+_EXPRESSION_KEPT_SAME_VALUE_NOTE = (
+    "The value asked for is what the expression evaluates to right now, but the "
+    "expression is still there and will keep driving the parameter. "
+    + _EXPRESSION_KEPT_NOTE.split(". ", 1)[1]
+)
+
+
+def _raw_string(parm: hou.Parm) -> str | None:
+    """The unexpanded text of a String parm (`$JOB/geo/a_$F4.bgeo.sc`), or None."""
+    with contextlib.suppress(Exception):
+        if parm.parmTemplate().type() == hou.parmTemplateType.String:
+            return parm.unexpandedString()
+    return None
+
+
+def _write_parm(parm: hou.Parm, value: Any, override_expression: bool = False) -> dict[str, Any]:
+    """Set one parm and report honestly whether the write actually took.
+
+    hou.Parm.set() on a parm that holds an expression does NOT remove the
+    expression: eval() keeps answering with it, and the reply used to look
+    like a success anyway, the truth only in a `new_value` nobody compared
+    against what was asked for. deleteAllKeyframes() is what clears it, which
+    is what override_expression does.
+
+    Whether the expression survived decides `expression_kept`, not whether the
+    values differ: zeroing a factory `$N` that evaluates to 0 leaves the
+    expression in place just the same. A String parm echoes its raw text next
+    to the expanded one, since `$JOB/...` read back as an absolute path looks
+    like the very mistake a caller checks for.
+    """
+    before = _expression_of(parm)
+    through = _referenced_parm(parm) if before is not None else None
+    if before is not None and override_expression:
+        with contextlib.suppress(Exception):
+            parm.deleteAllKeyframes()
+        through = None
+    parm.set(value)
+    after = _expression_of(parm)
+    new_value = _serialize_value(parm.eval())
+    info: dict[str, Any] = {"new_value": new_value}
+    raw = _raw_string(parm)
+    if raw is not None:
+        info["raw_value"] = raw
+    matches = _values_match(value, new_value)
+    if after is not None and through is not None and matches:
+        # The value did land, in the parm this one reads.
+        info["written_through"] = through
+        info["expression"] = after
+        info["note"] = _WRITTEN_THROUGH_NOTE
+    elif after is not None:
+        info["expression_kept"] = True
+        info["expression"] = after
+        info["requested"] = _serialize_value(value)
+        if matches:
+            info["same_as_evaluated"] = True
+        info["note"] = _EXPRESSION_KEPT_SAME_VALUE_NOTE if matches else _EXPRESSION_KEPT_NOTE
+    elif before is not None:
+        info["expression_removed"] = before
+    return info
+
+
+def _set_tuple(
+    node: hou.Node,
+    parm_name: str,
+    value: list | tuple,
+    override_expression: bool = False,
+) -> tuple[Any | None, dict[str, Any]]:
     """Apply a list value to the parm tuple of that name; None if there is none.
 
     A list/tuple value addressed at a vector parameter name (e.g. "size" on a
     box, "t" on a transform, a light's colour) is applied to the whole parm
     tuple, so callers are not forced to know the per-component names.
+
+    Answers `(values, report)`, where *report* carries what _write_parm reports
+    for a single parm, per component: which kept an expression, which wrote
+    through a channel reference, and the raw text of String components.
     """
     parm_tuple = node.parmTuple(parm_name)
     if parm_tuple is None:
-        return None
+        return None, {}
     if len(value) != len(parm_tuple):
         raise ValueError(
             f"Parameter '{parm_name}' on {node.path()} has "
             f"{len(parm_tuple)} components, got {len(value)} values."
         )
+    components = list(parm_tuple)
+    through = {
+        parm.name(): target
+        for parm in components
+        if _expression_of(parm) is not None and (target := _referenced_parm(parm)) is not None
+    }
+    if override_expression:
+        for parm in components:
+            if _expression_of(parm) is not None:
+                with contextlib.suppress(Exception):
+                    parm.deleteAllKeyframes()
+        through = {}
     try:
         parm_tuple.set(value)
     except hou.PermissionError:
-        reason = _expression_driven(list(parm_tuple))
+        reason = _expression_driven(components)
         if reason:
             raise ValueError(reason) from None
         raise
-    return [_serialize_value(p.eval()) for p in parm_tuple]
+    new_value = [_serialize_value(p.eval()) for p in components]
+    kept: list[dict[str, Any]] = []
+    landed_elsewhere: dict[str, str] = {}
+    for index, parm in enumerate(components):
+        expression = _expression_of(parm)
+        if expression is None:
+            continue
+        matches = _values_match(value[index], new_value[index])
+        if parm.name() in through and matches:
+            landed_elsewhere[parm.name()] = through[parm.name()]
+            continue
+        # Kept whenever the expression survived, equal values or not.
+        entry: dict[str, Any] = {
+            "component": parm.name(),
+            "index": index,
+            "expression": expression,
+            "requested": _serialize_value(value[index]),
+        }
+        if matches:
+            entry["same_as_evaluated"] = True
+        kept.append(entry)
+    report: dict[str, Any] = {}
+    raw = [_raw_string(p) for p in components]
+    if any(r is not None for r in raw):
+        report["raw_value"] = raw
+    if kept:
+        same = all(entry.get("same_as_evaluated") for entry in kept)
+        report.update(
+            {
+                "expression_kept": True,
+                "expression_components": kept,
+                "requested": [_serialize_value(v) for v in value],
+                "note": _EXPRESSION_KEPT_SAME_VALUE_NOTE if same else _EXPRESSION_KEPT_NOTE,
+            }
+        )
+    if landed_elsewhere:
+        report["written_through"] = landed_elsewhere
+        report.setdefault("note", _WRITTEN_THROUGH_NOTE)
+    return new_value, report
+
+
+###### Reply size and the expression_policy alias (fork)
+#
+# The write above is upstream's. What follows only shapes its reply and maps
+# our older argument spelling onto it, so the two cannot disagree about what
+# a write did.
+
+# Above this many characters a value is reported as length, hash and samples
+# rather than in full. Parameter values are normally three floats; the ones
+# that are not are file lists and VEX snippets, and a reply that quietly clips
+# one of those is how a caller concludes a write did something it did not.
+_VALUE_CHARS = 200
+
+_RETURN_MODES = ("summary", "full", "none")
+
+# The keys of a reply entry that echo a value rather than say what happened.
+_VALUE_KEYS = ("new_value", "raw_value", "requested")
+
+# Expression text the reply names. It says what happened, so "none" keeps it,
+# but it can be a whole snippet, so it is summarised like a value.
+_EXPRESSION_KEYS = ("expression", "expression_removed")
+
+
+def _resolve_return_values(mode: Any) -> str:
+    """The return_values token, or a message naming the ones that exist."""
+    if mode is None:
+        return "summary"
+    if isinstance(mode, str) and mode.lower() in _RETURN_MODES:
+        return mode.lower()
+    raise ValueError(f"return_values must be one of {list(_RETURN_MODES)}, not {mode!r}")
+
+
+def _resolve_max_value_chars(max_value_chars: Any) -> int:
+    """The summary threshold, refused unless it is a positive integer."""
+    if not isinstance(max_value_chars, int) or isinstance(max_value_chars, bool):
+        raise ValueError(f"max_value_chars must be an integer, got {max_value_chars!r}")
+    if max_value_chars < 1:
+        raise ValueError(f"max_value_chars must be at least 1, got {max_value_chars}")
+    return max_value_chars
+
+
+def _resolve_override(override_expression: Any, expression_policy: Any) -> bool:
+    """override_expression, with expression_policy accepted as its alias.
+
+    "replace" is override_expression=True; "preserve" (or nothing) is the
+    plain write that reports a kept expression. "preserve" next to
+    override_expression=True asks for both at once and is refused.
+    """
+    if expression_policy is None:
+        return bool(override_expression)
+    policy = resolve_expression_policy(expression_policy)
+    if policy == "preserve" and override_expression:
+        raise ValueError(
+            "expression_policy='preserve' contradicts override_expression=True: "
+            "pass override_expression=True (or expression_policy='replace') to "
+            "clear the expression, or neither to keep it."
+        )
+    return policy == "replace" or bool(override_expression)
+
+
+def _compact_values(entry: dict[str, Any], max_chars: int) -> None:
+    """Replace each value echo longer than *max_chars* by its `<key>_summary`.
+
+    Deliberately no clipped value under the original key: a clipped value
+    under the name a caller compares against is worse than no value at all.
+    """
+    for key in (*_VALUE_KEYS, *_EXPRESSION_KEYS):
+        if key not in entry:
+            continue
+        receipt = value_receipt(entry[key], max_chars)
+        if receipt["complete"]:
+            continue
+        del entry[key]
+        entry[f"{key}_summary"] = {k: v for k, v in receipt.items() if k != "value"}
+
+
+def _says_more_than_values(entry: dict[str, Any]) -> bool:
+    """Whether an entry reports something besides its name and values."""
+    plain = {"parm_name", *_VALUE_KEYS, *(f"{key}_summary" for key in _VALUE_KEYS)}
+    return any(key not in plain for key in entry)
+
+
+def _shape_reply(reply: dict[str, Any], mode: str, max_chars: int) -> dict[str, Any]:
+    """Fit a set_parameter / set_parameters reply to *mode*.
+
+    "full" is the reply as written. "summary" replaces long values and
+    expressions by their summaries and clips error text, which can quote the
+    value that caused it. "none" is for large batches: echoing every name back
+    cost a 900-parameter Add write about fifteen thousand tokens, so the batch
+    keeps a `set_count` and only the entries that report an expression; a
+    single write that reports none drops its values.
+    """
+    if mode == "full":
+        return reply
+    batch = isinstance(reply.get("set"), list)
+    entries = reply["set"] if batch else [reply]
+    for entry in entries:
+        _compact_values(entry, max_chars)
+    for error in reply.get("errors") or []:
+        error["error"] = clip(error["error"])
+    if mode == "none":
+        if batch:
+            reply["set_count"] = len(entries)
+            reply["set"] = [entry for entry in entries if _says_more_than_values(entry)]
+        elif not _says_more_than_values({k: v for k, v in reply.items() if k != "node_path"}):
+            for key in _VALUE_KEYS:
+                reply.pop(key, None)
+                reply.pop(f"{key}_summary", None)
+    return reply
 
 
 def _set_parameter(
     node_path: str,
     parm_name: str,
     value: Any,
-    expression_policy: str = "preserve",
+    override_expression: bool = False,
+    expression_policy: str | None = None,
     return_values: str = "summary",
     max_value_chars: int = _VALUE_CHARS,
     **_: Any,
 ) -> dict[str, Any]:
-    """Set one parameter and report what the node actually evaluates afterwards.
+    """Set a parameter value, auto-detecting the appropriate type.
 
-    A list/tuple value addressed at a vector parameter name (e.g. "size" on a
-    box, "t" on a transform) is applied to the whole parm tuple, so callers are
-    not forced to know the per-component names (sizex, ...). Scalars broadcast
-    across a tuple.
-
-    Same rules as the batch write, with one deliberate difference in how the
-    answer arrives: with a single parameter asked for, a failure is the whole
-    result, so it is raised rather than buried in an errors list a caller has
-    to remember to read.
+    expression_policy is an alias of override_expression and return_values /
+    max_value_chars size the reply (see _shape_reply); all three are checked
+    before anything is written.
     """
-    result = _set_parameters(
-        node_path,
-        {parm_name: value},
-        expression_policy=expression_policy,
-        return_values=return_values,
-        max_value_chars=max_value_chars,
-        _single=parm_name,
-    )
-    if result["errors"]:
-        message = result["errors"][0]["error"]
-        applied = (result["set"][0] if result["set"] else {}).get("applied_components")
-        if applied:
-            message = f"{message} ({applied} component(s) were written before the failure)"
-        raise ValueError(message)
-    return result
+    override = _resolve_override(override_expression, expression_policy)
+    mode = _resolve_return_values(return_values)
+    max_chars = _resolve_max_value_chars(max_value_chars)
+    if isinstance(value, (list, tuple)):
+        new_value, report = _set_tuple(_resolve_node(node_path), parm_name, value, override)
+        if new_value is not None:
+            result: dict[str, Any] = {
+                "node_path": node_path,
+                "parm_name": parm_name,
+                "new_value": new_value,
+            }
+            result.update(report)
+            return _shape_reply(result, mode, max_chars)
+
+    parm = _resolve_parm(node_path, parm_name)
+
+    try:
+        written = _write_parm(parm, value, override)
+    except hou.PermissionError:
+        reason = _expression_driven([parm])
+        if reason:
+            raise ValueError(reason) from None
+        raise
+
+    result = {"node_path": node_path, "parm_name": parm_name}
+    result.update(written)
+    return _shape_reply(result, mode, max_chars)
 
 
 register_handler("parameters.set_parameter", _set_parameter)
@@ -564,89 +595,86 @@ register_handler("parameters.set_parameter", _set_parameter)
 def _set_parameters(
     node_path: str,
     params: dict[str, Any],
-    expression_policy: str = "preserve",
+    override_expression: bool = False,
+    expression_policy: str | None = None,
     return_values: str = "summary",
     max_value_chars: int = _VALUE_CHARS,
-    _single: str | None = None,
     **_: Any,
 ) -> dict[str, Any]:
-    """Batch-set parameters on one node, with the same rules as the single write.
+    """Batch-set multiple parameters on a single node.
 
-    expression_policy decides what happens when the parameter is already driven
-    by something. "preserve" (the default) refuses rather than overwriting, and
-    names the expression in the refusal. "replace" clears the keyframes and
-    expression ON THE ADDRESSED COMPONENT first, then writes the literal; a
-    channel reference is cleared where it is written and never followed to the
-    parameter it points at, which belongs to a node the caller did not name.
-
-    Arguments are validated before anything is written. Per-parameter failures
-    do not stop the rest — they are reported, and success is false if any
-    occurred.
+    expression_policy, return_values and max_value_chars as for
+    _set_parameter; they and *params* are checked before anything is written.
     """
-    policy = resolve_expression_policy(expression_policy)
+    override = _resolve_override(override_expression, expression_policy)
     mode = _resolve_return_values(return_values)
-    if not isinstance(max_value_chars, int) or isinstance(max_value_chars, bool):
-        raise ValueError(f"max_value_chars must be an integer, got {max_value_chars!r}")
-    if max_value_chars < 1:
-        raise ValueError(f"max_value_chars must be at least 1, got {max_value_chars}")
+    max_chars = _resolve_max_value_chars(max_value_chars)
     if not isinstance(params, dict) or not params:
         raise ValueError("'params' must be a non-empty mapping of parameter names to values")
-
     node = _resolve_node(node_path)
 
     results: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+
+    available = _available_parm_names(node)
     for name, value in params.items():
         # A list on a vector name sets the whole tuple, exactly as the single
-        # setter does: _address resolves the name to its components, so the
-        # batch path is not limited to per-component names either.
-        entry, error = _write_parm(node, name, value, policy, mode, max_value_chars)
-        if entry is not None:
+        # setter does. The batch path used to know only per-component names,
+        # which made "prefer set_parameters" and "set a light colour" collide.
+        if isinstance(value, (list, tuple)):
+            try:
+                new_value, report = _set_tuple(node, name, value, override)
+            except Exception as exc:
+                errors.append({"parm_name": name, "error": str(exc)})
+                continue
+            if new_value is not None:
+                entry: dict[str, Any] = {"parm_name": name, "new_value": new_value}
+                entry.update(report)
+                results.append(entry)
+                continue
+        parm = node.parm(name)
+        if parm is None:
+            close = get_close_matches(name, available, n=3, cutoff=0.4)
+            hint = f" Did you mean: {close}?" if close else ""
+            errors.append({"parm_name": name, "error": f"Parameter '{name}' not found.{hint}"})
+            continue
+        try:
+            entry = {"parm_name": name}
+            entry.update(_write_parm(parm, value, override))
             results.append(entry)
-        if error:
-            errors.append({"parm_name": name, "error": error})
+        except Exception as exc:
+            errors.append({"parm_name": name, "error": str(exc)})
 
-    if mode == "none":
-        # "none" asks for a count, not a list: echoing every name back cost a
-        # 900-parameter Add write about fifteen thousand tokens. An entry
-        # stays only when it says more than its name -- an expression this
-        # write cleared, or components written before a failure.
-        failed = {error["parm_name"] for error in errors}
-        written = sum(1 for entry in results if entry["parm_name"] not in failed)
-        results = [entry for entry in results if len(entry) > 1]
-    result: dict[str, Any] = {
+    # A batch whose `errors` is empty while a parm kept its expression reads as
+    # a clean success: name it at the top level too, so a caller that only
+    # reads `errors` still sees that a write did not take, or landed elsewhere.
+    kept = [entry["parm_name"] for entry in results if entry.get("expression_kept")]
+    through = {
+        entry["parm_name"]: entry["written_through"]
+        for entry in results
+        if entry.get("written_through")
+    }
+    reply: dict[str, Any] = {
         "node_path": node_path,
-        "success": not errors,
         "set": results,
         "errors": errors,
-        "expression_policy": policy,
-        # Evaluation is frame-dependent, so a value read back without saying
-        # when it was read is not a fact about the parameter.
-        "context": _eval_context(),
     }
-    if mode == "none":
-        result["set_count"] = written
-    if _single is not None:
-        # The single write predates the batch and callers read new_value off
-        # the top level; keeping that promise costs one key.
-        result["parm_name"] = _single
-        first = results[0] if results else {}
-        if "new_value" in first:
-            result["new_value"] = first["new_value"]
-        elif "new_value_summary" in first:
-            result["new_value_summary"] = first["new_value_summary"]
-        if errors:
-            result["error"] = errors[0]["error"]
-    return result
-
-
-def _eval_context() -> dict[str, Any]:
-    """When the read-back values were evaluated."""
-    context: dict[str, Any] = {}
-    for key, reader in (("frame", hou.frame), ("time", hou.time), ("fps", hou.fps)):
-        with contextlib.suppress(Exception):
-            context[key] = reader()
-    return context
+    warnings: list[str] = []
+    if kept:
+        reply["expressions_kept"] = kept
+        warnings.append(
+            f"{len(kept)} parameter(s) kept an expression and did not take the "
+            f"value asked for: {kept}. {_EXPRESSION_KEPT_NOTE}"
+        )
+    if through:
+        reply["written_through"] = through
+        warnings.append(
+            f"{len(through)} value(s) were written into the parameters these read "
+            f"rather than into them: {through}. {_WRITTEN_THROUGH_NOTE}"
+        )
+    if warnings:
+        reply["warning"] = " ".join(warnings)
+    return _shape_reply(reply, mode, max_chars)
 
 
 register_handler("parameters.set_parameters", _set_parameters)
@@ -1169,11 +1197,40 @@ register_handler("parameters.create_spare_parameters", _create_spare_parameters)
 
 _GET_PARMS_CAP = 60
 
+# Rows a network sweep returns before it reports `truncated`.
+_SWEEP_ROW_CAP = 2000
+
+
+def _parm_entry(parm: hou.Parm, include_defaults: bool) -> dict[str, Any]:
+    """One parameter as get_parameters reports it, for a node or a sweep row."""
+    data_parm = _data_parm_value(parm, parm.parmTemplate())
+    entry: dict[str, Any] = data_parm or {"value": _serialize_value(parm.eval())}
+    raw = parm.rawValue()
+    # Only worth reporting when it differs: an expression is the thing a
+    # caller most often needs to see and a literal is just noise.
+    if not data_parm and isinstance(raw, str) and raw != str(entry["value"]):
+        entry["raw_value"] = raw
+    if include_defaults:
+        entry["is_at_default"] = parm.isAtDefault()
+    return entry
+
+
+def _matches_patterns(parm: hou.Parm, lowered: list[str] | None) -> bool:
+    """Whether any lowered pattern is a substring of the parm's name or label."""
+    if lowered is None:
+        return True
+    name = parm.name().lower()
+    label = parm.parmTemplate().label().lower()
+    return any(p in name or p in label for p in lowered)
+
 
 def _get_parameters(
-    node_path: str,
+    node_path: str | None = None,
     patterns: list[str] | str | None = None,
     include_defaults: bool = False,
+    inside: str | None = None,
+    recursive: bool = False,
+    node_type: str | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Current values for every parameter matching any of several patterns.
@@ -1183,12 +1240,26 @@ def _get_parameters(
     trips. get_node_card reports names and defaults for a node *type*; this
     reports the live values on a specific node.
 
+    With *inside* instead of *node_path*, the same patterns are read across a
+    whole network and come back as one table of `rows`. "Every file parameter
+    of this material library, unexpanded" was find_nodes plus one
+    get_parameters per node: 68 calls in one session.
+
     Args:
         node_path: Node to read.
         patterns: Substrings matched against parameter name and label. Omit for
-            every non-hidden parameter, up to the cap.
+            every non-hidden parameter, up to the cap. Required with *inside*.
         include_defaults: Also report whether each value is still the default.
+        inside: A network to read instead of one node; answers `rows`.
+        recursive: With *inside*, every descendant, not only the children.
+        node_type: With *inside*, only nodes of this type name.
     """
+    if inside is not None:
+        if node_path is not None:
+            raise ValueError("Pass either node_path (one node) or inside (a network), not both.")
+        return _sweep_parameters(inside, patterns, include_defaults, recursive, node_type)
+    if node_path is None:
+        raise ValueError("node_path is required (or inside, to read a whole network).")
     node = hou.node(node_path)
     if node is None:
         raise hou.OperationFailed(f"Node not found: {node_path}")
@@ -1200,24 +1271,12 @@ def _get_parameters(
     values: dict[str, Any] = {}
     matched = 0
     for parm in node.parms():
-        name = parm.name()
-        if lowered is not None:
-            label = parm.parmTemplate().label().lower()
-            if not any(p in name.lower() or p in label for p in lowered):
-                continue
+        if not _matches_patterns(parm, lowered):
+            continue
         matched += 1
         if len(values) >= _GET_PARMS_CAP:
             continue
-        data_parm = _data_parm_value(parm, parm.parmTemplate())
-        entry: dict[str, Any] = data_parm or {"value": _serialize_value(parm.eval())}
-        raw = parm.rawValue()
-        # Only worth reporting when it differs: an expression is the thing a
-        # caller most often needs to see and a literal is just noise.
-        if not data_parm and isinstance(raw, str) and raw != str(entry["value"]):
-            entry["raw_value"] = raw
-        if include_defaults:
-            entry["is_at_default"] = parm.isAtDefault()
-        values[name] = entry
+        values[parm.name()] = _parm_entry(parm, include_defaults)
 
     return {
         "node_path": node_path,
@@ -1227,6 +1286,66 @@ def _get_parameters(
         "returned": len(values),
         "truncated": matched > len(values),
         "parameters": values,
+    }
+
+
+def _sweep_parameters(
+    inside: str,
+    patterns: list[str] | str | None,
+    include_defaults: bool,
+    recursive: bool,
+    node_type: str | None,
+) -> dict[str, Any]:
+    """get_parameters over the nodes of a network, as one table of rows."""
+    from fxhoudinimcp_server.handlers.node_handlers import _VALUELESS_PARM_TYPES
+
+    parent = hou.node(inside)
+    if parent is None:
+        raise hou.OperationFailed(f"Node not found: {inside}")
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    if not patterns:
+        raise ValueError(
+            "patterns is required with inside: every parameter of a whole network "
+            "is not an answer anyone can read. Name what to look for, e.g. ['file']."
+        )
+    lowered = [p.lower() for p in patterns]
+    nodes = parent.allSubChildren() if recursive else parent.children()
+    rows: list[dict[str, Any]] = []
+    matched = 0
+    scanned = 0
+    nodes_matched = 0
+    for node in nodes:
+        if node_type and node.type().name() != node_type:
+            continue
+        scanned += 1
+        hit = False
+        for parm in node.parms():
+            # A button or a folder matched by label has no value to report.
+            with contextlib.suppress(Exception):
+                if parm.parmTemplate().type().name() in _VALUELESS_PARM_TYPES:
+                    continue
+            if not _matches_patterns(parm, lowered):
+                continue
+            matched += 1
+            hit = True
+            if len(rows) >= _SWEEP_ROW_CAP:
+                continue
+            row: dict[str, Any] = {"node": node.path(), "parm": parm.name()}
+            row.update(_parm_entry(parm, include_defaults))
+            rows.append(row)
+        nodes_matched += hit
+    return {
+        "inside": parent.path(),
+        "recursive": bool(recursive),
+        "node_type": node_type,
+        "patterns": patterns,
+        "nodes_scanned": scanned,
+        "nodes_matched": nodes_matched,
+        "matched": matched,
+        "returned": len(rows),
+        "truncated": matched > len(rows),
+        "rows": rows,
     }
 
 
@@ -1316,6 +1435,7 @@ def _get_parm_references(
     parm_name: str | None = None,
     direction: str = "both",
     limit: int = 200,
+    include_node_level: bool | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Who references a parameter, and what it references -- both directions.
@@ -1325,6 +1445,11 @@ def _get_parm_references(
     `outgoing` lists what this node's expressions and backtick strings read.
     Node-level `dependents` / `references` round it off, so "what breaks if I
     rename this control" is one call instead of a HOM script.
+
+    *include_node_level* decides whether the node-level lists are included.
+    None (the default) includes them for a whole-node query and leaves them
+    out when *parm_name* names one parameter: they answer a question about
+    the node, not about that parameter.
     """
     if direction not in ("both", "incoming", "outgoing"):
         raise ValueError("direction must be 'both', 'incoming' or 'outgoing'.")
@@ -1372,16 +1497,23 @@ def _get_parm_references(
         "outgoing": outgoing,
         "truncated": truncated,
     }
-    # This node only (include_children=False: a subnet's descendants are not
-    # its own references), capped like the parameter lists.
-    result["node_dependents"], count = _capped_paths(dependents, node.path(), limit)
-    if count > limit:
-        result["node_dependents_count"] = count
-    with contextlib.suppress(Exception):
-        references = node.references(include_children=False)
-        result["node_references"], count = _capped_paths(references, node.path(), limit)
+    # Asked about one parameter, the answer is about that parameter. On an
+    # asset with 947 children the node-level lists came to about 117 KB, next
+    # to 7 KB of parameter entries, for a question they do not answer. Still
+    # on by default for a whole-node query, and either way on request.
+    node_level = parm_name is None if include_node_level is None else bool(include_node_level)
+    result["include_node_level"] = node_level
+    if node_level:
+        # This node only (include_children=False: a subnet's descendants are
+        # not its own references), capped like the parameter lists.
+        result["node_dependents"], count = _capped_paths(dependents, node.path(), limit)
         if count > limit:
-            result["node_references_count"] = count
+            result["node_dependents_count"] = count
+        with contextlib.suppress(Exception):
+            references = node.references(include_children=False)
+            result["node_references"], count = _capped_paths(references, node.path(), limit)
+            if count > limit:
+                result["node_references_count"] = count
     with contextlib.suppress(Exception):
         if node.needsToCook():
             result["note"] = (

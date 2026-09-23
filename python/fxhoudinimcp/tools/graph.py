@@ -46,15 +46,32 @@ async def build_network(
     and neither key ever means "all targets verified" unless
     `verification.complete` is true.
 
-    Each node spec dict supports:
-        type (required), name, parms (lists set whole parm tuples),
-        inputs (list of source names — earlier spec names, existing
-        children, or absolute paths; or dicts with index or input_name /
-        source / source_output, where input_name is a connector name or
-        label as get_node_card lists them; or {"indirect_input": n} to wire
-        from connector n of the parent subnet itself; or null to hold a
-        position unconnected), flags (display/render/bypass/template),
-        color [r,g,b], comment.
+    Each node spec dict supports exactly these keys; an unknown one (in a
+    spec or in an input entry) is a validation error with a did-you-mean,
+    never a silently dropped request:
+        type (required), name, parms (lists set whole parm tuples; a value
+        written {"expr": "ch('../x')"} is set as an expression, with an
+        optional "language": "hscript" | "python"), expressions (or its
+        alias exprs: a block of parm name -> expression), inputs (list of
+        source names — earlier spec names, existing children, or absolute
+        paths; or dicts with index or input_name / source / source_output,
+        where input_name is a connector name or label as get_node_card
+        lists them; or {"indirect_input": n} to wire from connector n of
+        the parent subnet itself; or null to hold a position unconnected),
+        flags (display/render/bypass/template), color [r,g,b], comment,
+        override_expression.
+
+    A string aimed at a numeric parameter is caught during validation and
+    answered with the {"expr": ...} spelling, instead of failing mid-build
+    and rolling the whole graph back.
+
+    A literal in parms does not replace an expression the parm already
+    holds (a Ray SOP ships dir = @N.x): the dry run lists such parms in
+    `expressions_in_the_way`, the build reports `expressions_kept` and a
+    `warning`. "override_expression": true on the spec clears them first.
+
+    There is no "children" key: build the subnet, then call build_network
+    again with the subnet as parent_path.
 
     Args:
         parent_path: Network to build inside (e.g. "/obj/geo1").
@@ -123,7 +140,9 @@ async def get_node_card(
     Connectors are read off a probe node the first time a type is asked
     for in a session (no undo entry, creation scripts not run);
     `connectors_probed: false` with `connectors_note` means they could not
-    be read, not that the type has none.
+    be read, not that the type has none. A menu whose items a script
+    computes (`loadtype` on filemerge::2.0) is read off the same probe and
+    marked `menu_source: "generator"`, with the script in `menu_generator`.
 
     Use this BEFORE setting parameters on a node type you have not used
     in this session — never guess parameter names. Unversioned names

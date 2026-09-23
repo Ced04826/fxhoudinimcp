@@ -1,0 +1,184 @@
+"""get_node_card showed a script-generated menu as a Menu with no items.
+
+`filemerge::2.0` promotes `loadtype` from an inner `file1`, and its items come
+from the script `opmenu -l -a file1 loadtype`. The type's template answers
+menuItems() with an empty tuple, so the card carried `"type": "Menu"` and no
+`menu` key, and a session took its tokens off the `file` SOP's card instead.
+A live parm runs the script. The card already makes a throwaway probe for the
+connectors, so the same probe now answers the menu: `menu`, `menu_labels`,
+`menu_source: "generator"` and the script in `menu_generator`.
+
+hou is mocked here; the live check ran on Houdini 22.0.429.
+"""
+
+from __future__ import annotations
+
+# Built-in
+import os
+import sys
+from unittest.mock import MagicMock
+
+# Third-party
+import pytest
+
+sys.modules.setdefault("hou", MagicMock())
+sys.modules.setdefault("hdefereval", MagicMock())
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "houdini", "scripts", "python"))
+
+# Internal
+import fxhoudinimcp_server.handlers.graph_handlers as graph  # noqa: E402
+
+hou = graph.hou
+
+LOADTYPE_ITEMS = ("full", "infobbox", "info", "points", "delayed", "packedseq", "packedgeo")
+LOADTYPE_LABELS = (
+    "All Geometry",
+    "Bounding Box",
+    "Info",
+    "Point Cloud",
+    "Packed Disk Primitive",
+    "Packed Disk Sequence",
+    "Packed Geometry",
+)
+GENERATOR = "opmenu -l -a file1 loadtype"
+
+
+def _parm(name, items=(), labels=(), template_items=(), generator="", menu_type=None):
+    parm = MagicMock()
+    menu_type = hou.parmTemplateType.Menu if menu_type is None else menu_type
+    parm.name.return_value = name
+    parm.menuItems.return_value = tuple(items)
+    parm.menuLabels.return_value = tuple(labels)
+    template = MagicMock()
+    template.menuItems.return_value = tuple(template_items)
+    template.itemGeneratorScript.return_value = generator
+    template.type.return_value = menu_type
+    parm.parmTemplate.return_value = template
+    return parm
+
+
+def _template(name, items=(), label=None):
+    template = MagicMock()
+    template.name.return_value = name
+    template.label.return_value = label or name.title()
+    template.type.return_value.name.return_value = "Menu"
+    template.numComponents.return_value = 1
+    template.isHidden.return_value = False
+    template.defaultValue.return_value = (0,)
+    template.menuItems.return_value = tuple(items)
+    return template
+
+
+def _probe(parms):
+    probe = MagicMock()
+    probe.parms.return_value = list(parms)
+    probe.inputNames.return_value = ["input1"]
+    probe.inputLabels.return_value = ["Input 1"]
+    probe.inputDataTypes.return_value = []
+    probe.outputNames.return_value = ["output1"]
+    probe.outputLabels.return_value = ["Output 1"]
+    return probe
+
+
+class TestGeneratedMenusOfAProbe:
+    def test_a_script_generated_menu_is_read_off_the_live_parm(self):
+        probe = _probe(
+            [
+                _parm("loadtype", LOADTYPE_ITEMS, LOADTYPE_LABELS, generator=GENERATOR),
+                _parm("static", template_items=("a", "b")),
+                _parm("plain"),
+            ]
+        )
+        generated = graph._generated_menus_of(probe)
+        assert set(generated) == {"loadtype"}
+        assert generated["loadtype"]["items"] == list(LOADTYPE_ITEMS)
+        assert generated["loadtype"]["labels"][0] == "All Geometry"
+        assert generated["loadtype"]["generator"] == GENERATOR
+
+    def test_a_static_menu_is_left_to_the_template(self):
+        probe = _probe([_parm("group", template_items=("a",), generator="x")])
+        assert graph._generated_menus_of(probe) == {}
+
+    def test_a_suggestion_menu_is_left_out(self):
+        # attribwrangle's snippet (StringReplace) and group pickers
+        # (StringToggle): their items are suggestions, not tokens.
+        snippet = _parm(
+            "snippet", ("// code",), generator="x", menu_type=hou.parmTemplateType.String
+        )
+        snippet.parmTemplate.return_value.menuType.return_value = "replace"
+        assert graph._generated_menus_of(_probe([snippet])) == {}
+
+    def test_a_generator_that_yields_nothing_still_names_its_script(self):
+        probe = _probe([_parm("loadtype", generator=GENERATOR)])
+        assert graph._generated_menus_of(probe) == {"loadtype": {"generator": GENERATOR}}
+
+    def test_one_failing_parm_does_not_lose_the_others(self):
+        broken = _parm("broken", generator="x")
+        broken.menuItems.side_effect = RuntimeError("script error")
+        probe = _probe([broken, _parm("loadtype", LOADTYPE_ITEMS, generator=GENERATOR)])
+        assert set(graph._generated_menus_of(probe)) == {"loadtype"}
+
+
+class TestTheCardReadsGeneratedMenus:
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch):
+        monkeypatch.setattr(graph, "_CONNECTOR_CACHE", {})
+        monkeypatch.setattr(graph, "_definition_stamp", lambda node_type: None)
+        monkeypatch.setattr(graph, "_container_for", lambda category: "geo")
+        monkeypatch.setattr(graph, "_help_text", lambda resolved, context: None)
+
+    def _card(self, monkeypatch, templates, probe, **kwargs):
+        root = MagicMock()
+        scratch = MagicMock()
+        root.createNode.return_value = scratch
+        scratch.createNode.return_value = probe
+        monkeypatch.setattr(hou, "node", lambda path: root)
+
+        resolved = MagicMock()
+        resolved.name.return_value = "filemerge::2.0"
+        resolved.description.return_value = "File Merge"
+        resolved.minNumInputs.return_value = 0
+        resolved.maxNumInputs.return_value = 0
+        resolved.maxNumOutputs.return_value = 1
+        resolved.parmTemplateGroup.return_value.entriesWithoutFolders.return_value = templates
+        resolved.parmTemplateGroup.return_value.entries.return_value = []
+        monkeypatch.setattr(hou, "nodeTypeCategories", lambda: {"Sop": MagicMock()})
+        monkeypatch.setattr(graph, "_resolve_node_type", lambda category, name: resolved)
+        card = graph.get_node_card("filemerge", "Sop", **kwargs)
+        return card, root
+
+    def test_the_card_lists_the_generated_items_with_labels_and_source(self, monkeypatch):
+        probe = _probe([_parm("loadtype", LOADTYPE_ITEMS, LOADTYPE_LABELS, generator=GENERATOR)])
+        card, _ = self._card(monkeypatch, [_template("loadtype")], probe, parm_filter="loadtype")
+        (entry,) = card["parms"]
+        assert entry["menu"] == list(LOADTYPE_ITEMS)
+        assert entry["menu_labels"] == list(LOADTYPE_LABELS)
+        assert entry["menu_source"] == "generator"
+        assert entry["menu_generator"] == GENERATOR
+        assert "note" not in entry
+        assert card["connectors_probed"] is True
+
+    def test_a_static_menu_keeps_the_template_and_says_so(self, monkeypatch):
+        probe = _probe([])
+        card, _ = self._card(monkeypatch, [_template("mode", items=("a", "b"))], probe)
+        (entry,) = card["parms"]
+        assert entry["menu"] == ["a", "b"]
+        assert entry["menu_source"] == "template"
+        assert "menu_generator" not in entry
+
+    def test_an_empty_generated_menu_is_not_shown_as_no_menu(self, monkeypatch):
+        probe = _probe([_parm("loadtype", generator=GENERATOR)])
+        card, _ = self._card(monkeypatch, [_template("loadtype")], probe)
+        (entry,) = card["parms"]
+        assert "menu" not in entry
+        assert entry["menu_generator"] == GENERATOR
+        assert "menu_generator" in entry["note"]
+
+    def test_a_second_card_reads_the_menus_from_the_cache(self, monkeypatch):
+        probe = _probe([_parm("loadtype", LOADTYPE_ITEMS, generator=GENERATOR)])
+        _, first_root = self._card(monkeypatch, [_template("loadtype")], probe)
+        card, second_root = self._card(monkeypatch, [_template("loadtype")], probe)
+        first_root.createNode.assert_called_once()
+        second_root.createNode.assert_not_called()
+        assert card["parms"][0]["menu"] == list(LOADTYPE_ITEMS)
+        assert card["parms"][0]["menu_source"] == "generator"

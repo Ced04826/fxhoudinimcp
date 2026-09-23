@@ -212,13 +212,51 @@ def _usd_value_to_python(val: Any, array_limit: int | None = _ARRAY_SUMMARY_LIMI
     return str(val)
 
 
+def _traverse(stage: Usd.Stage, root: Usd.Prim | None, instance_proxies: bool) -> Any:
+    """Prims under *root* (or the whole stage), optionally through instances.
+
+    The default USD traversal stops at an instanceable prim: its children
+    live on the prototype, and GetChildren() on the instance answers with an
+    empty tuple. A stage of instanced trees therefore counted one Mesh per
+    prototype, and finding the meshes took execute_python with
+    TraverseInstanceProxies. The predicate is opt-in because instance
+    proxies multiply the prim count by whatever the instancer instances.
+
+    Args:
+        stage: The stage to walk.
+        root: Subtree root, or None for the whole stage.
+        instance_proxies: Descend into instanceable prims.
+    """
+    if root is None:
+        if instance_proxies:
+            return stage.Traverse(Usd.TraverseInstanceProxies())
+        return stage.Traverse()
+    if instance_proxies:
+        return Usd.PrimRange(root, Usd.TraverseInstanceProxies())
+    return Usd.PrimRange(root)
+
+
+def _hidden_descendants(prim: Usd.Prim) -> int:
+    """How many prims an instanceable prim hides behind an empty GetChildren()."""
+    count = 0
+    with contextlib.suppress(Exception):
+        for _ in Usd.PrimRange(prim, Usd.TraverseInstanceProxies()):
+            count += 1
+    # The range starts at the prim itself.
+    return max(0, count - 1)
+
+
 def _prim_to_dict(
-    prim: Usd.Prim, include_attrs: bool = False, full: bool = False
+    prim: Usd.Prim,
+    include_attrs: bool = False,
+    full: bool = False,
+    instance_proxies: bool = False,
 ) -> dict[str, Any]:
     """Convert a USD prim to a JSON-safe dict.
 
     With include_attrs, array values longer than _ARRAY_SUMMARY_LIMIT are
-    summarised unless *full* is set.
+    summarised unless *full* is set, and `children` lists the prims under
+    an instanceable prim's prototype when *instance_proxies* is set.
     """
     info: dict[str, Any] = {
         "path": str(prim.GetPath()),
@@ -226,6 +264,19 @@ def _prim_to_dict(
         "is_active": prim.IsActive(),
         "has_payload": prim.HasPayload(),
     }
+    # An empty `children` on an instanceable prim is not an empty prim: its
+    # contents live on the prototype, and only an instance-proxy walk sees
+    # them. Say so, with a count, instead of letting [] read as "nothing".
+    # The count walks the whole prototype, so only the single-prim reply
+    # (the one that lists `children`) pays for it, not every list entry.
+    with contextlib.suppress(Exception):
+        if prim.IsInstanceable():
+            info["is_instanceable"] = True
+            hidden = _hidden_descendants(prim) if include_attrs else 0
+            if hidden:
+                info["hidden_descendants"] = hidden
+        if prim.IsInstanceProxy():
+            info["is_instance_proxy"] = True
 
     # Kind metadata
     model = Usd.ModelAPI(prim)
@@ -251,7 +302,16 @@ def _prim_to_dict(
             attrs.append(attr_info)
         info["attributes"] = attrs
 
-        children = [str(c.GetPath()) for c in prim.GetChildren()]
+        if instance_proxies:
+            children = [
+                str(c.GetPath())
+                for c in prim.GetFilteredChildren(
+                    Usd.TraverseInstanceProxies(Usd.PrimDefaultPredicate)
+                )
+            ]
+            info["instance_proxies_included"] = True
+        else:
+            children = [str(c.GetPath()) for c in prim.GetChildren()]
         info["children"] = children
 
     return info
@@ -260,8 +320,68 @@ def _prim_to_dict(
 ###### lops.get_stage_info
 
 
-def _get_stage_info(*, node_path: str) -> dict[str, Any]:
-    """Stage summary: prim count, layers, default prim, up axis, meters per unit."""
+def _viewport_delegate() -> str | None:
+    """Name of the Hydra delegate the first Scene Viewer draws with, if any."""
+    with contextlib.suppress(Exception):
+        for pane_tab in hou.ui.paneTabs():
+            if pane_tab.type() == hou.paneTabType.SceneViewer:
+                return str(pane_tab.currentHydraRenderer())
+    return None
+
+
+def _resolve_stage_node(node_path: str) -> tuple[hou.Node, dict[str, Any]]:
+    """The LOP whose stage answers for *node_path*, plus what it stands for.
+
+    `/stage` is a network, not a LOP, and get_stage_info refused it with
+    "Node is not a LOP node (no stage())", which left "what is the viewport
+    showing" to execute_python and displayNode(). A network now answers
+    through its display node, and the reply says so.
+
+    Raises:
+        hou.OperationFailed: if the node does not exist, or neither it nor
+            its display node holds a stage.
+    """
+    node = hou.node(node_path)
+    if node is None:
+        raise hou.OperationFailed(f"Node not found: {node_path}")
+    if hasattr(node, "stage"):
+        return node, {}
+    if not hasattr(node, "displayNode"):
+        raise hou.OperationFailed(f"Node is not a LOP node (no stage()): {node_path}")
+    display = None
+    with contextlib.suppress(Exception):
+        display = node.displayNode()
+    if display is None:
+        raise hou.OperationFailed(
+            f"Node is not a LOP node (no stage()): {node_path} is a network with "
+            "no display node. Set the display flag on a LOP inside it, or pass "
+            "that LOP's path."
+        )
+    if not hasattr(display, "stage"):
+        raise hou.OperationFailed(
+            f"Node is not a LOP node (no stage()): {node_path}, and its display "
+            f"node {display.path()} is not a LOP either."
+        )
+    context: dict[str, Any] = {
+        "requested_path": node_path,
+        "resolved_from": "display_node",
+        "display_node": display.path(),
+    }
+    with contextlib.suppress(Exception):
+        render = node.renderNode()
+        if render is not None:
+            context["render_node"] = render.path()
+    return display, context
+
+
+def _get_stage_info(*, node_path: str = "/stage") -> dict[str, Any]:
+    """Stage summary: prim count, layers, default prim, up axis, meters per unit.
+
+    Accepts a LOP network (`/stage`) as well as a LOP: the network answers
+    through its display node, which is what the viewport shows.
+    """
+    node, context = _resolve_stage_node(node_path)
+    node_path = node.path()
     stage = _get_lop_stage(node_path)
 
     # Count prims
@@ -278,7 +398,7 @@ def _get_stage_info(*, node_path: str) -> dict[str, Any]:
     default_prim = stage.GetDefaultPrim()
     default_prim_path = str(default_prim.GetPath()) if default_prim else None
 
-    return {
+    result: dict[str, Any] = {
         "node_path": node_path,
         "prim_count": prim_count,
         "default_prim": default_prim_path,
@@ -287,7 +407,13 @@ def _get_stage_info(*, node_path: str) -> dict[str, Any]:
         "root_layer": root_layer.identifier,
         "layer_count": len(layers),
         "layers": layers[:50],  # Cap to avoid huge responses
+        "frame": float(hou.frame()),
     }
+    result.update(context)
+    delegate = _viewport_delegate()
+    if delegate:
+        result["viewport_delegate"] = delegate
+    return result
 
 
 register_handler("lops.get_stage_info", _get_stage_info)
@@ -301,11 +427,14 @@ def _get_usd_prim(
     node_path: str,
     prim_path: str,
     full: bool = False,
+    traverse_instance_proxies: bool = False,
 ) -> dict[str, Any]:
     """Detailed prim info with type, kind, attributes, and children.
 
     Array attributes are summarised (size, element type, head, range) unless
-    *full* is set; get_usd_attribute reads one array in windows.
+    *full* is set; get_usd_attribute reads one array in windows. An
+    instanceable prim answers `children: []` until traverse_instance_proxies
+    is set, since its contents live on the prototype.
     """
     stage = _get_lop_stage(node_path)
 
@@ -315,7 +444,12 @@ def _get_usd_prim(
 
     return {
         "node_path": node_path,
-        "prim": _prim_to_dict(prim, include_attrs=True, full=bool(full)),
+        "prim": _prim_to_dict(
+            prim,
+            include_attrs=True,
+            full=bool(full),
+            instance_proxies=bool(traverse_instance_proxies),
+        ),
         "arrays_summarised": not full,
     }
 
@@ -333,8 +467,13 @@ def _list_usd_prims(
     prim_type: str | None = None,
     kind: str | None = None,
     depth: int | None = None,
+    traverse_instance_proxies: bool = False,
 ) -> dict[str, Any]:
-    """List prims filtered by type/kind/purpose with optional depth limit."""
+    """List prims filtered by type/kind/purpose with optional depth limit.
+
+    With traverse_instance_proxies the walk descends into instanceable prims
+    and lists the prims under their prototypes.
+    """
     stage = _get_lop_stage(node_path)
 
     root = stage.GetPrimAtPath(root_path)
@@ -349,7 +488,8 @@ def _list_usd_prims(
     # for "is under root", and "/materials/BLD" then matched
     # "/materials/BLD_probes" too; Sdf.Path.HasPrefix compares path
     # elements, and Usd.PrimRange(root) never leaves the subtree at all.
-    prims = stage.Traverse() if root_path == "/" else Usd.PrimRange(root)
+    proxies = bool(traverse_instance_proxies)
+    prims = _traverse(stage, None if root_path == "/" else root, proxies)
 
     for prim in prims:
         prim_path = prim.GetPath()
@@ -387,6 +527,7 @@ def _list_usd_prims(
             "kind": kind,
             "depth": depth,
         },
+        "instance_proxies_included": proxies,
         "count": len(results),
         "prims": results,
     }
@@ -413,6 +554,14 @@ def _get_usd_attribute(
     A long array answers with a summary as `value` and a window of elements
     as `slice` (offset/limit, default the first 64); full=True returns the
     whole array as `value`.
+
+    A time-sampled attribute (a PointInstancer's `positions`, `protoIndices`)
+    has nothing in its default slot, so Get() with the default time code
+    answers None -- USD's semantics, and `value: null` next to
+    `is_authored: true` read as "the attribute is empty". With no *time*
+    given and samples present, the current frame is read instead (the first
+    sample when the frame is outside the sampled range), and the reply names
+    the time it used and the samples it found.
     """
     stage = _get_lop_stage(node_path)
 
@@ -424,7 +573,21 @@ def _get_usd_attribute(
     if not attr.IsValid():
         raise hou.OperationFailed(f"Attribute '{attr_name}' not found on prim '{prim_path}'")
 
-    time_code = Usd.TimeCode(time) if time is not None else Usd.TimeCode.Default()
+    samples: list[float] = []
+    with contextlib.suppress(Exception):
+        samples = [float(t) for t in attr.GetTimeSamples()]
+
+    time_used = time
+    time_source = "requested" if time is not None else "default"
+    if time is None and samples:
+        with contextlib.suppress(Exception):
+            time_used = float(hou.frame())
+            time_source = "stage_frame"
+        if time_used is None or not (samples[0] <= time_used <= samples[-1]):
+            time_used = samples[0]
+            time_source = "first_sample"
+
+    time_code = Usd.TimeCode(time_used) if time_used is not None else Usd.TimeCode.Default()
     value = attr.Get(time_code)
 
     reply: dict[str, Any] = {
@@ -433,8 +596,19 @@ def _get_usd_attribute(
         "attr_name": attr_name,
         "type": str(attr.GetTypeName()),
         "is_authored": attr.IsAuthored(),
-        "time": time,
+        "time": time_used,
+        "requested_time": time,
+        "time_source": time_source,
     }
+    if samples:
+        reply["time_samples"] = len(samples)
+        reply["time_range"] = [samples[0], samples[-1]]
+        if time is None:
+            reply["note"] = (
+                f"'{attr_name}' is time-sampled ({len(samples)} samples over "
+                f"{samples[0]}..{samples[-1]}); no time was given, so it was read "
+                f"at {time_used} ({time_source}). Pass time= to pin a frame."
+            )
     if full or not _is_usd_array(value) or len(value) <= _ARRAY_SUMMARY_LIMIT:
         reply["value"] = _usd_value_to_python(value, array_limit=None)
         return reply
@@ -500,32 +674,52 @@ def _get_usd_prim_stats(
     *,
     node_path: str,
     prim_path: str = "/",
+    traverse_instance_proxies: bool = False,
 ) -> dict[str, Any]:
-    """Prim counts broken down by type under the given root."""
+    """Prim counts broken down by type under the given root.
+
+    Without traverse_instance_proxies, instanced geometry is counted once per
+    prototype, not once per instance; `instanceable_prims` says whether that
+    is happening.
+    """
     stage = _get_lop_stage(node_path)
 
     type_counts: dict[str, int] = {}
     total = 0
+    instanceable = 0
 
     root = stage.GetPrimAtPath(prim_path)
     if not root.IsValid():
         raise hou.OperationFailed(f"Root prim not found at '{prim_path}' on stage from {node_path}")
     # Same test as list_usd_prims: a path, not a string prefix.
-    prims = stage.Traverse() if prim_path == "/" else Usd.PrimRange(root)
+    proxies = bool(traverse_instance_proxies)
+    prims = _traverse(stage, None if prim_path == "/" else root, proxies)
     for prim in prims:
         total += 1
         type_name = str(prim.GetTypeName()) or "(untyped)"
         type_counts[type_name] = type_counts.get(type_name, 0) + 1
+        with contextlib.suppress(Exception):
+            if prim.IsInstanceable():
+                instanceable += 1
 
     # Sort by count descending
     sorted_types = sorted(type_counts.items(), key=lambda x: -x[1])
 
-    return {
+    result: dict[str, Any] = {
         "node_path": node_path,
         "prim_path": prim_path,
         "total_prims": total,
         "type_counts": dict(sorted_types),
+        "instance_proxies_included": proxies,
+        "instanceable_prims": instanceable,
     }
+    if instanceable and not proxies:
+        result["note"] = (
+            f"{instanceable} instanceable prim(s) were counted without their "
+            f"contents. Pass traverse_instance_proxies=true to count the "
+            f"geometry under their prototypes."
+        )
+    return result
 
 
 register_handler("lops.get_usd_prim_stats", _get_usd_prim_stats)
@@ -908,14 +1102,20 @@ def _find_usd_prims(
     *,
     node_path: str,
     pattern: str,
+    traverse_instance_proxies: bool = False,
 ) -> dict[str, Any]:
-    """Search prims by path pattern (supports * and ** wildcards)."""
+    """Search prims by path pattern (supports * and ** wildcards).
+
+    With traverse_instance_proxies the search reaches prims under
+    instanceable prototypes, which the default walk never visits.
+    """
     stage = _get_lop_stage(node_path)
 
     import fnmatch
 
+    proxies = bool(traverse_instance_proxies)
     results: list[dict[str, Any]] = []
-    for prim in stage.Traverse():
+    for prim in _traverse(stage, None, proxies):
         prim_path = str(prim.GetPath())
         if fnmatch.fnmatch(prim_path, pattern) or pattern in prim_path:
             results.append(_prim_to_dict(prim))
@@ -925,6 +1125,7 @@ def _find_usd_prims(
     return {
         "node_path": node_path,
         "pattern": pattern,
+        "instance_proxies_included": proxies,
         "count": len(results),
         "prims": results,
     }

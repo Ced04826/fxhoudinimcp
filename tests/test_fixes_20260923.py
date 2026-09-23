@@ -764,7 +764,10 @@ class TestNodeCardStartOffset:
         monkeypatch.setattr(
             graph,
             "_connectors_for_type",
-            lambda context, node_type: ({"inputs": [], "outputs": []}, None),
+            lambda context, node_type, generated_menus=None: (
+                {"inputs": [], "outputs": []},
+                None,
+            ),
         )
         card = graph.get_node_card("add", "Sop", include_help=False)
         assert card["multiparms"] == [
