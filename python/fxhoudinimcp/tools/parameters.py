@@ -111,6 +111,7 @@ async def get_parm_references(
     parm_name: str | None = None,
     direction: str = "both",
     limit: int = 200,
+    include_node_level: bool | None = None,
 ) -> dict:
     """Who references a parameter, and what it references — in one call.
 
@@ -120,18 +121,25 @@ async def get_parm_references(
     backtick strings read, resolved to parameter paths (pure ch() links and
     richer expressions alike; `unresolved` names a written target that no
     longer exists). `node_dependents` / `node_references` give the
-    node-level view for this node only.
+    node-level view for this node only; `include_node_level` in the reply
+    says whether they were included.
 
     Args:
         node_path: Node to inspect.
         parm_name: One parameter instead of all of them.
         direction: "both", "incoming" or "outgoing".
         limit: Cap on reported entries.
+        include_node_level: Include node_dependents / node_references. Default:
+            on for a whole-node query, off when parm_name names one parameter;
+            on an asset with hundreds of children those lists run to about
+            100 KB and answer a question about the node, not the parameter.
     """
     bridge = _get_bridge(ctx)
     payload: dict[str, Any] = {"node_path": node_path, "direction": direction, "limit": limit}
     if parm_name is not None:
         payload["parm_name"] = parm_name
+    if include_node_level is not None:
+        payload["include_node_level"] = include_node_level
     return await bridge.execute("parameters.get_parm_references", payload)
 
 

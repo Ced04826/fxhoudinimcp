@@ -1002,6 +1002,7 @@ def _get_parm_references(
     parm_name: str | None = None,
     direction: str = "both",
     limit: int = 200,
+    include_node_level: bool | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Who references a parameter, and what it references -- both directions.
@@ -1011,6 +1012,11 @@ def _get_parm_references(
     `outgoing` lists what this node's expressions and backtick strings read.
     Node-level `dependents` / `references` round it off, so "what breaks if I
     rename this control" is one call instead of a HOM script.
+
+    *include_node_level* decides whether the node-level lists are included.
+    None (the default) includes them for a whole-node query and leaves them
+    out when *parm_name* names one parameter: they answer a question about
+    the node, not about that parameter.
     """
     if direction not in ("both", "incoming", "outgoing"):
         raise ValueError("direction must be 'both', 'incoming' or 'outgoing'.")
@@ -1058,16 +1064,23 @@ def _get_parm_references(
         "outgoing": outgoing,
         "truncated": truncated,
     }
-    # This node only (include_children=False: a subnet's descendants are not
-    # its own references), capped like the parameter lists.
-    result["node_dependents"], count = _capped_paths(dependents, node.path(), limit)
-    if count > limit:
-        result["node_dependents_count"] = count
-    with contextlib.suppress(Exception):
-        references = node.references(include_children=False)
-        result["node_references"], count = _capped_paths(references, node.path(), limit)
+    # Asked about one parameter, the answer is about that parameter. On an
+    # asset with 947 children the node-level lists came to about 117 KB, next
+    # to 7 KB of parameter entries, for a question they do not answer. Still
+    # on by default for a whole-node query, and either way on request.
+    node_level = parm_name is None if include_node_level is None else bool(include_node_level)
+    result["include_node_level"] = node_level
+    if node_level:
+        # This node only (include_children=False: a subnet's descendants are
+        # not its own references), capped like the parameter lists.
+        result["node_dependents"], count = _capped_paths(dependents, node.path(), limit)
         if count > limit:
-            result["node_references_count"] = count
+            result["node_dependents_count"] = count
+        with contextlib.suppress(Exception):
+            references = node.references(include_children=False)
+            result["node_references"], count = _capped_paths(references, node.path(), limit)
+            if count > limit:
+                result["node_references_count"] = count
     with contextlib.suppress(Exception):
         if node.needsToCook():
             result["note"] = (
