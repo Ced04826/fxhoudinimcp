@@ -838,6 +838,16 @@ def _numeric_components(values: Any) -> list[float]:
         return []
 
 
+def _element_count(geo: hou.Geometry, cls: str, element_getter: Any) -> int:
+    """Points, prims or vertices in *geo*, from intrinsics when they answer."""
+    intrinsic = {"point": "pointcount", "prim": "primitivecount", "vertex": "vertexcount"}[cls]
+    with contextlib.suppress(Exception):
+        count = geo.intrinsicValue(intrinsic)
+        if isinstance(count, int):
+            return count
+    return len(element_getter())
+
+
 def _get_attrib_stats(
     *,
     node_path: str,
@@ -857,7 +867,9 @@ def _get_attrib_stats(
     listers = {
         "point": (geo.pointAttribs, geo.points),
         "prim": (geo.primAttribs, geo.prims),
-        "vertex": (geo.vertexAttribs, None),
+        # uv and N usually live on vertices, and the UV range is what decides a
+        # texture's tiling multiplier.
+        "vertex": (geo.vertexAttribs, lambda: [v for prim in geo.prims() for v in prim.vertices()]),
         "detail": (geo.globalAttribs, None),
         "global": (geo.globalAttribs, None),
     }
@@ -887,10 +899,10 @@ def _get_attrib_stats(
     if element_getter is None:
         raise ValueError(
             f"attrib_class {attrib_class!r} has no per-element statistics; "
-            "use point, prim or detail"
+            "use point, prim, vertex or detail"
         )
 
-    elements = element_getter()
+    elements = None  # built only when a fast path is missing: vertices are costly
     stats: dict[str, Any] = {}
     for name in wanted:
         attrib = available[name]
@@ -899,11 +911,14 @@ def _get_attrib_stats(
             continue
         # attribValues() is a single C++ call for the whole array, where a Python
         # loop over 62k elements would be thousands of times slower.
+        kind = "Int" if attrib.dataType() == hou.attribData.Int else "Float"
         try:
-            flat = list(geo.pointFloatAttribValues(name)) if cls == "point" else None
+            flat = list(getattr(geo, f"{cls}{kind}AttribValues")(name))
         except (AttributeError, hou.OperationFailed):
             flat = None
         if flat is None:
+            if elements is None:
+                elements = element_getter()
             flat = []
             for element in elements:
                 flat.extend(_numeric_components(element.attribValue(attrib)))
@@ -912,7 +927,7 @@ def _get_attrib_stats(
             continue
         size = attrib.size()
         entry: dict[str, Any] = {
-            "count": len(elements),
+            "count": len(flat) // max(size, 1),
             "size": size,
             "min": min(flat),
             "max": max(flat),
@@ -935,7 +950,7 @@ def _get_attrib_stats(
     return {
         "node_path": node_path,
         "attrib_class": attrib_class,
-        "element_count": len(elements),
+        "element_count": _element_count(geo, cls, element_getter),
         "stats": stats,
         "missing": missing,
         "truncated": bool(attribs is None and len(available) > _STATS_ATTRIB_CAP),

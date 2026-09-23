@@ -335,7 +335,8 @@ async def get_attrib_stats(
     Args:
         node_path: SOP node path.
         attribs: Attribute names. Omit for every attribute of the class.
-        attrib_class: "point", "prim" or "detail".
+        attrib_class: "point", "prim", "vertex" (uv and N usually live
+            there) or "detail".
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"node_path": node_path, "attrib_class": attrib_class}
