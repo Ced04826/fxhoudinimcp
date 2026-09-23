@@ -14,11 +14,16 @@ from fxhoudinimcp.server import _get_bridge, mcp
 
 
 @mcp.tool()
-async def get_stage_info(ctx: Context, node_path: str) -> dict:
-    """Get USD stage info from a LOP node.
+async def get_stage_info(ctx: Context, node_path: str = "/stage") -> dict:
+    """Get USD stage info from a LOP node, or from a LOP network.
+
+    Given a network such as "/stage", the answer is about what that network
+    displays: `display_node` (and `render_node`) name it, `resolved_from` is
+    "display_node", `viewport_delegate` names the Hydra delegate the Scene
+    Viewer draws with, and `frame` is the current frame.
 
     Args:
-        node_path: LOP node path.
+        node_path: LOP node or LOP network path (default "/stage").
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(

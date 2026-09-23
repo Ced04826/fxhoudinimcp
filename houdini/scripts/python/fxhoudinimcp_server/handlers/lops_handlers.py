@@ -258,8 +258,68 @@ def _prim_to_dict(
 ###### lops.get_stage_info
 
 
-def _get_stage_info(*, node_path: str) -> dict[str, Any]:
-    """Stage summary: prim count, layers, default prim, up axis, meters per unit."""
+def _viewport_delegate() -> str | None:
+    """Name of the Hydra delegate the first Scene Viewer draws with, if any."""
+    with contextlib.suppress(Exception):
+        for pane_tab in hou.ui.paneTabs():
+            if pane_tab.type() == hou.paneTabType.SceneViewer:
+                return str(pane_tab.currentHydraRenderer())
+    return None
+
+
+def _resolve_stage_node(node_path: str) -> tuple[hou.Node, dict[str, Any]]:
+    """The LOP whose stage answers for *node_path*, plus what it stands for.
+
+    `/stage` is a network, not a LOP, and get_stage_info refused it with
+    "Node is not a LOP node (no stage())", which left "what is the viewport
+    showing" to execute_python and displayNode(). A network now answers
+    through its display node, and the reply says so.
+
+    Raises:
+        hou.OperationFailed: if the node does not exist, or neither it nor
+            its display node holds a stage.
+    """
+    node = hou.node(node_path)
+    if node is None:
+        raise hou.OperationFailed(f"Node not found: {node_path}")
+    if hasattr(node, "stage"):
+        return node, {}
+    if not hasattr(node, "displayNode"):
+        raise hou.OperationFailed(f"Node is not a LOP node (no stage()): {node_path}")
+    display = None
+    with contextlib.suppress(Exception):
+        display = node.displayNode()
+    if display is None:
+        raise hou.OperationFailed(
+            f"Node is not a LOP node (no stage()): {node_path} is a network with "
+            "no display node. Set the display flag on a LOP inside it, or pass "
+            "that LOP's path."
+        )
+    if not hasattr(display, "stage"):
+        raise hou.OperationFailed(
+            f"Node is not a LOP node (no stage()): {node_path}, and its display "
+            f"node {display.path()} is not a LOP either."
+        )
+    context: dict[str, Any] = {
+        "requested_path": node_path,
+        "resolved_from": "display_node",
+        "display_node": display.path(),
+    }
+    with contextlib.suppress(Exception):
+        render = node.renderNode()
+        if render is not None:
+            context["render_node"] = render.path()
+    return display, context
+
+
+def _get_stage_info(*, node_path: str = "/stage") -> dict[str, Any]:
+    """Stage summary: prim count, layers, default prim, up axis, meters per unit.
+
+    Accepts a LOP network (`/stage`) as well as a LOP: the network answers
+    through its display node, which is what the viewport shows.
+    """
+    node, context = _resolve_stage_node(node_path)
+    node_path = node.path()
     stage = _get_lop_stage(node_path)
 
     # Count prims
@@ -276,7 +336,7 @@ def _get_stage_info(*, node_path: str) -> dict[str, Any]:
     default_prim = stage.GetDefaultPrim()
     default_prim_path = str(default_prim.GetPath()) if default_prim else None
 
-    return {
+    result: dict[str, Any] = {
         "node_path": node_path,
         "prim_count": prim_count,
         "default_prim": default_prim_path,
@@ -285,7 +345,13 @@ def _get_stage_info(*, node_path: str) -> dict[str, Any]:
         "root_layer": root_layer.identifier,
         "layer_count": len(layers),
         "layers": layers[:50],  # Cap to avoid huge responses
+        "frame": float(hou.frame()),
     }
+    result.update(context)
+    delegate = _viewport_delegate()
+    if delegate:
+        result["viewport_delegate"] = delegate
+    return result
 
 
 register_handler("lops.get_stage_info", _get_stage_info)
