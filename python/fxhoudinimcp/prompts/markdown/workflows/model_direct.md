@@ -61,7 +61,8 @@ is an installed Modeler HDA. No separate Boolean MCP tool is required.
 
 1. Measure bidirectional area-sampled surface distances in a declared space.
    Record samples, seed, tolerances, mean/P95/max and coverage; check important
-   holes/contact regions separately. Use the actual output surface, including
+   holes/contact regions separately (`section_geometry`, `fit="circle"` for
+   hole and boss diameters, outlines at given heights). Use the actual output surface, including
    evaluated SubD only where used. Coverage is not visual similarity.
 2. Check unexpected non-manifold/degenerate/flipped faces, wrong openings and
    part connectivity. Inspect actual triangulation of ngons; legal planar
