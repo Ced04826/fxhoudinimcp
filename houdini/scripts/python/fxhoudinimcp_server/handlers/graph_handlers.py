@@ -192,8 +192,9 @@ def _container_for(category_name: str) -> str | None:
 
 # Connectors per type for the session: probing creates a node, and a card is
 # read again and again. Keyed on the HDA definition's modification time too,
-# so a reinstalled asset is probed afresh.
-_CONNECTOR_CACHE: dict[tuple, dict] = {}
+# so a reinstalled asset is probed afresh. Each entry is (connectors,
+# generated menus): one probe answers both.
+_CONNECTOR_CACHE: dict[tuple, tuple[dict, dict]] = {}
 
 
 def _definition_stamp(node_type) -> Any:
@@ -204,19 +205,74 @@ def _definition_stamp(node_type) -> Any:
     return None
 
 
-def _connectors_for_type(category_name: str, node_type) -> tuple[dict | None, str | None]:
+def _is_strict_menu(template) -> bool:
+    """A menu that rejects arbitrary text: an int menu or a "normal" string one."""
+    return template.type() == hou.parmTemplateType.Menu or (
+        template.type() == hou.parmTemplateType.String
+        and template.menuType() == hou.menuType.Normal
+    )
+
+
+def _generated_menus_of(node: hou.Node) -> dict[str, dict[str, Any]]:
+    """Menus a live node computes that its type's templates do not carry.
+
+    `filemerge::2.0` promotes `loadtype` from an inner `file1`, and its items
+    come from the script `opmenu -l -a file1 loadtype`. The type's template
+    answers menuItems() with an empty tuple, so the card showed a Menu with no
+    items, and a session took its tokens off another node's card. A live parm
+    runs the script and answers with all seven.
+
+    Returns {parm name: {"generator": script, "items": [...], "labels": [...]}};
+    "items" is absent when the live parm had none to offer either.
+    """
+    generated: dict[str, dict[str, Any]] = {}
+    with contextlib.suppress(Exception):
+        for parm in node.parms():
+            with contextlib.suppress(Exception):
+                template = parm.parmTemplate()
+                if list(template.menuItems()):
+                    continue  # a static menu: the template already has it
+                if not _is_strict_menu(template):
+                    # A group picker or a wrangle's snippet list: suggestions,
+                    # not tokens, and whole VEX snippets doubled the card.
+                    continue
+                script = ""
+                with contextlib.suppress(Exception):
+                    script = template.itemGeneratorScript() or ""
+                if not script:
+                    continue
+                entry: dict[str, Any] = {"generator": script}
+                items = list(parm.menuItems())
+                if items:
+                    entry["items"] = items
+                    with contextlib.suppress(Exception):
+                        entry["labels"] = list(parm.menuLabels())
+                generated[parm.name()] = entry
+    return generated
+
+
+def _connectors_for_type(
+    category_name: str,
+    node_type,
+    generated_menus: dict | None = None,
+) -> tuple[dict | None, str | None]:
     """Connector names/labels of *node_type*, probed on a throwaway instance.
 
     Returns (connectors, None), or (None, why) when there was nothing to probe
     in or the probe failed: a card is never refused over its connectors, and
-    never reports "no inputs" when it did not look. The probe runs with undo
-    disabled and without the type's creation scripts (a documentation read
-    must not run an asset's OnCreated); it still marks the scene modified,
-    as build_network's dry run does, once per type per session.
+    never reports "no inputs" when it did not look. When *generated_menus* is
+    given, it is filled from the same probe with the menus a script computes
+    (see _generated_menus_of): one probe, two questions. The probe runs with
+    undo disabled and without the type's creation scripts (a documentation
+    read must not run an asset's OnCreated); it still marks the scene
+    modified, as build_network's dry run does, once per type per session.
     """
     key = (category_name, node_type.name(), _definition_stamp(node_type))
     if key in _CONNECTOR_CACHE:
-        return _CONNECTOR_CACHE[key], None
+        connectors, menus = _CONNECTOR_CACHE[key]
+        if generated_menus is not None:
+            generated_menus.update(menus)
+        return connectors, None
     container = _container_for(category_name)
     if container is None:
         return None, f"no network under /obj holds {category_name} nodes to probe in"
@@ -228,6 +284,7 @@ def _connectors_for_type(category_name: str, node_type) -> tuple[dict | None, st
         with hou.undos.disabler():
             scratch = root.createNode(container, "fxhoudinimcp_card_probe")
             probe = scratch.createNode(node_type.name(), run_init_scripts=False)
+            menus = _generated_menus_of(probe)
             connectors = _connectors_of(probe)
     except Exception as exc:
         return None, f"probing {node_type.name()} failed: {readable_message(exc)}"
@@ -236,7 +293,9 @@ def _connectors_for_type(category_name: str, node_type) -> tuple[dict | None, st
             if scratch is not None:
                 with hou.undos.disabler():
                     scratch.destroy()
-    _CONNECTOR_CACHE[key] = connectors
+    _CONNECTOR_CACHE[key] = (connectors, menus)
+    if generated_menus is not None:
+        generated_menus.update(menus)
     return connectors, None
 
 
@@ -290,13 +349,7 @@ def _parm_names_for_type(
         with contextlib.suppress(Exception):
             template = parm.parmTemplate()
             items = list(parm.menuItems())
-            if items and (
-                template.type() == hou.parmTemplateType.Menu
-                or (
-                    template.type() == hou.parmTemplateType.String
-                    and template.menuType() == hou.menuType.Normal
-                )
-            ):
+            if items and _is_strict_menu(template):
                 menus[parm.name()] = items
     probe.destroy()
     return parm_names, tuple_names, menus, _instance_patterns(node_type), connectors
@@ -1157,6 +1210,13 @@ def get_node_card(
         close = get_close_matches(node_type, list(category.nodeTypes()), n=5, cutoff=0.4)
         raise ValueError(f"Node type '{node_type}' not found in {context}. Close matches: {close}")
 
+    # Connectors, in order, by index AND name: the index of `texcoord` on
+    # mtlximage is 3, and until now there was nowhere to read that. The same
+    # throwaway probe also answers the menus a live parm computes but the
+    # type's template does not carry, so it runs before the parameter walk.
+    generated_menus: dict[str, dict[str, Any]] = {}
+    connectors, not_probed = _connectors_for_type(context, resolved, generated_menus)
+
     parms: list[dict[str, Any]] = []
     _PARM_CAP = 80
     _MENU_CAP = 15
@@ -1198,16 +1258,37 @@ def get_node_card(
             entry["multiparm_instance"] = True
         with contextlib.suppress(Exception):
             entry["default"] = list(template.defaultValue())
+        items: list[str] = []
+        menu_source = "template"
         with contextlib.suppress(Exception):
             items = list(template.menuItems())
-            if items:
-                entry["menu"] = items[:_MENU_CAP]
-                if len(items) > _MENU_CAP:
-                    # Silent truncation reads as "these are all the options",
-                    # which is how a caller picks a token that is not in a menu
-                    # it never saw the rest of.
-                    entry["menu_truncated"] = True
-                    entry["menu_count"] = len(items)
+        generated = generated_menus.get(name)
+        if not items and generated:
+            # The template has no items because a script computes them
+            # (`opmenu -l -a file1 loadtype` on filemerge::2.0). An empty Menu
+            # on the card reads as "no menu", and a session then took its
+            # tokens off another node's card.
+            entry["menu_generator"] = generated["generator"]
+            items = list(generated.get("items") or [])
+            menu_source = "generator"
+            labels = generated.get("labels") or []
+            if labels:
+                entry["menu_labels"] = list(labels)[:_MENU_CAP]
+            if not items:
+                entry["note"] = (
+                    "This menu's items are computed by the script in "
+                    "menu_generator and could not be read off a probe instance; "
+                    "the menu is not empty on a real node."
+                )
+        if items:
+            entry["menu"] = items[:_MENU_CAP]
+            entry["menu_source"] = menu_source
+            if len(items) > _MENU_CAP:
+                # Silent truncation reads as "these are all the options",
+                # which is how a caller picks a token that is not in a menu
+                # it never saw the rest of.
+                entry["menu_truncated"] = True
+                entry["menu_count"] = len(items)
         parms.append(entry)
 
     # Multiparm blocks, which are the reason a parameter can be real and yet
@@ -1244,10 +1325,6 @@ def get_node_card(
     help_text = _help_text(resolved, context) if include_help else None
     if help_text and len(help_text) > 5000:
         help_text = help_text[:5000] + "\n[... help truncated]"
-
-    # Connectors, in order, by index AND name: the index of `texcoord` on
-    # mtlximage is 3, and until now there was nowhere to read that.
-    connectors, not_probed = _connectors_for_type(context, resolved)
 
     card = {
         "type": resolved.name(),

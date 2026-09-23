@@ -114,7 +114,9 @@ async def get_node_card(
     shipped help text. Connectors are read off a probe node the first time
     a type is asked for in a session (no undo entry, creation scripts not
     run); `connectors_probed: false` with `connectors_note` means they could
-    not be read, not that the type has none.
+    not be read, not that the type has none. A menu whose items a script
+    computes (`loadtype` on filemerge::2.0) is read off the same probe and
+    marked `menu_source: "generator"`, with the script in `menu_generator`.
 
     Use this BEFORE setting parameters on a node type you have not used
     in this session — never guess parameter names. Unversioned names
