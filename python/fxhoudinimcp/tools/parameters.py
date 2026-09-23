@@ -38,18 +38,45 @@ async def get_parameter(ctx: Context, node_path: str, parm_name: str) -> dict:
 
 
 @mcp.tool()
-async def set_parameter(ctx: Context, node_path: str, parm_name: str, value: Value) -> dict:
+async def set_parameter(
+    ctx: Context,
+    node_path: str,
+    parm_name: str,
+    value: Value,
+    override_expression: bool = False,
+) -> dict:
     """Set a parameter value.
+
+    A parameter that holds an expression does NOT take a literal: Houdini
+    writes the value into a slot the expression keeps overriding. The reply
+    then carries `expression_kept: true` with the surviving `expression` and
+    what you `requested` (plus `same_as_evaluated` when the expression happens
+    to evaluate to that value right now) — read those before calling the write
+    done. Pass override_expression=True to clear the expression first.
+
+    A parameter holding a BARE ch() reference is the opposite trap: Houdini
+    writes THROUGH it into the parameter it reads, so the value lands on
+    another node. The reply names that parameter in `written_through`.
+
+    A String parameter echoes `raw_value` (the unexpanded text, `$JOB/...`)
+    next to the expanded `new_value`.
 
     Args:
         node_path: Node path.
         parm_name: Parameter name.
         value: New value (int, float, string, bool, or list).
+        override_expression: Remove an expression standing in the way,
+            instead of reporting that the write did not take.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
         "parameters.set_parameter",
-        {"node_path": node_path, "parm_name": parm_name, "value": value},
+        {
+            "node_path": node_path,
+            "parm_name": parm_name,
+            "value": value,
+            "override_expression": override_expression,
+        },
     )
 
 
@@ -57,17 +84,35 @@ async def set_parameter(ctx: Context, node_path: str, parm_name: str, value: Val
 
 
 @mcp.tool()
-async def set_parameters(ctx: Context, node_path: str, params: dict[str, Any]) -> dict:
+async def set_parameters(
+    ctx: Context,
+    node_path: str,
+    params: dict[str, Any],
+    override_expression: bool = False,
+) -> dict:
     """Batch-set multiple parameters on a node.
+
+    Parameters that held an expression and therefore ignored the literal are
+    listed in `expressions_kept`, with a top-level `warning`: a batch whose
+    `errors` is empty can still contain a write that did not take. Values that
+    landed on ANOTHER node, because the parameter is a bare ch() reference
+    Houdini writes through, are in `written_through`. Each entry in `set`
+    carries the same keys as set_parameter's reply. Pass
+    override_expression=True to clear those expressions and links instead.
 
     Args:
         node_path: Node path.
         params: Mapping of parameter names to values.
+        override_expression: Remove expressions standing in the way.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
         "parameters.set_parameters",
-        {"node_path": node_path, "params": params},
+        {
+            "node_path": node_path,
+            "params": params,
+            "override_expression": override_expression,
+        },
     )
 
 
