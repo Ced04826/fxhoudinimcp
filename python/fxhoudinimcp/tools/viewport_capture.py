@@ -27,6 +27,7 @@ async def capture_viewport(
     restore_view: bool = True,
     follow_targets: bool = True,
     show_target: bool = False,
+    isolate: bool | list[str] = True,
 ) -> dict:
     """Capture what the Scene Viewer shows, from several views in one call,
     each framed so the target is whole and fills the image.
@@ -50,6 +51,11 @@ async def capture_viewport(
     what is drawn (`drawn.targets_drawn`); a target that is not its network's
     display node is a problem unless show_target moves the display flag onto
     it for the capture. Network and flags are put back afterwards.
+
+    At /obj every displayed object is drawn, and inside a SOP network the
+    other objects are ghosted over the one being edited. isolate draws only
+    the targets' objects, through the flipbook's own object mask: nothing in
+    the scene or the viewer changes.
 
     Look at the images with your file reader; nothing is inlined.
 
@@ -80,8 +86,14 @@ async def capture_viewport(
             capture (default True).
         show_target: Move the display flag onto a SOP target that is not its
             network's display node, for the capture only (default False).
+        isolate: True (default) draws only the objects that hold the node
+            targets; without node targets nothing is hidden. False draws
+            everything the viewer shows, for context. A list of node paths
+            draws those objects (a SOP path means its object), e.g. the body
+            and a wheel together.
 
-    Returns per view: path, pixels, target_rect (image pixels, origin top
+    Returns per view: path, pixels, isolated (the objects drawn alone, or
+    null), target_rect (image pixels, origin top
     left), target_in_frame, target_fill, drawn_fraction (share of the target
     region actually drawn on), drawn (network, display_node, targets_drawn),
     projection, looking_along, pivot, and ortho_width or distance with
@@ -98,6 +110,7 @@ async def capture_viewport(
         "restore_view": restore_view,
         "follow_targets": follow_targets,
         "show_target": show_target,
+        "isolate": isolate,
     }
     for key, value in (
         ("views", views),

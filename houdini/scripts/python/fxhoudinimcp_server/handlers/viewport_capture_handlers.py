@@ -665,7 +665,9 @@ def _orient(viewport, state: dict[str, Any], view: dict[str, Any], base: dict[st
     return params
 
 
-def _flipbook(scene_viewer, viewport, path: str, out_w: int, out_h: int) -> str:
+def _flipbook(
+    scene_viewer, viewport, path: str, out_w: int, out_h: int, visible: list[str] | None
+) -> str:
     settings = scene_viewer.flipbookSettings().stash()
     frame = hou.frame()
     settings.frameRange((frame, frame))
@@ -673,8 +675,54 @@ def _flipbook(scene_viewer, viewport, path: str, out_w: int, out_h: int) -> str:
     _no_mplay(settings)
     settings.useResolution(True)
     settings.resolution((int(out_w), int(out_h)))
+    if visible:
+        # A mask on this copy of the settings only: the viewer, the scene and
+        # the display flags are untouched. Measured on 22.0.368: it hides the
+        # other displayed objects at /obj and their ghosts inside a SOP
+        # network, and full paths match objects nested in subnets.
+        settings.visibleObjects(" ".join(visible))
     scene_viewer.flipbook(viewport, settings)
     return _find_flipbook_output(path, frame)
+
+
+def _owning_object(node):
+    """The object *node* is part of: itself for an object node, else None."""
+    while node is not None:
+        with contextlib.suppress(Exception):
+            if node.type().category().name() == "Object":
+                return node
+        node = node.parent()
+    return None
+
+
+def _parse_isolate(isolate: Any) -> bool | list[str]:
+    """True/False, or the object paths to show; node paths map to their object."""
+    if isinstance(isolate, bool):
+        return isolate
+    if isinstance(isolate, str):
+        isolate = [isolate]
+    if not isinstance(isolate, (list, tuple)) or not isolate:
+        raise ValueError(f"isolate must be true, false or a list of node paths, not {isolate!r}")
+    objects: list[str] = []
+    for path in isolate:
+        node = hou.node(path) if isinstance(path, str) else None
+        if node is None:
+            raise ValueError(f"isolate: no node at {path!r}")
+        owner = _owning_object(node)
+        if owner is None:
+            raise ValueError(f"isolate: {node.path()} is not an object or inside one")
+        objects.append(owner.path())
+    return sorted(set(objects))
+
+
+def _isolated_objects(isolate: bool | list[str], described: list[str]) -> list[str] | None:
+    """The objects this view draws alone, or None to draw what the viewer shows."""
+    if isolate is False:
+        return None
+    if isolate is not True:
+        return isolate
+    owners = [_owning_object(hou.node(path)) for path in described if path != "bbox"]
+    return sorted({owner.path() for owner in owners if owner is not None}) or None
 
 
 def _pixel_facts(path: str, rect: list[float] | None) -> dict[str, Any]:
@@ -716,7 +764,7 @@ def _pixel_facts(path: str, rect: list[float] | None) -> dict[str, Any]:
     return {"readable": True, "pixels": [w, h], "drawn_fraction": round(float(drawn.mean()), 4)}
 
 
-def _shoot(scene_viewer, viewport, state, base, view, corners, path, max_size, margin):
+def _shoot(scene_viewer, viewport, state, base, view, corners, path, max_size, margin, visible):
     size = viewport.size()
     width, height = float(size[2]), float(size[3])
     params = _orient(viewport, state, view, base)
@@ -786,7 +834,8 @@ def _shoot(scene_viewer, viewport, state, base, view, corners, path, max_size, m
                 round((rect[3] - rect[1]) / out_h, 3),
             ]
 
-    written = _flipbook(scene_viewer, viewport, path, out_w, out_h)
+    shot["isolated"] = visible
+    written = _flipbook(scene_viewer, viewport, path, out_w, out_h, visible)
     facts = _pixel_facts(written, rect) if os.path.isfile(written) else {"readable": False}
     if facts.get("drawn_fraction") is not None and facts["drawn_fraction"] < _BLANK_FRACTION:
         # One redraw and one retry before the verdict: a viewport that has
@@ -794,7 +843,7 @@ def _shoot(scene_viewer, viewport, state, base, view, corners, path, max_size, m
         with contextlib.suppress(Exception):
             viewport.draw()
         time.sleep(0.2)
-        written = _flipbook(scene_viewer, viewport, path, out_w, out_h)
+        written = _flipbook(scene_viewer, viewport, path, out_w, out_h, visible)
         facts = _pixel_facts(written, rect) if os.path.isfile(written) else {"readable": False}
         shot["retried"] = True
     shot["path"] = written
@@ -860,7 +909,9 @@ def _show_targets(scene_viewer, described, follow, show_target, moved_flags) -> 
     return facts
 
 
-def _restore_targets(scene_viewer, viewer_network: str, moved_flags, restore_view: bool) -> list[str]:
+def _restore_targets(
+    scene_viewer, viewer_network: str, moved_flags, restore_view: bool
+) -> list[str]:
     """Put back the display flags moved and, with restore_view, the viewer's network."""
     problems: list[str] = []
     for network, previous in moved_flags.items():
@@ -879,7 +930,9 @@ def _restore_targets(scene_viewer, viewer_network: str, moved_flags, restore_vie
         with contextlib.suppress(Exception):
             scene_viewer.setPwd(hou.node(viewer_network))
         if scene_viewer.pwd().path() != viewer_network:
-            problems.append(f"the viewer is in {scene_viewer.pwd().path()}, was in {viewer_network}")
+            problems.append(
+                f"the viewer is in {scene_viewer.pwd().path()}, was in {viewer_network}"
+            )
     return problems
 
 
@@ -899,6 +952,7 @@ def capture_viewport(
     restore_view: bool = True,
     follow_targets: bool = True,
     show_target: bool = False,
+    isolate: Any = True,
     **_: Any,
 ) -> dict[str, Any]:
     """Flipbook the Scene Viewer from one or more views, framed on a target.
@@ -906,7 +960,9 @@ def capture_viewport(
     See the module docstring for what is captured and how framing is checked.
     follow_targets points the viewer at the SOP targets' network for the
     capture; show_target moves the display flag onto a SOP target that is not
-    its network's display node. Both are put back afterwards.
+    its network's display node. Both are put back afterwards. isolate draws
+    only the targets' objects (or the objects listed), so other displayed
+    objects and their ghosts do not overlap the target.
     """
     started = time.perf_counter()
     if not isinstance(max_size, int) or isinstance(max_size, bool) or not 256 <= max_size <= 4096:
@@ -923,6 +979,7 @@ def capture_viewport(
 
     # Targets are resolved before the viewer is touched, so a bad path costs
     # nothing but the error.
+    isolate = _parse_isolate(isolate)
     shared = _target_corners(targets, bbox)
     per_view = [
         _target_corners(spec["targets"], spec["bbox"])
@@ -975,11 +1032,28 @@ def capture_viewport(
         result["shading"] = _current_shading(viewport)
         for spec, name, (corners, described) in zip(specs, names, per_view, strict=True):
             path = os.path.join(output_dir, f"{safe_name(prefix)}_{name}.png").replace("\\", "/")
-            drawn = _show_targets(
-                scene_viewer, described, follow_targets, show_target, moved_flags
-            )
+            drawn = _show_targets(scene_viewer, described, follow_targets, show_target, moved_flags)
+            visible = _isolated_objects(isolate, described)
+            if visible:
+                hidden = []
+                for target in drawn["targets_drawn"]:
+                    owner = _owning_object(hou.node(target))
+                    if owner is None or owner.path() not in visible:
+                        hidden.append(target)
+                        drawn["targets_drawn"][target] = False
+                if hidden:
+                    drawn["hidden_by_isolate"] = hidden
             shot = _shoot(
-                scene_viewer, viewport, state, base, spec, corners, path, max_size, float(margin)
+                scene_viewer,
+                viewport,
+                state,
+                base,
+                spec,
+                corners,
+                path,
+                max_size,
+                float(margin),
+                visible,
             )
             shot["framed"] = described or None
             shot["drawn"] = drawn
@@ -987,7 +1061,9 @@ def capture_viewport(
     finally:
         if restore_view:
             restore_problems = _restore_state(viewport, state, base)
-        restore_problems += _restore_targets(scene_viewer, viewer_network, moved_flags, restore_view)
+        restore_problems += _restore_targets(
+            scene_viewer, viewer_network, moved_flags, restore_view
+        )
 
     for shot in result["views"]:
         if not shot.get("file_exists"):
@@ -999,7 +1075,14 @@ def capture_viewport(
         if shot.get("target_in_frame") is False:
             result["problems"].append(f"{shot['name']}: the target is not fully in frame")
         drawn = shot.get("drawn") or {}
+        for target in drawn.get("hidden_by_isolate") or []:
+            result["problems"].append(
+                f"{shot['name']}: {target} is framed but its object is not in "
+                f"isolate {shot.get('isolated')}"
+            )
         for target, showing in (drawn.get("targets_drawn") or {}).items():
+            if target in (drawn.get("hidden_by_isolate") or []):
+                continue
             if not showing:
                 result["problems"].append(
                     f"{shot['name']}: {target} is framed but not drawn -- the viewer draws "

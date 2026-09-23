@@ -267,3 +267,56 @@ class TestTargetsAreDrawn:
     def test_a_bbox_alone_needs_no_drawing_check(self):
         facts = vc._show_targets(MagicMock(), ["bbox"], True, False, {})
         assert facts["targets_drawn"] == {}
+
+
+class TestIsolate:
+    """isolate maps node paths to the objects that hold them."""
+
+    @staticmethod
+    def _scene(monkeypatch):
+        from types import SimpleNamespace
+
+        nodes = {}
+
+        def make(path, category, parent):
+            node = SimpleNamespace(
+                path=lambda: path,
+                parent=lambda: nodes.get(parent),
+                type=lambda: SimpleNamespace(
+                    category=lambda: SimpleNamespace(name=lambda: category)
+                ),
+            )
+            nodes[path] = node
+
+        make("/", "Manager", None)
+        make("/obj", "Manager", "/")
+        make("/obj/a", "Object", "/obj")
+        make("/obj/a/box1", "Sop", "/obj/a")
+        make("/obj/sub", "Object", "/obj")
+        make("/obj/sub/c", "Object", "/obj/sub")
+        make("/obj/sub/c/tube1", "Sop", "/obj/sub/c")
+        monkeypatch.setattr(vc.hou, "node", lambda path: nodes.get(path))
+
+    def test_paths_map_to_their_objects(self, monkeypatch):
+        self._scene(monkeypatch)
+        assert vc._parse_isolate(True) is True
+        assert vc._parse_isolate(False) is False
+        assert vc._parse_isolate(["/obj/sub/c/tube1", "/obj/a/box1", "/obj/a"]) == [
+            "/obj/a",
+            "/obj/sub/c",
+        ]
+        assert vc._parse_isolate("/obj/a") == ["/obj/a"]
+
+    @pytest.mark.parametrize("bad", [[], ["/obj/nope"], ["/obj"], 3, [None]])
+    def test_bad_isolate_is_refused(self, monkeypatch, bad):
+        self._scene(monkeypatch)
+        with pytest.raises(ValueError):
+            vc._parse_isolate(bad)
+
+    def test_true_isolates_the_targets_objects_only(self, monkeypatch):
+        self._scene(monkeypatch)
+        described = ["/obj/a/box1", "bbox", "/obj/sub/c/tube1"]
+        assert vc._isolated_objects(True, described) == ["/obj/a", "/obj/sub/c"]
+        assert vc._isolated_objects(True, ["bbox"]) is None
+        assert vc._isolated_objects(False, described) is None
+        assert vc._isolated_objects(["/obj/a"], ["bbox"]) == ["/obj/a"]
