@@ -27,6 +27,7 @@ _HANDLER_MODULES = [
     "animation_handlers",
     "rendering_handlers",
     "viewport_handlers",
+    "viewport_capture_handlers",
     "geometry_handlers",
     "modeling_handlers",
     "lops_handlers",

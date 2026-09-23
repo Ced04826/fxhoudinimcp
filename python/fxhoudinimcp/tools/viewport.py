@@ -195,21 +195,38 @@ async def capture_network_editor(
     ctx: Context,
     output_path: str,
     node_path: str | None = None,
+    network_path: str | None = None,
+    bounds: list[float] | None = None,
+    margin: float = 0.05,
 ) -> dict:
-    """Capture a screenshot of the network editor.
+    """Capture the network editor, framed on a whole network, a node, or bounds.
 
     The image is written to disk only; open ``output_path`` with your file
     reader to look at it. Prefer get_node_info or list_children for inspecting
     node connections unless visual confirmation of wiring is genuinely needed.
 
+    Uses the largest Network Editor pane. The pane is put back where it was
+    and the selection is never changed. success is false when the image is a
+    single colour (the pane did not draw).
+
     Args:
         output_path: Image file path.
-        node_path: Node path to navigate to before capture.
+        node_path: Frame this node with its direct inputs and outputs.
+        network_path: Frame this whole network: nodes, boxes, sticky notes,
+            dots. Default: the pane's current network, whole.
+        bounds: [x0, y0, x1, y1] in network units, in network_path or the
+            pane's current network.
+        margin: Border around what is framed, as a fraction of its size.
     """
     bridge = _get_bridge(ctx)
-    params: dict[str, Any] = {"output_path": output_path}
-    if node_path is not None:
-        params["node_path"] = node_path
+    params: dict[str, Any] = {"output_path": output_path, "margin": margin}
+    for key, value in (
+        ("node_path", node_path),
+        ("network_path", network_path),
+        ("bounds", bounds),
+    ):
+        if value is not None:
+            params[key] = value
     return await bridge.execute("viewport.capture_network_editor", params)
 
 

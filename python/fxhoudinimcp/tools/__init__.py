@@ -31,5 +31,6 @@ from fxhoudinimcp.tools import (
     tops,  # noqa: F401
     vex,  # noqa: F401
     viewport,  # noqa: F401
+    viewport_capture,  # noqa: F401
     workflows,  # noqa: F401
 )

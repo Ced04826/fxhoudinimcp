@@ -606,6 +606,14 @@ def _set_parameters(
         if error:
             errors.append({"parm_name": name, "error": error})
 
+    if mode == "none":
+        # "none" asks for a count, not a list: echoing every name back cost a
+        # 900-parameter Add write about fifteen thousand tokens. An entry
+        # stays only when it says more than its name -- an expression this
+        # write cleared, or components written before a failure.
+        failed = {error["parm_name"] for error in errors}
+        written = sum(1 for entry in results if entry["parm_name"] not in failed)
+        results = [entry for entry in results if len(entry) > 1]
     result: dict[str, Any] = {
         "node_path": node_path,
         "success": not errors,
@@ -616,6 +624,8 @@ def _set_parameters(
         # when it was read is not a fact about the parameter.
         "context": _eval_context(),
     }
+    if mode == "none":
+        result["set_count"] = written
     if _single is not None:
         # The single write predates the batch and callers read new_value off
         # the top level; keeping that promise costs one key.

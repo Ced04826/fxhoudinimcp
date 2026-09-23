@@ -964,12 +964,22 @@ class TestParameterWrites:
         )
         assert result["set"][0]["new_value"] == long_code
 
-    def test_none_returns_names_only(self, hou_stub, monkeypatch):
+    def test_none_returns_a_count_not_the_names(self, hou_stub, monkeypatch):
         _node(monkeypatch, _box_node())
         result = parameter_handlers._set_parameters(
-            "/obj/geo1/box1", {"sizex": 2.0}, return_values="none"
+            "/obj/geo1/box1", {"sizex": 2.0, "sizey": 3.0}, return_values="none"
         )
-        assert result["set"] == [{"parm_name": "sizex"}]
+        assert result["set"] == []
+        assert result["set_count"] == 2
+        assert result["success"] is True
+
+    def test_none_still_names_what_failed(self, hou_stub, monkeypatch):
+        _node(monkeypatch, _box_node())
+        result = parameter_handlers._set_parameters(
+            "/obj/geo1/box1", {"sizex": 2.0, "nosuchparm": 1.0}, return_values="none"
+        )
+        assert result["set_count"] == 1
+        assert [error["parm_name"] for error in result["errors"]] == ["nosuchparm"]
 
     def test_an_empty_batch_is_refused(self, hou_stub, monkeypatch):
         _node(monkeypatch, _box_node())

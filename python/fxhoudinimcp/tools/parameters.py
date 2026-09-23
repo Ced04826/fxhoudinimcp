@@ -67,7 +67,7 @@ async def set_parameter(
             and never followed to the parameter it points at.
         return_values: "summary" (default) compacts values over ~200
             characters to length/hash/samples, "full" returns them whole,
-            "none" returns names only.
+            "none" skips the read-back and returns `set_count` plus errors.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
@@ -105,7 +105,10 @@ async def set_parameters(
         expression_policy: "preserve" (default) refuses to overwrite an
             existing expression or keyframes and says which; "replace"
             clears them on the addressed component first.
-        return_values: "summary" (default), "full", or "none".
+        return_values: "summary" (default), "full", or "none". "none" is
+            for large batches: no read-back, a `set_count`, the errors, and
+            only those entries that report a cleared expression or a
+            partial write.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(

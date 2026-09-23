@@ -189,6 +189,7 @@
     "vex.validate_vex",
     "viewport.capture_network_editor",
     "viewport.capture_screenshot",
+    "viewport.capture_viewport",
     "viewport.find_error_nodes",
     "viewport.frame_all",
     "viewport.frame_selection",

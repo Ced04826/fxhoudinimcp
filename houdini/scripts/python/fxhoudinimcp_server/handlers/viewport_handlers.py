@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import time
 
 # Third-party
 import hou
@@ -663,46 +664,215 @@ def capture_screenshot(
 def capture_network_editor(
     output_path: str,
     node_path: str = None,
+    network_path: str = None,
+    bounds: list = None,
+    margin: float = 0.05,
 ) -> dict:
-    """Capture a screenshot of the network editor.
+    """Capture the network editor, framed on a whole network, a node, or bounds.
+
+    The pane is put back where it was (network and visible area) and the
+    selection and current node are never touched: framing a node used to
+    select it, which changed what the user had picked.
 
     Args:
         output_path: Destination image path.
-        node_path: Optional node path to navigate to before capture.
+        node_path: Frame this node and its direct inputs and outputs.
+        network_path: Frame this whole network (every node, box, sticky
+            note and dot). Default: the pane's current network, whole.
+        bounds: [x0, y0, x1, y1] in network units, inside network_path (or
+            the pane's current network).
+        margin: Border around the framed items, as a fraction of their size.
     """
+    require_ui(
+        "capture the network editor",
+        alternative="Wiring can be read without a UI through list_children or get_node_info.",
+    )
+    if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not 0 <= margin <= 1:
+        raise ValueError(f"margin must be within 0..1, not {margin!r}")
+    if node_path is not None and bounds is not None:
+        raise ValueError("give node_path or bounds, not both")
+
+    editors = [p for p in hou.ui.paneTabs() if p.type() == hou.paneTabType.NetworkEditor]
+    if not editors:
+        raise RuntimeError("No Network Editor pane on the current desktop.")
+    # The largest one: a small editor draws a few nodes at an unreadable size,
+    # and too small a pane has produced solid black images reported as success.
+    pane = max(editors, key=lambda p: p.qtScreenGeometry().width() * p.qtScreenGeometry().height())
+    geometry = pane.qtScreenGeometry()
+    if geometry.width() < 300 or geometry.height() < 200:
+        raise RuntimeError(
+            f"The largest Network Editor pane ('{pane.name()}') is "
+            f"{geometry.width()}x{geometry.height()} pixels, too small to capture "
+            f"legibly. Enlarge it or switch to a desktop with a larger one."
+        )
+
+    focus = None
+    if node_path is not None:
+        focus = hou.node(node_path)
+        if focus is None:
+            raise ValueError(f"Node not found: {node_path}")
+        network = focus.parent()
+    elif network_path is not None:
+        network = hou.node(network_path)
+        if network is None:
+            raise ValueError(f"Network not found: {network_path}")
+    else:
+        network = pane.pwd()
+
+    if bounds is not None:
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+            raise ValueError(f"bounds must be [x0, y0, x1, y1], not {bounds!r}")
+        x0, y0, x1, y1 = (float(v) for v in bounds)
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError(f"bounds are empty: {bounds!r}")
+        framed, item_count = "bounds", None
+    else:
+        if focus is not None:
+            items = [focus, *focus.inputs(), *focus.outputs()]
+            items = [
+                item
+                for item in items
+                if item is not None and item.parent().path() == network.path()
+            ]
+            framed = "node"
+        else:
+            items = _network_items(network)
+            framed = "network"
+        if not items:
+            raise ValueError(f"{network.path()} has nothing to frame")
+        x0, y0, x1, y1 = _items_rect(items)
+        item_count = len(items)
+    pad_x = max((x1 - x0) * margin, 0.5)
+    pad_y = max((y1 - y0) * margin, 0.5)
+    x0, x1, y0, y1 = x0 - pad_x, x1 + pad_x, y0 - pad_y, y1 + pad_y
+    # Grow the short side to the pane's aspect, so the pane shows exactly this.
+    aspect = float(geometry.width()) / geometry.height()
+    if (x1 - x0) / (y1 - y0) < aspect:
+        cx, half = (x0 + x1) / 2.0, (y1 - y0) * aspect / 2.0
+        x0, x1 = cx - half, cx + half
+    else:
+        cy, half = (y0 + y1) / 2.0, (x1 - x0) / aspect / 2.0
+        y0, y1 = cy - half, cy + half
+
     out_dir = os.path.dirname(output_path)
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
-    network_editor = None
-    for pane_tab in hou.ui.paneTabs():
-        if pane_tab.type() == hou.paneTabType.NetworkEditor:
-            network_editor = pane_tab
-            break
+    old_network = pane.pwd()
+    old_bounds = pane.visibleBounds()
+    try:
+        if pane.pwd().path() != network.path():
+            pane.cd(network.path())
+        pane.setVisibleBounds(hou.BoundingRect(x0, y0, x1, y1), 0.0)
+        _let_qt_repaint()
+        visible = pane.visibleBounds()
+        _capture_pane_tab_qt(pane, output_path)
+    finally:
+        with contextlib.suppress(Exception):
+            if pane.pwd().path() != old_network.path():
+                pane.cd(old_network.path())
+            pane.setVisibleBounds(old_bounds, 0.0)
 
-    if network_editor is None:
-        raise RuntimeError("No Network Editor pane found.")
-
-    # Navigate to the specified node if provided
-    if node_path is not None:
-        node = hou.node(node_path)
-        if node is None:
-            raise ValueError(f"Node not found: {node_path}")
-        parent = node.parent()
-        if parent is not None:
-            network_editor.cd(parent.path())
-        network_editor.setCurrentNode(node)
-        network_editor.homeToSelection()
-
-    # Capture the network editor via Qt widget grab
-    _capture_pane_tab_qt(network_editor, output_path)
-
-    return {
+    restored = pane.pwd().path() == old_network.path()
+    result = {
         "success": True,
         "output_path": output_path,
-        "node_path": node_path,
         "file_exists": os.path.isfile(output_path),
+        "pane_name": pane.name(),
+        "network": network.path(),
+        "framed": framed,
+        "node_path": node_path,
+        "visible_bounds": [round(v, 3) for v in (*visible.min(), *visible.max())],
+        "pane_restored": restored,
     }
+    if item_count is not None:
+        result["items_framed"] = item_count
+    if result["file_exists"]:
+        result["bytes"] = os.path.getsize(output_path)
+        facts = _image_spread(output_path)
+        result.update(facts)
+        if facts.get("uniform"):
+            # A solid image is what a pane that did not draw produces, and it
+            # used to come back as success.
+            result["success"] = False
+            result["error"] = (
+                "The captured image is a single colour: the pane did not draw. "
+                "Make sure the Network Editor is visible and not collapsed."
+            )
+    else:
+        result["success"] = False
+        result["error"] = "No image was written."
+    if not restored:
+        result["success"] = False
+        result["error"] = f"The pane was left in {pane.pwd().path()}, not {old_network.path()}."
+    return result
+
+
+def _network_items(network) -> list:
+    """Everything in *network* that has a place: nodes, boxes, notes, dots."""
+    items: list = list(network.children())
+    for reader in ("networkBoxes", "stickyNotes", "networkDots", "indirectInputs"):
+        with contextlib.suppress(Exception):
+            items.extend(getattr(network, reader)())
+    return items
+
+
+def _items_rect(items) -> tuple:
+    """Bounding rectangle, in network units, of items with a position.
+
+    A node's size() is its tile; its name is drawn to the right of it, and a
+    frame on the tiles alone cut the last label in half.
+    """
+    x0 = y0 = float("inf")
+    x1 = y1 = float("-inf")
+    for item in items:
+        with contextlib.suppress(Exception):
+            position = item.position()
+            size = None
+            with contextlib.suppress(Exception):
+                size = item.size()
+            w, h = (size[0], size[1]) if size is not None else (0.2, 0.2)
+            label = 0.0
+            if isinstance(item, (hou.Node, hou.SubnetIndirectInput)):
+                text = item.name() if isinstance(item, hou.Node) else "Sub-Network Input #00"
+                label = 0.3 + 0.14 * len(text)
+            x0, y0 = min(x0, position[0]), min(y0, position[1])
+            x1, y1 = max(x1, position[0] + w + label), max(y1, position[1] + h)
+    if x0 == float("inf"):
+        raise ValueError("none of the items reports a position")
+    return x0, y0, x1, y1
+
+
+def _let_qt_repaint() -> None:
+    """Let the editor redraw the new area: Qt repaints dirty regions only, and
+    a grab taken straight away shows the previous view in places."""
+    try:
+        from PySide6 import QtWidgets
+    except ImportError:
+        from PySide2 import QtWidgets
+    for _ in range(8):
+        QtWidgets.QApplication.processEvents()
+        time.sleep(0.06)
+
+
+def _image_spread(path: str) -> dict:
+    """Pixel size of the image and whether it is a single colour."""
+    try:
+        from PySide6 import QtGui
+    except ImportError:
+        from PySide2 import QtGui
+    image = QtGui.QImage(path)
+    if image.isNull():
+        return {"readable": False}
+    w, h = image.width(), image.height()
+    colours = set()
+    step_x, step_y = max(1, w // 64), max(1, h // 64)
+    for y in range(0, h, step_y):
+        for x in range(0, w, step_x):
+            colours.add(image.pixel(x, y))
+            if len(colours) > 4:
+                return {"pixels": [w, h], "uniform": False}
+    return {"pixels": [w, h], "uniform": len(colours) <= 1}
 
 
 ###### viewport.set_current_network
