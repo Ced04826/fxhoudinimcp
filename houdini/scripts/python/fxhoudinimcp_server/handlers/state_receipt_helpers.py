@@ -369,12 +369,27 @@ def _as_index(value: Any) -> int | None:
     return int(value)
 
 
-def parse_input_entries(entries: Any, max_inputs: int, label: str) -> tuple[list, list]:
-    """Normalise a spec's ``inputs`` into index/source/output triples.
+def parse_input_entries(
+    entries: Any,
+    max_inputs: int,
+    label: str,
+    resolve_name: Any = None,
+) -> tuple[list, list]:
+    """Normalise a spec's ``inputs`` into index/source/output entries.
 
     Returns ``(parsed, errors)``. A ``None`` entry holds a position without
     requesting a connection, which is how a caller wires input 1 and leaves
     input 0 alone in a list that has to be positional.
+
+    A dict may name its connector with ``input_name`` instead of ``index``
+    (the name wins); *resolve_name* turns the name into an index, raising
+    ValueError with the reason, or returning None when there is nothing to
+    look it up in (an error already reported elsewhere). A dict with
+    ``indirect_input`` wires from that connector of the parent subnet rather
+    than from a node, and then carries no ``source``.
+
+    Each parsed entry has index, source, source_output, input_name and
+    indirect.
     """
     errors: list[str] = []
     if entries is None:
@@ -387,9 +402,27 @@ def parse_input_entries(entries: Any, max_inputs: int, label: str) -> tuple[list
     for position, entry in enumerate(entries):
         if entry is None:
             continue
+        input_name = None
+        indirect = None
         if isinstance(entry, dict):
             source = entry.get("source")
-            index = _as_index(entry.get("index", position))
+            input_name = entry.get("input_name") or None
+            if input_name is not None:
+                if resolve_name is None:
+                    errors.append(
+                        f"node {label}: input entry {position} names input "
+                        f"{input_name!r}, but its connectors could not be read"
+                    )
+                    continue
+                try:
+                    index = resolve_name(str(input_name))
+                except ValueError as exc:
+                    errors.append(f"node {label}: {exc}")
+                    continue
+                if index is None:
+                    continue
+            else:
+                index = _as_index(entry.get("index", position))
             output = _as_index(entry.get("source_output", 0))
             if index is None:
                 errors.append(
@@ -406,7 +439,30 @@ def parse_input_entries(entries: Any, max_inputs: int, label: str) -> tuple[list
             if output < 0:
                 errors.append(f"node {label}: input {index} has a negative source_output {output}")
                 continue
-            if source is None:
+            if entry.get("indirect_input") is not None:
+                # The parent subnet's own connector: not a node, so it has no
+                # path a source string could name, and it has one output.
+                indirect = entry["indirect_input"]
+                if source is not None:
+                    errors.append(
+                        f"node {label}: an input takes either 'source' or "
+                        f"'indirect_input', not both (got {source!r} and {indirect!r})"
+                    )
+                    continue
+                if output != 0:
+                    errors.append(
+                        f"node {label}: a subnet input connector has one output; "
+                        f"source_output must be 0, got {output}"
+                    )
+                    continue
+                if isinstance(indirect, float) and indirect.is_integer():
+                    indirect = int(indirect)
+                if isinstance(indirect, bool) or not isinstance(indirect, int):
+                    errors.append(
+                        f"node {label}: indirect_input must be an integer, got {indirect!r}"
+                    )
+                    continue
+            elif source is None:
                 # An explicit null source is a request to leave that index
                 # empty, which "exact" then enforces and "preserve" ignores.
                 continue
@@ -419,7 +475,7 @@ def parse_input_entries(entries: Any, max_inputs: int, label: str) -> tuple[list
             )
             continue
 
-        if not isinstance(source, str) or not source.strip():
+        if indirect is None and (not isinstance(source, str) or not source.strip()):
             errors.append(f"node {label}: input {index} has an empty source")
             continue
         if index < 0:
@@ -437,7 +493,15 @@ def parse_input_entries(entries: Any, max_inputs: int, label: str) -> tuple[list
             )
             continue
         claimed[index] = position
-        parsed.append({"index": index, "source": source, "source_output": output})
+        parsed.append(
+            {
+                "index": index,
+                "source": source,
+                "source_output": output,
+                "input_name": input_name,
+                "indirect": indirect,
+            }
+        )
 
     parsed.sort(key=lambda entry: entry["index"])
     return parsed, errors

@@ -1,6 +1,6 @@
 """MCP tools for Houdini parameter operations.
 
-Exposes 10 tools covering parameter get/set, expressions, channel
+Exposes 14 tools covering parameter get/set, expressions, channel
 references, locking, schema inspection, and spare parameter creation.
 """
 
@@ -149,6 +149,82 @@ async def get_parameter_schema(
     return await bridge.execute("parameters.get_parameter_schema", payload)
 
 
+###### parameters.get_parm_references
+
+
+@mcp.tool()
+async def get_parm_references(
+    ctx: Context,
+    node_path: str,
+    parm_name: str | None = None,
+    direction: str = "both",
+    limit: int = 200,
+) -> dict:
+    """Who references a parameter, and what it references — in one call.
+
+    `incoming`: for each parameter of the node (or just parm_name), the
+    parameters elsewhere whose expressions read it — what breaks if this
+    control is renamed. `outgoing`: what this node's expressions and
+    backtick strings read, resolved to parameter paths (pure ch() links and
+    richer expressions alike; `unresolved` names a written target that no
+    longer exists). `node_dependents` / `node_references` give the
+    node-level view for this node only.
+
+    Args:
+        node_path: Node to inspect.
+        parm_name: One parameter instead of all of them.
+        direction: "both", "incoming" or "outgoing".
+        limit: Cap on reported entries.
+    """
+    bridge = _get_bridge(ctx)
+    payload: dict[str, Any] = {"node_path": node_path, "direction": direction, "limit": limit}
+    if parm_name is not None:
+        payload["parm_name"] = parm_name
+    return await bridge.execute("parameters.get_parm_references", payload)
+
+
+###### parameters.get_parm_template_tree
+
+
+@mcp.tool()
+async def get_parm_template_tree(
+    ctx: Context,
+    node_path: str | None = None,
+    type_name: str | None = None,
+    context: str = "Sop",
+    folder: str | list[str] | None = None,
+    max_entries: int = 400,
+) -> dict:
+    """The whole parameter interface as a tree, the way Type Properties shows
+    it: folders (with folder_type — tabs, collapsible, multiparm), every
+    parameter in order with defaults, default expressions, ranges, menu
+    items, Hide/Disable When conditionals, callbacks, naming scheme; a
+    multiparm's `default_instances`. Each entry uses get_parameter_schema's
+    keys (`default_value`, `is_hidden`, `menu_items`...).
+
+    get_hda_info shows only the top folders and get_parameter_schema
+    flattens the structure away; read this before editing an interface.
+    Give node_path for a node (its instance interface, spares included) or
+    type_name + context for a type.
+
+    Args:
+        node_path: Node whose interface to read.
+        type_name: Node type instead (with context).
+        context: Category of type_name — "Sop", "Object", "Lop", ...
+        folder: Narrow to one folder by label, or a list of nested labels.
+        max_entries: Cap on entries (depth-first); the reply says when it cut.
+    """
+    bridge = _get_bridge(ctx)
+    payload: dict[str, Any] = {"context": context, "max_entries": max_entries}
+    if node_path is not None:
+        payload["node_path"] = node_path
+    if type_name is not None:
+        payload["type_name"] = type_name
+    if folder is not None:
+        payload["folder"] = folder
+    return await bridge.execute("parameters.get_parm_template_tree", payload)
+
+
 ###### parameters.set_expression
 
 
@@ -226,14 +302,26 @@ async def link_parameters(
     source_parm: str,
     dest_path: str,
     dest_parm: str,
+    replace_existing: bool = False,
 ) -> dict:
     """Create a channel reference from one parameter to another.
+
+    The destination gets an HScript expression that reads the source as its
+    own type: chs() for a String parameter, ch() for numbers, toggles and
+    menus. The path is relative to the destination node (chs("../CTRL/mat")),
+    so the link survives moving the pair, collapsing into a subnet or
+    instancing an HDA. The reply carries the expression, the function used
+    and the destination's evaluated value.
 
     Args:
         source_path: Source node path.
         source_parm: Source parameter name.
         dest_path: Destination node path.
         dest_parm: Destination parameter name.
+        replace_existing: Overwrite a destination that already has keyframes
+            or an expression. Refused otherwise, so animation is never lost
+            by accident. A link whose source already reads the destination
+            through ch() is refused as a cycle in every case.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
@@ -243,6 +331,7 @@ async def link_parameters(
             "source_parm": source_parm,
             "dest_path": dest_path,
             "dest_parm": dest_parm,
+            "replace_existing": replace_existing,
         },
     )
 
@@ -316,6 +405,10 @@ async def create_spare_parameters(
     folder_type: str = "Tabs",
 ) -> dict:
     """Batch-create multiple spare parameters in one call, optionally in a folder tab.
+
+    A name that already exists as a spare parameter is updated in place
+    (label, default, range); its current value and keyframes are kept.
+    A type change on an existing parameter is refused.
 
     Args:
         node_path: Node path.

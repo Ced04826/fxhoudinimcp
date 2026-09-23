@@ -45,7 +45,7 @@ def _scratch(category: str, parm_names: list[str]):
 class TestSignatureMenuIsLeftToHoudini:
     def test_vop_signature_menu_is_not_validated(self, monkeypatch):
         monkeypatch.setattr(graph, "_instance_patterns", lambda node_type: [])
-        _, _, menus, _ = graph._parm_names_for_type(
+        _, _, menus, _, _ = graph._parm_names_for_type(
             _scratch("Vop", ["signature", "operation"]), MagicMock()
         )
         assert "signature" not in menus
@@ -53,5 +53,5 @@ class TestSignatureMenuIsLeftToHoudini:
 
     def test_a_sop_parameter_called_signature_is_still_checked(self, monkeypatch):
         monkeypatch.setattr(graph, "_instance_patterns", lambda node_type: [])
-        _, _, menus, _ = graph._parm_names_for_type(_scratch("Sop", ["signature"]), MagicMock())
+        _, _, menus, _, _ = graph._parm_names_for_type(_scratch("Sop", ["signature"]), MagicMock())
         assert menus["signature"] == ["default"]

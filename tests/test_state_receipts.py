@@ -581,32 +581,39 @@ class TestJsonSafe:
 ###### build_network input specs
 
 
+def _wire(index, source, output=0, input_name=None, indirect=None):
+    return {
+        "index": index,
+        "source": source,
+        "source_output": output,
+        "input_name": input_name,
+        "indirect": indirect,
+    }
+
+
 class TestInputSpecs:
     def test_positional_strings_wire_in_order(self):
         parsed, errors = parse_input_entries(["a", "b"], 4, "copy")
         assert errors == []
-        assert parsed == [
-            {"index": 0, "source": "a", "source_output": 0},
-            {"index": 1, "source": "b", "source_output": 0},
-        ]
+        assert parsed == [_wire(0, "a"), _wire(1, "b")]
 
     def test_null_holds_a_position_without_connecting(self):
         parsed, errors = parse_input_entries([None, "b"], 4, "merge")
         assert errors == []
-        assert parsed == [{"index": 1, "source": "b", "source_output": 0}]
+        assert parsed == [_wire(1, "b")]
 
     def test_dicts_may_be_sparse_and_pick_an_output(self):
         parsed, errors = parse_input_entries(
             [{"index": 3, "source": "a", "source_output": 2}], 4, "n"
         )
         assert errors == []
-        assert parsed == [{"index": 3, "source": "a", "source_output": 2}]
+        assert parsed == [_wire(3, "a", 2)]
 
     def test_two_entries_on_one_index_is_an_error(self):
         parsed, errors = parse_input_entries(
             [{"index": 0, "source": "a"}, {"index": 0, "source": "b"}], 4, "n"
         )
-        assert parsed == [{"index": 0, "source": "a", "source_output": 0}]
+        assert parsed == [_wire(0, "a")]
         assert "specified twice" in errors[0]
 
     def test_index_past_the_type_is_an_error(self):
@@ -637,6 +644,25 @@ class TestInputSpecs:
 
     def test_omitted_inputs_parse_to_nothing(self):
         assert parse_input_entries(None, 4, "n") == ([], [])
+
+    def test_a_connector_name_resolves_to_its_index(self):
+        parsed, errors = parse_input_entries(
+            [{"input_name": "texcoord", "source": "uv"}],
+            8,
+            "img",
+            resolve_name=lambda name: 3,
+        )
+        assert errors == []
+        assert parsed == [_wire(3, "uv", input_name="texcoord")]
+
+    def test_a_connector_name_with_nothing_to_resolve_it_is_named(self):
+        _, errors = parse_input_entries([{"input_name": "texcoord", "source": "uv"}], 8, "img")
+        assert "could not be read" in errors[0]
+
+    def test_a_subnet_connector_carries_no_source(self):
+        parsed, errors = parse_input_entries([{"indirect_input": 1, "index": 2}], 4, "n")
+        assert errors == []
+        assert parsed == [_wire(2, None, indirect=1)]
 
 
 class TestParmValueChecks:

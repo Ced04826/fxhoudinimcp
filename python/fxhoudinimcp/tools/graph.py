@@ -49,9 +49,12 @@ async def build_network(
     Each node spec dict supports:
         type (required), name, parms (lists set whole parm tuples),
         inputs (list of source names — earlier spec names, existing
-        children, or absolute paths; or dicts with index/source/
-        source_output; or null to hold a position unconnected),
-        flags (display/render/bypass/template), color [r,g,b], comment.
+        children, or absolute paths; or dicts with index or input_name /
+        source / source_output, where input_name is a connector name or
+        label as get_node_card lists them; or {"indirect_input": n} to wire
+        from connector n of the parent subnet itself; or null to hold a
+        position unconnected), flags (display/render/bypass/template),
+        color [r,g,b], comment.
 
     Args:
         parent_path: Network to build inside (e.g. "/obj/geo1").
@@ -114,8 +117,13 @@ async def get_node_card(
     include_help: bool = False,
 ) -> dict:
     """Get the authoritative documentation card for a node type, straight
-    from the running Houdini: real connector labels and real parameter
-    names, defaults and menu tokens.
+    from the running Houdini: connectors in order (`inputs` / `outputs`
+    with index, name and label — the index of `texcoord` on mtlximage
+    lives here), and real parameter names, defaults and menu tokens.
+    Connectors are read off a probe node the first time a type is asked
+    for in a session (no undo entry, creation scripts not run);
+    `connectors_probed: false` with `connectors_note` means they could not
+    be read, not that the type has none.
 
     Use this BEFORE setting parameters on a node type you have not used
     in this session — never guess parameter names. Unversioned names
@@ -129,8 +137,9 @@ async def get_node_card(
 
     Args:
         node_type: Type name (e.g. "scatter", "rbdbulletsolver").
-        context: Category — "Sop", "Lop", "Dop", "Cop", "Chop", "Top",
-            "Object", "Driver".
+        context: Category — "Sop", "Lop", "Vop" (MaterialX and other shader
+            nodes inside a material network), "Dop", "Cop", "Chop", "Top",
+            "Object", "Driver"; also "Cop2", "Shop", "VopNet".
         parm_filter: Substring filter for the parameter list.
         include_help: Add the node's shipped help text. Off by default.
     """

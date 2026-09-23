@@ -24,9 +24,15 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.config import layout_if_enabled, place_new_nodes
+from fxhoudinimcp_server.config import layout_if_enabled, place_new_nodes, update_mode_warning
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
+from fxhoudinimcp_server.handlers.node_handlers import (
+    _find_input,
+    _indirect_input_item,
+    _input_table,
+    _resolve_input_index,
+)
 from fxhoudinimcp_server.handlers.state_receipt_helpers import (
     check_parm_value,
     clip,
@@ -61,10 +67,13 @@ def _resolve_node_type(category: hou.NodeTypeCategory, type_name: str):
     types = category.nodeTypes()
     if type_name in types:
         return types[type_name]
+    from fxhoudinimcp_server.handlers.hda_handlers import _version_key
+
     prefix = type_name + "::"
-    versioned = sorted(key for key in types if key.startswith(prefix))
+    versioned = [key for key in types if key.startswith(prefix)]
     if versioned:
-        return types[versioned[-1]]
+        # Numeric order, not string order: ::10.0 is newer than ::2.0.
+        return types[max(versioned, key=lambda key: _version_key(key[len(prefix) :]))]
     return None
 
 
@@ -109,30 +118,163 @@ def _is_dynamic_menu(probe: hou.Node, parm: hou.Parm) -> bool:
         return False
 
 
+def _connectors_of(node: hou.Node) -> dict[str, list[dict[str, Any]]]:
+    """Input and output connectors of a live node, in order, with their names.
+
+    A VOP's inputs are addressed by name (`texcoord`), and their order is not
+    stable across versions; a SOP's are `input1`, `input2` behind labels such
+    as "Spine curve". Both the index and the name are reported so a caller can
+    wire by whichever the verb at hand accepts.
+    """
+    outputs: list[dict[str, Any]] = []
+    names: list[str] = []
+    labels: list[str] = []
+    with contextlib.suppress(Exception):
+        names = list(node.outputNames())
+    with contextlib.suppress(Exception):
+        labels = list(node.outputLabels())
+    for index, name in enumerate(names):
+        entry: dict[str, Any] = {"index": index, "name": name}
+        if index < len(labels):
+            entry["label"] = labels[index]
+        outputs.append(entry)
+    return {"inputs": _input_table(node), "outputs": outputs}
+
+
+def _probe_connectors(scratch: hou.Node, node_type, parms: dict | None = None) -> dict:
+    """Connectors of *node_type* created inside *scratch* with *parms* applied.
+
+    A VOP's `signature`, a multiparm count or a variadic HDA decides what a
+    node exposes, so build_network probes a spec that names an input AND sets
+    parms the way the build will configure it: a dry run that passes then
+    wires the same connectors the build resolves.
+    """
+    with hou.undos.disabler():
+        probe = scratch.createNode(node_type.name())
+        try:
+            for name, value in (parms or {}).items():
+                with contextlib.suppress(Exception):
+                    _apply_parm(probe, name, value)
+            return _connectors_of(probe)
+        finally:
+            with contextlib.suppress(Exception):
+                probe.destroy()
+
+
+# OBJ-level container to probe each category's types in, where more than one
+# exists (geo and sopnet both hold SOPs). Any other category is found through
+# hou.NodeType.childTypeCategory(), so Cop2, Shop, VopNet and whatever SideFX
+# adds next are covered without an entry here.
+_PREFERRED_CONTAINERS = {
+    "Sop": "geo",
+    "Object": "subnet",
+    "Vop": "matnet",
+    "Lop": "lopnet",
+    "Dop": "dopnet",
+    "Cop": "copnet",
+    "Chop": "chopnet",
+    "Top": "topnet",
+    "Driver": "ropnet",
+}
+
+
+def _container_for(category_name: str) -> str | None:
+    """An OBJ-level type whose children are of *category_name*."""
+    object_types = hou.objNodeTypeCategory().nodeTypes()
+    preferred = _PREFERRED_CONTAINERS.get(category_name)
+    if preferred in object_types:
+        return preferred
+    fallback = None
+    for type_name in sorted(object_types):
+        with contextlib.suppress(Exception):
+            node_type = object_types[type_name]
+            child = node_type.childTypeCategory()
+            if child is None or child.name() != category_name:
+                continue
+            if not node_type.hidden():
+                return type_name
+            fallback = fallback or type_name
+    return fallback
+
+
+# Connectors per type for the session: probing creates a node, and a card is
+# read again and again. Keyed on the HDA definition's modification time too,
+# so a reinstalled asset is probed afresh.
+_CONNECTOR_CACHE: dict[tuple, dict] = {}
+
+
+def _definition_stamp(node_type) -> Any:
+    with contextlib.suppress(Exception):
+        definition = node_type.definition()
+        if definition is not None:
+            return (definition.libraryFilePath(), definition.modificationTime())
+    return None
+
+
+def _connectors_for_type(category_name: str, node_type) -> tuple[dict | None, str | None]:
+    """Connector names/labels of *node_type*, probed on a throwaway instance.
+
+    Returns (connectors, None), or (None, why) when there was nothing to probe
+    in or the probe failed: a card is never refused over its connectors, and
+    never reports "no inputs" when it did not look. The probe runs with undo
+    disabled and without the type's creation scripts (a documentation read
+    must not run an asset's OnCreated); it still marks the scene modified,
+    as build_network's dry run does, once per type per session.
+    """
+    key = (category_name, node_type.name(), _definition_stamp(node_type))
+    if key in _CONNECTOR_CACHE:
+        return _CONNECTOR_CACHE[key], None
+    container = _container_for(category_name)
+    if container is None:
+        return None, f"no network under /obj holds {category_name} nodes to probe in"
+    root = hou.node("/obj")
+    if root is None:
+        return None, "/obj does not exist"
+    scratch = None
+    try:
+        with hou.undos.disabler():
+            scratch = root.createNode(container, "fxhoudinimcp_card_probe")
+            probe = scratch.createNode(node_type.name(), run_init_scripts=False)
+            connectors = _connectors_of(probe)
+    except Exception as exc:
+        return None, f"probing {node_type.name()} failed: {readable_message(exc)}"
+    finally:
+        with contextlib.suppress(Exception):
+            if scratch is not None:
+                with hou.undos.disabler():
+                    scratch.destroy()
+    _CONNECTOR_CACHE[key] = connectors
+    return connectors, None
+
+
 class _TypeKnowledge(tuple):
     """What one probe of a node type teaches the validation pass.
 
-    A tuple, so `parm_names, tuple_names, menus, instance_patterns = ...` reads
-    as it always did. The per-parameter shapes ride along as an attribute
-    rather than a fifth element because they come off the same probe, and
-    instantiating a second node to learn them would double what validating a
-    type costs the user's scene.
+    A tuple, so `parm_names, tuple_names, menus, instance_patterns, connectors
+    = ...` unpacks it. The per-parameter shapes ride along as an attribute
+    because they come off the same probe, and instantiating a second node to
+    learn them would double what validating a type costs the user's scene.
     """
 
-    def __new__(cls, parm_names, tuple_names, menus, instance_patterns, shapes):
-        self = super().__new__(cls, (parm_names, tuple_names, menus, instance_patterns))
+    def __new__(cls, parm_names, tuple_names, menus, instance_patterns, connectors, shapes):
+        self = super().__new__(
+            cls, (parm_names, tuple_names, menus, instance_patterns, connectors)
+        )
         self.shapes = shapes
         return self
 
 
 def _parm_names_for_type(scratch: hou.Node, node_type) -> _TypeKnowledge:
     """Instantiate a type once to learn its parm names, tuple names, menus,
-    multiparm instance patterns and per-parameter shapes.
+    multiparm instance patterns, connectors and per-parameter shapes.
 
     The third element maps a strict-menu parm name to its token list. Only
     menus that reject arbitrary text are recorded (int menus and "normal"
     string menus); a free-text field with a suggestion menu is not a menu.
-    The fourth is what `_instance_patterns` returns.
+    The fourth is what `_instance_patterns` returns, the fifth the probe's
+    connectors (the same probe answers both questions, and probing is not
+    free). Creation scripts run here on purpose: the build that follows runs
+    them, so the names validated are the names the built node has.
 
     Shapes (`.shapes`) are learned here because names alone caught a
     misspelling and nothing else, so a spec that named a real three-float
@@ -142,6 +284,7 @@ def _parm_names_for_type(scratch: hou.Node, node_type) -> _TypeKnowledge:
     """
     probe = scratch.createNode(node_type.name())
     try:
+        connectors = _connectors_of(probe)
         parm_names = {p.name() for p in probe.parms()}
         tuple_names = {pt.name() for pt in probe.parmTuples()}
         menus: dict[str, list[str]] = {}
@@ -183,7 +326,7 @@ def _parm_names_for_type(scratch: hou.Node, node_type) -> _TypeKnowledge:
     patterns: list[re.Pattern] = []
     with contextlib.suppress(Exception):
         patterns = _instance_patterns(node_type)
-    return _TypeKnowledge(parm_names, tuple_names, menus, patterns, shapes)
+    return _TypeKnowledge(parm_names, tuple_names, menus, patterns, connectors, shapes)
 
 
 # Learning a type's parameters means instantiating it, and instantiating it in
@@ -255,12 +398,36 @@ def _apply_parm(node: hou.Node, name: str, value: Any) -> None:
         raise ValueError(f"parameter '{name}' not found")
 
 
+def _indirect_key(number: int) -> str:
+    """How a wire from the parent subnet's input connector *number* is named.
+
+    The connector is not a node and has no path, so the read-back and the
+    request both call it this, and the two can be compared like node paths.
+    """
+    return f"<indirect_input {number}>"
+
+
+def _indirect_label(connector: Any) -> str:
+    """The indirect-input key of a live SubnetIndirectInput.
+
+    HOM wrappers have no stable identity, so the connector is found in its
+    subnet's list by path.
+    """
+    with contextlib.suppress(Exception):
+        target = connector.path()
+        for number, candidate in enumerate(connector.parent().indirectInputs()):
+            if candidate.path() == target:
+                return _indirect_key(number)
+    return "<indirect_input ?>"
+
+
 def _actual_inputs(node: hou.Node) -> list[dict[str, Any]]:
     """The connections the node really has, read back off the node.
 
     Not the ones the spec asked for: the two differ whenever a creation
     callback has an opinion, and the whole reason a caller asks for this is to
-    find out that they differ.
+    find out that they differ. A wire from the parent subnet's own input
+    connector is reported under its indirect-input key, not dropped.
     """
     rows: list[dict[str, Any]] = []
     try:
@@ -269,14 +436,16 @@ def _actual_inputs(node: hou.Node) -> list[dict[str, Any]]:
         return rows
     for connection in connections:
         with contextlib.suppress(Exception):
-            source = connection.inputNode()
-            rows.append(
-                {
-                    "index": connection.inputIndex(),
-                    "source": source.path() if source is not None else None,
-                    "source_output": connection.outputIndex(),
-                }
-            )
+            connector = None
+            with contextlib.suppress(Exception):
+                connector = connection.subnetIndirectInput()
+            if connector is not None:
+                source, output = _indirect_label(connector), 0
+            else:
+                node = connection.inputNode()
+                source = node.path() if node is not None else None
+                output = connection.outputIndex()
+            rows.append({"index": connection.inputIndex(), "source": source, "source_output": output})
     return rows
 
 
@@ -351,13 +520,17 @@ def _geometry_summary(node: hou.Node) -> dict[str, Any] | None:
     if geo is None:
         return None
     bbox = geo.boundingBox()
-    return {
+    summary = {
         "points": geo.intrinsicValue("pointcount"),
         "prims": geo.intrinsicValue("primitivecount"),
         "bbox_min": list(bbox.minvec()),
         "bbox_max": list(bbox.maxvec()),
         "point_attribs": [a.name() for a in geo.pointAttribs()][:30],
     }
+    warning = update_mode_warning()
+    if warning:
+        summary["warning"] = warning
+    return summary
 
 
 ###### graph.build_network -- the "exact" input policy
@@ -371,12 +544,74 @@ def _geometry_summary(node: hou.Node) -> dict[str, Any] | None:
 # raise.
 
 
+def _names_an_input(spec: dict) -> bool:
+    """Whether a spec wires any input by connector name."""
+    entries = spec.get("inputs")
+    return isinstance(entries, (list, tuple)) and any(
+        isinstance(entry, dict) and entry.get("input_name") for entry in entries
+    )
+
+
+def _named_sources(entries: Any) -> list[str]:
+    """The node sources a spec's inputs name, whether or not the entry parsed.
+
+    A subnet-connector entry names none, even when it also (wrongly) carries a
+    source: that entry is refused for the combination, not for the source.
+    """
+    if not isinstance(entries, (list, tuple)):
+        return []
+    sources: list[str] = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            if entry.get("indirect_input") is not None:
+                continue
+            entry = entry.get("source")
+        if isinstance(entry, str) and entry.strip():
+            sources.append(entry)
+    return sources
+
+
+def _input_name_resolver(connectors: dict | None, max_inputs: int, type_name: Any):
+    """The input_name -> index rule for one spec, as parse_input_entries takes it.
+
+    None from the resolver when there are no connectors to look in: the type
+    did not resolve, and that error is already reported.
+    """
+
+    def resolve(input_name: str) -> int | None:
+        if connectors is None:
+            return None
+        try:
+            return _find_input(connectors["inputs"], input_name, max_inputs)
+        except ValueError as exc:
+            raise ValueError(f"{type_name} {exc}") from None
+
+    return resolve
+
+
 def _requested_map(parsed: list) -> dict[int, tuple]:
-    """{index: (source path, source output)} for one spec, as wired."""
+    """{index: (source path, source output)} for one spec, as wired.
+
+    A wire from the parent subnet's connector is keyed like the read-back
+    reports it (see _indirect_key).
+    """
     return {
         entry["index"]: (entry.get("source_path") or entry["source"], entry["source_output"])
         for entry in parsed
     }
+
+
+def _requested_source(node: hou.Node, parsed: list, index: int) -> Any:
+    """The live item input *index* of *node* should be wired from."""
+    for entry in parsed:
+        if entry["index"] != index:
+            continue
+        if entry["indirect"] is not None:
+            with contextlib.suppress(Exception):
+                return list(node.parent().indirectInputs())[entry["indirect"]]
+            return None
+        return hou.node(str(entry.get("source_path") or entry["source"]))
+    return None
 
 
 def _enforce_exact_inputs(nodes: list, built: list, parsed_inputs: list) -> list:
@@ -412,7 +647,7 @@ def _enforce_exact_inputs(nodes: list, built: list, parsed_inputs: list) -> list
                 continue
             # A creation or parameter callback moved a connection this build
             # already made. One corrective pass, then the read-back decides.
-            source = hou.node(str(source_path))
+            source = _requested_source(node, parsed, index)
             if source is None:
                 raise RuntimeError(
                     f"{node.path()}: input {index} should come from "
@@ -507,9 +742,13 @@ def build_network(
             parms (dict): parameter values; lists set whole parm tuples.
             inputs (list): wiring. Entries are either a source string
                 (wired positionally), null (holds the position without
-                connecting anything), or {"index", "source",
-                "source_output"}. Sources resolve to spec node names
-                first, then children of parent, then absolute paths.
+                connecting anything), or {"index" | "input_name", "source",
+                "source_output"}; "input_name" is a connector name or
+                label, as get_node_card lists them, and wins over "index".
+                Sources resolve to spec node names first, then children of
+                parent, then absolute paths. {"indirect_input": n} instead
+                of "source" wires from connector n of the parent subnet
+                itself.
             flags (dict): display/render/bypass/template booleans.
             color (list[3]) and comment (str): network annotations.
         dry_run: Validate only; never mutates the scene.
@@ -620,7 +859,18 @@ def build_network(
         cached = _TYPE_KNOWLEDGE.get(_type_cache_key(category, node_type))
         if cached is not None:
             parm_knowledge[type_name] = cached
-    if unknown_types:
+    # Connectors of a spec that names an input and sets parms, probed with
+    # those parms applied (see _probe_connectors). Not cached: the parms
+    # decide the answer.
+    spec_connectors: dict[int, dict] = {}
+    connector_probes = [
+        index
+        for index, spec in enumerate(nodes)
+        if resolved_types.get(spec.get("type")) is not None
+        and spec.get("parms")
+        and _names_an_input(spec)
+    ]
+    if unknown_types or connector_probes:
         # A probe that stole the display flag or the selection leaves the user
         # looking at something else, and a dry run must leave no trace at all.
         before_probing = _network_flags(parent)
@@ -629,17 +879,37 @@ def build_network(
                 knowledge = _type_knowledge(parent, node_type)
                 _TYPE_KNOWLEDGE[_type_cache_key(category, node_type)] = knowledge
                 parm_knowledge[type_name] = knowledge
+            for index in connector_probes:
+                spec = nodes[index]
+                spec_connectors[index] = _probe_connectors(
+                    parent, resolved_types[spec["type"]], spec["parms"]
+                )
         finally:
             _restore_network_flags(before_probing)
 
     # Parsed inputs are kept so the build wires exactly what validation
     # approved, rather than re-deriving it from the spec a second way.
     parsed_inputs: list[list[dict[str, Any]]] = []
+
+    # The parent's input connectors, listed once per build rather than once
+    # per entry that uses one.
+    # None when the listing itself failed: _indirect_input_item then lists
+    # again and reports the real HOM message instead of "not a subnet".
+    listed: list = []
+
+    def parent_connectors() -> list | None:
+        if not listed:
+            connectors: list | None = None
+            with contextlib.suppress(Exception):
+                connectors = list(parent.indirectInputs())
+            listed.append(connectors)
+        return listed[0]
+
     for index, spec in enumerate(nodes):
         label = spec.get("name") or spec.get("type") or f"#{index}"
         knowledge = parm_knowledge.get(spec.get("type"))
         if knowledge:
-            parm_names, tuple_names, menus, instance_patterns = knowledge
+            parm_names, tuple_names, menus, instance_patterns, _ = knowledge
             for parm_name, parm_value in (spec.get("parms") or {}).items():
                 if parm_name in menus:
                     problem = _menu_error(parm_name, parm_value, menus[parm_name])
@@ -669,14 +939,33 @@ def build_network(
                 )
         node_type = resolved_types.get(spec.get("type"))
         max_inputs = node_type.maxNumInputs() if node_type else 0
-        parsed, input_errors = parse_input_entries(spec.get("inputs"), max_inputs, label)
+        # None when the type did not resolve: that error is already reported,
+        # and a connector error on top of it would only be noise.
+        connectors = spec_connectors.get(index)
+        if connectors is None and knowledge:
+            connectors = knowledge[4]
+        parsed, input_errors = parse_input_entries(
+            spec.get("inputs"),
+            max_inputs,
+            label,
+            resolve_name=_input_name_resolver(connectors, max_inputs, spec.get("type")),
+        )
         errors += input_errors
         parsed_inputs.append(parsed)
         for entry in parsed:
-            source = entry["source"]
+            if entry["indirect"] is not None:
+                # The parent subnet's own connector: not a node, so it has no
+                # path a source string could name.
+                try:
+                    _indirect_input_item(parent, entry["indirect"], parent_connectors())
+                except ValueError as exc:
+                    errors.append(f"node {label}: {exc}")
+        # Every named source, including those of entries refused above for
+        # another reason: one pass reports everything wrong with a spec.
+        for source in _named_sources(spec.get("inputs")):
             if source in spec_names or source in existing:
                 continue
-            if hou.node(str(source)) is None:
+            if hou.node(source) is None:
                 errors.append(
                     f"node {label}: input source '{source}' is not a spec "
                     f"node, a child of {parent_path}, or an absolute path"
@@ -735,6 +1024,18 @@ def build_network(
                     )
                 parm.setExpression(str(expression))
             for entry in parsed:
+                if entry["input_name"]:
+                    # The built node, parms applied, is the last word on which
+                    # index a connector name means; the read-back compares
+                    # against the index actually wired.
+                    entry["index"] = _resolve_input_index(
+                        node, entry["index"], entry["input_name"]
+                    )
+                if entry["indirect"] is not None:
+                    source = parent_connectors()[entry["indirect"]]
+                    node.setInput(entry["index"], source, 0)
+                    entry["source_path"] = _indirect_key(entry["indirect"])
+                    continue
                 source_name = entry["source"]
                 source = (
                     created.get(source_name)
@@ -1191,13 +1492,18 @@ def get_node_card(
     if help_text and len(help_text) > 5000:
         help_text = help_text[:5000] + "\n[... help truncated]"
 
-    return {
+    # Connectors, in order, by index AND name: the index of `texcoord` on
+    # mtlximage is 3, and until now there was nowhere to read that.
+    connectors, not_probed = _connectors_for_type(context, resolved)
+
+    card = {
         "type": resolved.name(),
         "label": resolved.description(),
         "context": context,
         "min_inputs": resolved.minNumInputs(),
         "max_inputs": resolved.maxNumInputs(),
         "max_outputs": resolved.maxNumOutputs(),
+        "connectors_probed": connectors is not None,
         "is_generator": resolved.minNumInputs() == 0,
         "parm_count": len(parms),
         "parms_matched": matched,
@@ -1207,6 +1513,12 @@ def get_node_card(
         "multiparms": multiparms,
         "help": help_text,
     }
+    if connectors is not None:
+        card["inputs"] = connectors["inputs"]
+        card["outputs"] = connectors["outputs"]
+    else:
+        card["connectors_note"] = f"Connectors were not read: {not_probed}."
+    return card
 
 
 ###### graph.find_expensive_nodes

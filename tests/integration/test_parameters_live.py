@@ -193,3 +193,92 @@ class TestMultiparmInstanceDiscovery:
         # The count parm that governs how many instances exist.
         counts = call("parameters.get_parameters", node_path=solver.path(), patterns=["numsources"])
         assert "numsources" in counts["parameters"]
+
+
+class TestDataParameter:
+    def test_a_stash_reports_unset_then_set_through_both_readers(self, call):
+        geo = hou.node("/obj").createNode("geo")
+        box = geo.createNode("box")
+        stash = geo.createNode("stash")
+        stash.setInput(0, box)
+
+        before = call("parameters.get_parameter", node_path=stash.path(), parm_name="stash")
+        assert before["value"] is None
+        assert before["data"]["is_set"] is False
+
+        stash.parm("stashinput").pressButton()
+        after = call("parameters.get_parameter", node_path=stash.path(), parm_name="stash")
+        assert after["data"]["is_set"] is True
+        assert after["value"]["point_count"] == 8
+        assert after["data"]["geometry"]["prim_count"] == 6
+
+        batch = call("parameters.get_parameters", node_path=stash.path(), patterns=["stash"])
+        entry = batch["parameters"]["stash"]
+        assert entry["data"]["is_set"] is True
+
+
+class TestParmReferences:
+    def _scene(self):
+        obj = hou.node("/obj")
+        ctrl = obj.createNode("null", "CTRL")
+        group = ctrl.parmTemplateGroup()
+        group.append(hou.StringParmTemplate("version", "Version", 1, default_value=("v001",)))
+        ctrl.setParmTemplateGroup(group)
+        geo = obj.createNode("geo")
+        cache = geo.createNode("filecache")
+        cache.parm("file").set('$HIP/cache/`chs("/obj/CTRL/version")`/geo.bgeo.sc')
+        xform = geo.createNode("xform")
+        xform.parm("ty").setExpression("$F * 2")
+        return ctrl, cache, xform
+
+    def test_a_backtick_reference_is_seen_from_both_ends(self, call):
+        ctrl, cache, _ = self._scene()
+        incoming = call(
+            "parameters.get_parm_references", node_path=ctrl.path(), parm_name="version"
+        )
+        assert incoming["incoming"] == [
+            {"parm": "version", "referenced_by": [cache.parm("file").path()]}
+        ]
+        outgoing = call(
+            "parameters.get_parm_references",
+            node_path=cache.path(),
+            parm_name="file",
+            direction="outgoing",
+        )
+        assert outgoing["outgoing"][0]["references"] == ["/obj/CTRL/version"]
+        assert outgoing["outgoing"][0]["in_backticks"] is True
+
+    def test_an_expression_that_reads_no_channel_is_not_listed(self, call):
+        _, _, xform = self._scene()
+        data = call("parameters.get_parm_references", node_path=xform.path(), direction="outgoing")
+        assert data["outgoing"] == []
+
+
+class TestParmTemplateTree:
+    def test_scalar_defaults_and_multiparm_instances_are_reported(self, call):
+        node = hou.node("/obj").createNode("null")
+        group = node.parmTemplateGroup()
+        group.append(hou.ToggleParmTemplate("enable", "Enable", default_value=True))
+        group.append(
+            hou.FolderParmTemplate(
+                "items",
+                "Items",
+                parm_templates=[hou.FloatParmTemplate("item#", "Item #", 1)],
+                folder_type=hou.folderType.MultiparmBlock,
+                default_value=3,
+            )
+        )
+        node.setParmTemplateGroup(group)
+        tree = call("parameters.get_parm_template_tree", node_path=node.path(), max_entries=1000)
+
+        def find(entries, name):
+            for entry in entries:
+                if entry["name"] == name:
+                    return entry
+                found = find(entry.get("children", []), name)
+                if found:
+                    return found
+            return None
+
+        assert find(tree["entries"], "enable")["default_value"] is True
+        assert find(tree["entries"], "items")["default_instances"] == 3

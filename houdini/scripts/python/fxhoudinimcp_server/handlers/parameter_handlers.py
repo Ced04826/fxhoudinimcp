@@ -1,12 +1,13 @@
 """Houdini-side handlers for parameter operations.
 
-Provides 10 command handlers for reading, writing, and managing
+Provides 14 command handlers for reading, writing, and managing
 node parameters, expressions, channel references, and spare parameters.
 """
 
 from __future__ import annotations
 
 import contextlib
+import re
 
 # Built-in
 from difflib import get_close_matches
@@ -29,6 +30,7 @@ from fxhoudinimcp_server.handlers.state_receipt_helpers import (
     value_receipt,
     write_refusal,
 )
+from fxhoudinimcp_server.serialize import geometry_summary
 
 ###### Helpers
 
@@ -83,6 +85,53 @@ def _serialize_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_serialize_value(v) for v in value]
     return value
+
+
+def _data_parm_summary(parm: hou.Parm, pt: hou.ParmTemplate) -> dict[str, Any]:
+    """What a Data parameter holds, never the blob itself.
+
+    Counts come from serialize.geometry_summary (intrinsics), not from
+    parm.asData(): that serialises the whole geometry to a string on the main
+    thread, which is ruinous on a heavy stash and measures characters, not
+    bytes.
+    """
+    summary: dict[str, Any] = {"is_set": False}
+    with contextlib.suppress(Exception):
+        summary["data_parm_type"] = pt.dataParmType().name()
+    value = None
+    with contextlib.suppress(Exception):
+        value = parm.eval()
+    if isinstance(value, hou.Geometry):
+        # Set, possibly to an empty geometry: the counts say which.
+        summary["is_set"] = True
+        summary["geometry"] = geometry_summary(value)
+    elif isinstance(value, dict):
+        # A KeyValueDictionary evaluates to {} when empty.
+        summary["is_set"] = bool(value)
+        summary["key_count"] = len(value)
+    elif value is not None:
+        summary["is_set"] = True
+        summary["value_type"] = type(value).__name__
+    return summary
+
+
+def _data_parm_value(parm: hou.Parm, pt: hou.ParmTemplate) -> dict[str, Any] | None:
+    """For a Data parameter, the fields a reader reports; None for any other.
+
+    eval() on a Data parameter is a hou.Geometry or None and rawValue() is
+    empty either way, so `value` alone cannot tell "unset" from "set to an
+    empty geometry". `value` stays the geometry summary it always serialised
+    to; `data` says whether the blob is set and what it holds.
+    """
+    if _parm_type_name(pt) != "Data":
+        return None
+    data = _data_parm_summary(parm, pt)
+    value = data.get("geometry")
+    if "key_count" in data:
+        # A KeyValueDictionary always answered with the dictionary itself.
+        with contextlib.suppress(Exception):
+            value = _serialize_value(parm.eval())
+    return {"value": value, "data": data}
 
 
 def _template_to_dict(pt: hou.ParmTemplate) -> dict[str, Any]:
@@ -143,15 +192,18 @@ def _get_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any]:
     parm = _resolve_parm(node_path, parm_name)
     pt = parm.parmTemplate()
 
+    data_parm = _data_parm_value(parm, pt)
     result: dict[str, Any] = {
         "node_path": node_path,
         "parm_name": parm_name,
-        "value": _serialize_value(parm.eval()),
+        "value": data_parm["value"] if data_parm else _serialize_value(parm.eval()),
         "raw_value": _serialize_value(parm.rawValue()),
         "parm_type": _parm_type_name(pt),
         "is_locked": parm.isLocked(),
         "is_at_default": parm.isAtDefault(),
     }
+    if data_parm:
+        result["data"] = data_parm["data"]
 
     # Expression
     try:
@@ -724,26 +776,109 @@ register_handler("parameters.revert_parameter", _revert_parameter)
 ###### Handler: parameters.link_parameters
 
 
+def _channel_function(parm: hou.Parm) -> str:
+    """The HScript channel function that reads *parm* as its own type.
+
+    ``ch()`` evaluates the referenced channel as a number, so a String parameter
+    linked with it reads back as "0". Strings need ``chs()``; every
+    numeric kind (float, int, toggle, int-valued menu) reads with ``ch()``.
+    """
+    try:
+        kind = parm.parmTemplate().type()
+    except Exception:
+        return "ch"
+    return "chs" if kind == hou.parmTemplateType.String else "ch"
+
+
+def _relative_channel_path(dst: hou.Parm, src: hou.Parm) -> str:
+    """Path to *src* as *dst* would write it: relative, the way Houdini's own
+    Paste Relative References does.
+
+    An absolute path (``ch("/obj/gaps/CONTROL/mat")``) breaks the moment the
+    pair is moved, collapsed into a subnet or saved into an HDA and instanced
+    elsewhere; a relative one survives all three.
+    """
+    rel = dst.node().relativePathTo(src.node())
+    if rel in ("", "."):
+        return src.name()
+    return f"{rel}/{src.name()}"
+
+
+_CH_REF = re.compile(r"""\bch[fis]?\(\s*["']([^"']+)["']\s*\)""")
+
+
+def _reaches(parm: hou.Parm, goal: str, seen: set[str]) -> bool:
+    """True when *parm* reads *goal* through static HScript ch() references.
+
+    Only literal ``ch("path")`` calls are followed; Python or computed
+    references cannot be validated and are treated as leaves.
+    """
+    if parm.path() == goal:
+        return True
+    if parm.path() in seen:
+        return False
+    seen.add(parm.path())
+    for key in parm.keyframes():
+        with contextlib.suppress(hou.OperationFailed):
+            for ref in _CH_REF.findall(key.expression()):
+                dep = parm.node().parm(ref)
+                if dep is not None and _reaches(dep, goal, seen):
+                    return True
+    return False
+
+
 def _link_parameters(
     source_path: str,
     source_parm: str,
     dest_path: str,
     dest_parm: str,
+    replace_existing: bool = False,
     **_: Any,
 ) -> dict[str, Any]:
-    """Create a channel reference from destination parameter to source parameter."""
+    """Create a channel reference from destination parameter to source parameter.
+
+    The expression uses ``chs()`` for a String destination and ``ch()`` for
+    everything else, and a path relative to the destination node. The reply
+    reads the destination back so the caller sees the linked value, not just
+    the expression text.
+
+    A destination that already has keyframes or an expression is refused
+    unless *replace_existing* is set, and a link whose source already reads
+    the destination through static ch() references is refused as a cycle.
+    """
     src = _resolve_parm(source_path, source_parm)
     dst = _resolve_parm(dest_path, dest_parm)
 
-    # Build the channel reference expression
-    ref_expr = f'ch("{src.path()}")'
+    if dst.keyframes() and not replace_existing:
+        raise ValueError(
+            f"{dst.path()} already has animation or an expression; "
+            "pass replace_existing=True to overwrite it."
+        )
+    if _reaches(src, dst.path(), set()):
+        raise ValueError(f"Linking {dst.path()} to {src.path()} would create a channel cycle.")
+
+    function = _channel_function(dst)
+    channel_path = _relative_channel_path(dst, src)
+    ref_expr = f'{function}("{channel_path}")'
     dst.setExpression(ref_expr, hou.exprLanguage.Hscript)
 
-    return {
+    reply: dict[str, Any] = {
         "source": src.path(),
         "destination": dst.path(),
         "expression": ref_expr,
+        "function": function,
+        "relative": not channel_path.startswith("/"),
     }
+    with contextlib.suppress(Exception):
+        reply["value"] = _serialize_value(dst.eval())
+    src_kind = _channel_function(src)
+    if src_kind != function:
+        reply["warning"] = (
+            f"'{dst.name()}' is a {'String' if function == 'chs' else 'numeric'} parameter "
+            f"linked to a {'String' if src_kind == 'chs' else 'numeric'} source; "
+            f"{function}() converts the value on read."
+        )
+    return reply
 
 
 register_handler("parameters.link_parameters", _link_parameters)
@@ -951,17 +1086,49 @@ def _create_spare_parameters(
 ) -> dict[str, Any]:
     """Batch-create spare parameters, optionally inside a folder/tab."""
     node = _resolve_node(node_path)
+    ptg = node.parmTemplateGroup()
 
     templates = []
     created = []
+    updated = []
     for spec in parameters:
         pt = _build_parm_template(spec)
-        templates.append(pt)
-        created.append(spec["parm_name"])
+        existing = ptg.find(spec["parm_name"])
+        if existing is None:
+            # A tuple component such as "tx" is not a template name, so the
+            # group does not know it, but Houdini refuses it at commit time.
+            component = node.parm(spec["parm_name"])
+            if component is not None:
+                raise ValueError(
+                    f"'{spec['parm_name']}' is a component of the existing tuple "
+                    f"'{component.tuple().name()}'; pick another name."
+                )
+            templates.append(pt)
+            created.append(spec["parm_name"])
+            continue
+        # Same name: edit in place. Houdini keeps the current value and
+        # keyframes when the name and type are unchanged, so a type change
+        # is refused rather than silently dropping data.
+        current = node.parm(spec["parm_name"]) or node.parmTuple(spec["parm_name"])
+        if current is not None and not (
+            current.isSpare()
+            if isinstance(current, hou.Parm)
+            else all(p.isSpare() for p in current)
+        ):
+            raise ValueError(
+                f"'{spec['parm_name']}' is a built-in parameter; only spare parameters can be edited."
+            )
+        if existing.type() != pt.type():
+            raise ValueError(
+                f"'{spec['parm_name']}' exists as {existing.type().name()}; "
+                f"cannot change it to {pt.type().name()} without losing its value."
+            )
+        ptg.replace(spec["parm_name"], pt)
+        updated.append(spec["parm_name"])
 
-    ptg = node.parmTemplateGroup()
-
-    if folder_name is not None:
+    if not templates:
+        pass
+    elif folder_name is not None:
         ft = _FOLDER_TYPE_MAP.get(folder_type, hou.folderType.Tabs)
         folder = hou.FolderParmTemplate(
             folder_name.lower().replace(" ", "_"),
@@ -979,7 +1146,8 @@ def _create_spare_parameters(
     return {
         "node_path": node_path,
         "created": created,
-        "count": len(created),
+        "updated": updated,
+        "count": len(created) + len(updated),
         "folder_name": folder_name,
     }
 
@@ -1030,11 +1198,12 @@ def _get_parameters(
         matched += 1
         if len(values) >= _GET_PARMS_CAP:
             continue
-        entry: dict[str, Any] = {"value": _serialize_value(parm.eval())}
+        data_parm = _data_parm_value(parm, parm.parmTemplate())
+        entry: dict[str, Any] = data_parm or {"value": _serialize_value(parm.eval())}
         raw = parm.rawValue()
         # Only worth reporting when it differs: an expression is the thing a
         # caller most often needs to see and a literal is just noise.
-        if isinstance(raw, str) and raw != str(entry["value"]):
+        if not data_parm and isinstance(raw, str) and raw != str(entry["value"]):
             entry["raw_value"] = raw
         if include_defaults:
             entry["is_at_default"] = parm.isAtDefault()
@@ -1052,3 +1221,333 @@ def _get_parameters(
 
 
 register_handler("parameters.get_parameters", _get_parameters)
+
+
+###### Handler: parameters.get_parm_references
+
+# Every HScript function that reads a channel by path
+# ($HFS/houdini/help/expressions.zip). Longest first, so chsop is not read
+# as chs.
+_CHANNEL_FUNCTIONS = (
+    "ch", "chexist", "chexpr", "chexprf", "chexprt", "chf", "chramp", "chrampf",
+    "chrampraw", "chrampt", "chs", "chsop", "chsoplist", "chsraw", "cht",
+)  # fmt: skip
+_CHANNEL_NAMES = "|".join(sorted(_CHANNEL_FUNCTIONS, key=len, reverse=True))
+_CHANNEL_REF_RE = re.compile(r"\b(?:" + _CHANNEL_NAMES + r""")\s*\(\s*['"]([^'"]+)['"]""")
+_BACKTICKS_RE = re.compile(r"`([^`]*)`")
+
+
+def _outgoing_reference(parm: hou.Parm) -> dict[str, Any] | None:
+    """What *parm* reads from, or None when it reads no other channel.
+
+    A pure `ch("../src/tx")` resolves through getReferencedParm(). Anything
+    richer -- `ch("../src/scale") * 2` -- answers with the parm itself there
+    (measured on 22.0.429), so the channel references are read out of the
+    expression text and resolved relative to the node. A string parameter's
+    backtick expressions (`$HIP/`chs("../CTRL/version")`/geo.bgeo.sc`) are not
+    an expression() at all; they are read from unexpandedString(). An
+    expression that reads no channel (`$F * 2`) is not a reference.
+    """
+    expression = None
+    with contextlib.suppress(Exception):
+        expression = parm.expression()
+    texts: list[str] = []
+    in_backticks = False
+    if expression:
+        texts = [expression]
+    else:
+        with contextlib.suppress(Exception):
+            raw = parm.unexpandedString()
+            texts = _BACKTICKS_RE.findall(raw)
+            if texts:
+                expression, in_backticks = raw, True
+    if not texts:
+        return None
+    entry: dict[str, Any] = {"parm": parm.name(), "expression": expression}
+    if in_backticks:
+        entry["in_backticks"] = True
+    else:
+        with contextlib.suppress(Exception):
+            direct = parm.getReferencedParm()
+            if direct is not None and direct.path() != parm.path():
+                entry["references"] = [direct.path()]
+                entry["pure_reference"] = True
+                return entry
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    node = parm.node()
+    for text in texts:
+        for token in _CHANNEL_REF_RE.findall(text):
+            target = None
+            with contextlib.suppress(Exception):
+                target = node.parm(token)
+            if target is not None:
+                resolved.append(target.path())
+            else:
+                unresolved.append(token)
+    if not resolved and not unresolved:
+        return None
+    entry["references"] = resolved
+    if unresolved:
+        # Written in the expression, but no such parameter now: a renamed or
+        # deleted target, which is exactly what a rename audit is after.
+        entry["unresolved"] = unresolved
+    entry["pure_reference"] = False
+    return entry
+
+
+def _capped_paths(nodes: Any, exclude: str, limit: int) -> tuple[list[str], int]:
+    paths = sorted({n.path() for n in nodes} - {exclude})
+    return paths[:limit], len(paths)
+
+
+def _get_parm_references(
+    node_path: str,
+    parm_name: str | None = None,
+    direction: str = "both",
+    limit: int = 200,
+    **_: Any,
+) -> dict[str, Any]:
+    """Who references a parameter, and what it references -- both directions.
+
+    `incoming` lists, per parameter of *node_path* (or the one *parm_name*),
+    the parameters elsewhere whose expressions read it (parmsReferencingThis).
+    `outgoing` lists what this node's expressions and backtick strings read.
+    Node-level `dependents` / `references` round it off, so "what breaks if I
+    rename this control" is one call instead of a HOM script.
+    """
+    if direction not in ("both", "incoming", "outgoing"):
+        raise ValueError("direction must be 'both', 'incoming' or 'outgoing'.")
+    limit = int(limit)
+    node = _resolve_node(node_path)
+    parms = [_resolve_parm(node_path, parm_name)] if parm_name is not None else list(node.parms())
+
+    dependents: list = []
+    with contextlib.suppress(Exception):
+        dependents = list(node.dependents(include_children=False))
+    # parmsReferencingThis() walks the whole scene, once per parameter. A
+    # reader through ch() or backticks makes its node a dependent (a
+    # self-reference makes this node its own), so with no dependents there is
+    # nothing to find and the scan is skipped.
+    scan_incoming = direction in ("both", "incoming") and bool(dependents)
+
+    incoming: list[dict[str, Any]] = []
+    outgoing: list[dict[str, Any]] = []
+    truncated = False
+    for parm in parms:
+        found: list[tuple[list, dict[str, Any]]] = []
+        if scan_incoming:
+            with contextlib.suppress(Exception):
+                refs = [p.path() for p in parm.parmsReferencingThis()]
+                if refs:
+                    found.append((incoming, {"parm": parm.name(), "referenced_by": refs}))
+        if direction in ("both", "outgoing"):
+            entry = _outgoing_reference(parm)
+            if entry is not None:
+                found.append((outgoing, entry))
+        if not found:
+            continue
+        # Truncated only when there is an entry that does not fit.
+        if len(incoming) + len(outgoing) + len(found) > limit:
+            truncated = True
+            break
+        for target, entry in found:
+            target.append(entry)
+
+    result: dict[str, Any] = {
+        "node_path": node.path(),
+        "parm_name": parm_name,
+        "direction": direction,
+        "incoming": incoming,
+        "outgoing": outgoing,
+        "truncated": truncated,
+    }
+    # This node only (include_children=False: a subnet's descendants are not
+    # its own references), capped like the parameter lists.
+    result["node_dependents"], count = _capped_paths(dependents, node.path(), limit)
+    if count > limit:
+        result["node_dependents_count"] = count
+    with contextlib.suppress(Exception):
+        references = node.references(include_children=False)
+        result["node_references"], count = _capped_paths(references, node.path(), limit)
+        if count > limit:
+            result["node_references_count"] = count
+    with contextlib.suppress(Exception):
+        if node.needsToCook():
+            result["note"] = (
+                "node_dependents / node_references, and the dependents check that "
+                "decides whether `incoming` is scanned, are as of this node's last "
+                "cook (HOM: they can differ until it cooks); `outgoing` is parsed "
+                "from expressions and is not."
+            )
+    return result
+
+
+register_handler("parameters.get_parm_references", _get_parm_references)
+
+
+###### Handler: parameters.get_parm_template_tree
+
+
+def _template_tree_entry(pt: hou.ParmTemplate) -> dict[str, Any]:
+    """One template as the Type Properties dialog shows it: folders, ranges,
+    menus, conditionals, callbacks, defaults -- nothing evaluated.
+
+    Built on _template_to_dict, so the tree and get_parameter_schema report a
+    template with the same keys (default_value, is_hidden, min_is_strict,
+    menu_items...) and the same fixes; the tree adds what only the tree needs.
+    """
+    entry = _template_to_dict(pt)
+    with contextlib.suppress(Exception):
+        conditionals = pt.conditionals()
+        if conditionals:
+            entry["conditionals"] = {
+                key.name() if hasattr(key, "name") else str(key): value
+                for key, value in conditionals.items()
+            }
+    with contextlib.suppress(Exception):
+        help_text = pt.help()
+        if help_text:
+            entry["help"] = help_text
+    with contextlib.suppress(Exception):
+        if pt.joinsWithNext():
+            entry["join_with_next"] = True
+    with contextlib.suppress(Exception):
+        tags = dict(pt.tags())
+        if tags:
+            entry["tags"] = {
+                k: (v if len(str(v)) <= 120 else str(v)[:120] + "...") for k, v in tags.items()
+            }
+    if entry["type"] == "Folder":
+        with contextlib.suppress(Exception):
+            entry["folder_type"] = pt.folderType().name()
+            if "Multiparm" in entry["folder_type"]:
+                # A multiparm folder's default is the instance count a fresh
+                # node gets.
+                entry["default_instances"] = entry.get("default_value")
+        with contextlib.suppress(Exception):
+            if pt.endsTabGroup():
+                entry["ends_tab_group"] = True
+        children: list[dict[str, Any]] = []
+        with contextlib.suppress(Exception):
+            for child in pt.parmTemplates():
+                # One unreadable child costs that child, not the folder.
+                with contextlib.suppress(Exception):
+                    children.append(_template_tree_entry(child))
+        entry["children"] = children
+        return entry
+    with contextlib.suppress(Exception):
+        expressions = [e for e in pt.defaultExpression() if e]
+        if expressions:
+            entry["default_expression"] = expressions
+    with contextlib.suppress(Exception):
+        callback = pt.scriptCallback()
+        if callback:
+            entry["callback"] = callback
+            entry["callback_language"] = pt.scriptCallbackLanguage().name()
+    with contextlib.suppress(Exception):
+        string_type = pt.stringType().name()
+        if string_type != "Regular":
+            entry["string_type"] = string_type
+    with contextlib.suppress(Exception):
+        entry["data_parm_type"] = pt.dataParmType().name()
+    with contextlib.suppress(Exception):
+        look = pt.look().name()
+        if look != "Regular":
+            entry["look"] = look
+    return entry
+
+
+def _count_tree(entries: list[dict[str, Any]]) -> int:
+    return sum(1 + _count_tree(entry.get("children", [])) for entry in entries)
+
+
+def _prune_tree(entries: list[dict[str, Any]], budget: list[int]) -> list[dict[str, Any]]:
+    """Keep the first *budget* entries depth-first; the rest are cut."""
+    kept: list[dict[str, Any]] = []
+    for entry in entries:
+        if budget[0] <= 0:
+            break
+        budget[0] -= 1
+        if "children" in entry:
+            entry["children"] = _prune_tree(entry["children"], budget)
+        kept.append(entry)
+    return kept
+
+
+def _node_type_for_tree(context: str, type_name: str):
+    """Resolve *type_name* in *context* the way createNode would, through the
+    same resolver build_network and get_node_card use."""
+    from fxhoudinimcp_server.handlers.graph_handlers import _resolve_node_type
+
+    categories = hou.nodeTypeCategories()
+    category = categories.get(context)
+    if category is None:
+        raise ValueError(f"Unknown context '{context}'. Available: {sorted(categories)}")
+    resolved = _resolve_node_type(category, type_name)
+    if resolved is None:
+        close = get_close_matches(type_name, list(category.nodeTypes()), n=5, cutoff=0.4)
+        raise ValueError(f"Node type '{type_name}' not found in {context}. Close: {close}")
+    return resolved
+
+
+def _get_parm_template_tree(
+    node_path: str | None = None,
+    type_name: str | None = None,
+    context: str = "Sop",
+    folder: Any = None,
+    max_entries: int = 400,
+    **_: Any,
+) -> dict[str, Any]:
+    """The whole parameter interface as a tree -- folders, conditionals, menu
+    items, multiparm blocks, callbacks -- for a node or a node type.
+
+    get_hda_info shows the top folders and get_parameter_schema flattens the
+    rest away; neither can answer "what is in the Controls tab, in order,
+    with its Hide When rules". This does. `folder` narrows to one folder by
+    label (or a list of nested labels).
+    """
+    if node_path is not None:
+        node = _resolve_node(node_path)
+        group = node.parmTemplateGroup()
+        subject: dict[str, Any] = {"node_path": node.path(), "type": node.type().name()}
+    elif type_name is not None:
+        node_type = _node_type_for_tree(context, type_name)
+        group = node_type.parmTemplateGroup()
+        subject = {"type": node_type.name(), "context": context}
+    else:
+        raise ValueError("Give node_path or type_name.")
+
+    if folder is not None:
+        labels = tuple(folder) if isinstance(folder, (list, tuple)) else (str(folder),)
+        found = group.findFolder(labels)
+        if found is None:
+            available = [e.label() for e in group.entries() if _parm_type_name(e) == "Folder"]
+            raise ValueError(f"No folder labelled {labels!r}. Top-level folders: {available}")
+        entries = [_template_tree_entry(found)]
+    else:
+        entries = [_template_tree_entry(entry) for entry in group.entries()]
+
+    total = _count_tree(entries)
+    truncated = total > int(max_entries)
+    if truncated:
+        entries = _prune_tree(entries, [int(max_entries)])
+
+    result = dict(subject)
+    result.update(
+        {
+            "folder": folder,
+            "entry_count": total,
+            "truncated": truncated,
+            "entries": entries,
+        }
+    )
+    if truncated:
+        result["note"] = (
+            f"{total} entries, showing the first {int(max_entries)}. Narrow with "
+            f"folder=<label> or raise max_entries."
+        )
+    return result
+
+
+register_handler("parameters.get_parm_template_tree", _get_parm_template_tree)

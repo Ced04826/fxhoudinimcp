@@ -9,7 +9,7 @@
   <p align="center">
     The most comprehensive MCP server for SideFX Houdini.
     <br/>
-    199 tools across 23 categories, covering every major Houdini context.
+    206 tools across 23 categories, covering every major Houdini context.
     <br/><br/>
   </p>
 
@@ -54,7 +54,7 @@
 
 A comprehensive [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) server for [SideFX Houdini](https://www.sidefx.com/). Connects AI assistants like Claude directly to Houdini's Python API, enabling natural language control over scene building, simulation setup, rendering, and more.
 
-**199 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
+**206 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
 
 <!-- FEATURES -->
 ## Features
@@ -64,7 +64,7 @@ A comprehensive [MCP](https://modelcontextprotocol.io/) (Model Context Protocol)
 | **Graph Intelligence** | 6 | Atomic validated network building, network verification, node doc cards, cook profiling, frame-range cooking with per-frame evidence, cook status |
 | **Documentation** | 2 | Full-text search + page retrieval over Houdini's own shipped manual (version-exact) |
 | **Scene Management** | 10 | Open, save, import/export, scene info, connection status, undo/redo |
-| **Node Operations** | 20 | Create, delete, copy, connect, layout, flags, network boxes, sticky notes, object transforms |
+| **Node Operations** | 22 | Create, delete, copy, connect, layout, flags, network boxes, sticky notes, object transforms |
 | **Parameters** | 12 | Get/set values in bulk, expressions, keyframes, spare parameters |
 | **Geometry (SOPs)** | 14 | Points, prims, attributes, attribute statistics, volume inspection, groups, sampling, nearest-point search |
 | **LOPs/USD** | 18 | Stage inspection, prims, layers, composition, variants, lighting |
@@ -99,7 +99,7 @@ flowchart LR
 
     subgraph MCP[" ⚡ FXHoudini MCP Server "]
         direction TB
-        B1("🔧 199 tools")
+        B1("🔧 206 tools")
         B2("📦 8 Resources")
         B3("💬 9 Prompts")
     end
@@ -159,8 +159,10 @@ Then restart Houdini, restart your MCP client, and check the **MCP** menu in
 Houdini's menu bar.
 
 `install` does both halves. It writes a Houdini package file pointing at this
-exact install, and registers the server with Claude Code and Claude Desktop,
-whichever it finds, using the absolute path of the Python you ran it with.
+exact install, and registers the server with every MCP client it finds on the
+machine (Claude Code, Claude Desktop, Codex, Copilot CLI, Gemini CLI, Cursor,
+Windsurf, VS Code, Cline), using the absolute path of the Python you ran it
+with. Pass `--client` to name the ones you want instead.
 
 Use `python -m fxhoudinimcp install` rather than the bare `fxhoudinimcp install`
 if you have more than one Python. Both work, but the module form is
@@ -202,7 +204,7 @@ the common case after switching Python versions or recreating a virtualenv.
 | `--dry-run` | Report every change, make none |
 | `--houdini-dir DIR` | Which packages directory to write into |
 | `--client-only` | Register a client, leave Houdini untouched. Needs no packages directory, so it works when several exist |
-| `--client auto\|claude-code\|claude-desktop\|both\|none` | Which client to register. `none` if you wire it up yourself |
+| `--client NAME` | Which client to register, repeatable: `claude-code`, `claude-desktop`, `codex`, `copilot`, `gemini`, `cursor`, `windsurf`, `vscode`, `cline`. Default `auto` takes every one detected; `none` if you wire it up yourself |
 
 Upgrading later moves both halves at once, because the plugin lives inside the
 wheel:
@@ -241,7 +243,7 @@ you only want one Houdini cleaned.
 | `--dry-run` | Nothing. Lists what it would remove |
 | `--houdini-dir DIR` | Only this packages directory, instead of every one found |
 | `--client-only` | Only the client registration, leaving the package files |
-| `--client auto\|claude-code\|claude-desktop\|both\|none` | Which client to unregister from |
+| `--client NAME` | Which client to unregister from, repeatable; same names as `install`. Default `auto` takes every one with an entry |
 | `--yes` | Skip the confirmation. Required when stdin is not a terminal |
 
 ### Configuring the plugin
@@ -362,6 +364,25 @@ closing the window is not enough.
 
 To scope the server to a single project instead, add a `.mcp.json` in the project
 root with the same `mcpServers` block.
+
+**Other clients.** Same command, same absolute path; only where it goes differs.
+The CLI-driven ones take the command after their own `mcp add`, the file-driven
+ones take the JSON block above in the file listed, under the key listed. Paths
+checked against each vendor's documentation in September 2026; they move.
+
+| Client | Register with | Remove with |
+| --- | --- | --- |
+| Codex | `codex mcp add fxhoudini -- <python> -m fxhoudinimcp` | `codex mcp remove fxhoudini` |
+| Copilot CLI | `copilot mcp add fxhoudini -- <python> -m fxhoudinimcp` | `copilot mcp remove fxhoudini` |
+| Gemini CLI | `gemini mcp add -s user fxhoudini <python> -m fxhoudinimcp` | `gemini mcp remove -s user fxhoudini` |
+| Cursor | `~/.cursor/mcp.json`, key `mcpServers` | delete the entry |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json`, key `mcpServers` | delete the entry |
+| VS Code | user `mcp.json` (**MCP: Open User Configuration**), key `servers`, entry gets `"type": "stdio"` | delete the entry |
+| Cline | `cline_mcp_settings.json` in the extension's `globalStorage/saoudrizwan.claude-dev/settings/`, key `mcpServers` | delete the entry |
+
+Anything not listed (OpenCode, Zed, Roo Code, Kiro...) speaks the same stdio
+protocol: give it `<python> -m fxhoudinimcp` as the command in whatever shape
+its config wants, and `--client none` to keep `install` out of the way.
 
 `python -m fxhoudinimcp install --client-only` does this step for you, with the
 right path already filled in, and leaves the Houdini side alone. **MCP > Connect
@@ -591,7 +612,7 @@ Set `HOUDINI_DISABLE_OPENFX_DEFAULT_PATH=1` when running any of the above.
 This is a Houdini/Universe conflict, not something this repo causes.
 
 Unit tests mock `hou` and run anywhere. The integration suite in
-`tests/integration/` executes all 199 commands against live Houdini via
+`tests/integration/` executes all 206 commands against live Houdini via
 `hython` — including end-to-end user scenarios (procedural modeling,
 simulation, animation, lookdev) — and prints per-command timing and
 coverage reports; it is skipped automatically when `hou` is not
@@ -604,7 +625,7 @@ server's own bridge).
 
 1. **Houdini Plugin** (`houdini/`): Runs inside Houdini's Python environment. Registers a body-free `GET /fxapi` URL handler; small JSON commands use the query string and large commands use a single-use local temp file. Uses `hdefereval.executeInMainThreadWithResult()` to safely execute `hou.*` calls on the main thread. On H22, route registration and serving share one dedicated owner thread because `hwebserver` state is thread-local.
 
-2. **MCP Server** (`python/fxhoudinimcp/`): A standalone Python process using FastMCP. Exposes 199 tools, 8 resources, and 9 prompts via the MCP protocol. Forwards tool calls to Houdini over HTTP.
+2. **MCP Server** (`python/fxhoudinimcp/`): A standalone Python process using FastMCP. Exposes 206 tools, 8 resources, and 9 prompts via the MCP protocol. Forwards tool calls to Houdini over HTTP.
 
 3. **Bridge** (`python/fxhoudinimcp/bridge.py`): Async HTTP client that sends commands to Houdini's hwebserver and deserializes responses. Handles connection errors and timeouts.
 

@@ -7,6 +7,8 @@ All functions run on the main thread via the dispatcher.
 from __future__ import annotations
 
 # Built-in
+import contextlib
+import itertools
 from typing import Any
 
 # Third-party
@@ -73,10 +75,88 @@ def _get_lop_stage(node_path: str) -> Usd.Stage:
     return stage
 
 
-def _usd_value_to_python(val: Any) -> Any:
-    """Convert USD/Gf types to JSON-safe Python types."""
+#: Arrays longer than this are summarised (size, type, head, range) unless the
+#: caller asks for the full value. 16 keeps extent (2 vec3), xformOpOrder and
+#: small primvars whole; points, faceVertexIndices and st never fit anyway.
+_ARRAY_SUMMARY_LIMIT = 16
+_ARRAY_HEAD = 8
+
+
+def _is_usd_array(val: Any) -> bool:
+    """A Vt array or any other sized sequence that is not text, a mapping or a Gf vector."""
+    if (
+        isinstance(val, (str, bytes, dict))
+        or not hasattr(val, "__len__")
+        or not hasattr(val, "__iter__")
+    ):
+        return False
+    if HAS_PXR:
+        gf = (
+            Gf.Vec2f, Gf.Vec2d, Gf.Vec2h, Gf.Vec2i, Gf.Vec3f, Gf.Vec3d, Gf.Vec3h, Gf.Vec3i,
+            Gf.Vec4f, Gf.Vec4d, Gf.Vec4h, Gf.Vec4i, Gf.Matrix2d, Gf.Matrix2f, Gf.Matrix3d,
+            Gf.Matrix3f, Gf.Matrix4d, Gf.Matrix4f, Gf.Quatf, Gf.Quatd, Gf.Quath,
+        )  # fmt: skip
+        with contextlib.suppress(Exception):
+            if isinstance(val, gf):
+                return False
+    return True
+
+
+def _array_range(val: Any) -> dict[str, Any]:
+    """min/max of a numeric array (per component for vectors), or {} when not numeric."""
+    try:
+        import numpy as np
+
+        arr = np.asarray(val)
+        if arr.dtype.kind not in "iuf" or arr.size == 0:
+            return {}
+        if arr.ndim == 1:
+            return {"min": arr.min().item(), "max": arr.max().item()}
+        return {"min": arr.min(axis=0).tolist(), "max": arr.max(axis=0).tolist()}
+    except Exception:
+        return {}
+
+
+def _array_summary(val: Any, head: int = _ARRAY_HEAD) -> dict[str, Any]:
+    """What an agent needs from a large array: how many, of what, the first few, the range.
+
+    get_usd_prim on a building mesh answered 6.6 million characters (points,
+    st, faceVertexIndices in full) and get_usd_attribute(primvars:st) 40 000
+    lines. Nobody reads that; they grep it. This is the grep.
+    """
+    size = len(val)
+    first = val[0] if size else None
+    summary: dict[str, Any] = {
+        "array": True,
+        "size": size,
+        "element_type": type(first).__name__ if size else None,
+        "head": [_usd_value_to_python(v, array_limit=None) for v in itertools.islice(val, head)],
+    }
+    summary.update(_array_range(val))
+    summary["note"] = f"{size} elements; first {min(head, size)} shown. full=True returns them all."
+    return summary
+
+
+def _usd_value_to_python(val: Any, array_limit: int | None = _ARRAY_SUMMARY_LIMIT) -> Any:
+    """Convert USD/Gf types to JSON-safe Python types.
+
+    An array longer than *array_limit* comes back as a summary dict (see
+    _array_summary); array_limit=None returns every element.
+    """
     if val is None:
         return None
+    # Text first: a str is iterable with a length, so the generic Vt-array
+    # fallback below walks it character by character and each 1-char str is
+    # iterable again -- a token attribute (orientation, purpose, visibility)
+    # came back as a ~1000-deep nested list, 24 KB per token on a Mesh.
+    if isinstance(val, (bool, int, float, str)):
+        return val
+    if array_limit is not None and _is_usd_array(val):
+        try:
+            if len(val) > array_limit:
+                return _array_summary(val)
+        except TypeError:
+            pass
     # Handle Gf vector/matrix types
     if HAS_PXR:
         if isinstance(val, (Gf.Vec2f, Gf.Vec2d, Gf.Vec2h, Gf.Vec2i)):
@@ -110,15 +190,15 @@ def _usd_value_to_python(val: Any) -> Any:
             return list(val)
         if isinstance(val, Vt.TokenArray):
             return [str(t) for t in val]
-        # Generic Vt array fallback
+        # Generic Vt array fallback. No cap here: array_limit above already
+        # decides whether a long array is summarised, so reaching this point
+        # means the caller asked for the whole thing. The old 10 000 break made
+        # full=True quietly lie for every array type not enumerated above --
+        # Vt.Vec2fArray (primvars:st) came back with 10 001 of 40 000 elements
+        # while Vt.Vec3fArray came back whole.
         if hasattr(val, "__iter__") and hasattr(val, "__len__"):
             try:
-                result = []
-                for item in val:
-                    result.append(_usd_value_to_python(item))
-                    if len(result) > 10000:
-                        break
-                return result
+                return [_usd_value_to_python(item) for item in val]
             except (TypeError, RuntimeError):
                 pass
     # Primitives
@@ -130,8 +210,14 @@ def _usd_value_to_python(val: Any) -> Any:
     return str(val)
 
 
-def _prim_to_dict(prim: Usd.Prim, include_attrs: bool = False) -> dict[str, Any]:
-    """Convert a USD prim to a JSON-safe dict."""
+def _prim_to_dict(
+    prim: Usd.Prim, include_attrs: bool = False, full: bool = False
+) -> dict[str, Any]:
+    """Convert a USD prim to a JSON-safe dict.
+
+    With include_attrs, array values longer than _ARRAY_SUMMARY_LIMIT are
+    summarised unless *full* is set.
+    """
     info: dict[str, Any] = {
         "path": str(prim.GetPath()),
         "type": str(prim.GetTypeName()),
@@ -154,7 +240,9 @@ def _prim_to_dict(prim: Usd.Prim, include_attrs: bool = False) -> dict[str, Any]
             }
             if attr.IsAuthored() or attr.HasValue():
                 try:
-                    attr_info["value"] = _usd_value_to_python(attr.Get())
+                    attr_info["value"] = _usd_value_to_python(
+                        attr.Get(), array_limit=None if full else _ARRAY_SUMMARY_LIMIT
+                    )
                 except Exception:
                     attr_info["value"] = None
                     attr_info["error"] = "Could not read value"
@@ -210,8 +298,13 @@ def _get_usd_prim(
     *,
     node_path: str,
     prim_path: str,
+    full: bool = False,
 ) -> dict[str, Any]:
-    """Detailed prim info with type, kind, attributes, and children."""
+    """Detailed prim info with type, kind, attributes, and children.
+
+    Array attributes are summarised (size, element type, head, range) unless
+    *full* is set; get_usd_attribute reads one array in windows.
+    """
     stage = _get_lop_stage(node_path)
 
     prim = stage.GetPrimAtPath(prim_path)
@@ -220,7 +313,8 @@ def _get_usd_prim(
 
     return {
         "node_path": node_path,
-        "prim": _prim_to_dict(prim, include_attrs=True),
+        "prim": _prim_to_dict(prim, include_attrs=True, full=bool(full)),
+        "arrays_summarised": not full,
     }
 
 
@@ -246,19 +340,24 @@ def _list_usd_prims(
         raise hou.OperationFailed(f"Root prim not found at '{root_path}' on stage from {node_path}")
 
     results: list[dict[str, Any]] = []
-    root_depth = len(root_path.rstrip("/").split("/")) - 1
+    root_sdf_path = root.GetPath()
+    root_depth = root_sdf_path.pathElementCount
 
-    for prim in stage.Traverse():
-        prim_path_str = str(prim.GetPath())
+    # Walk the subtree of *root* only. A string prefix test used to stand in
+    # for "is under root", and "/materials/BLD" then matched
+    # "/materials/BLD_probes" too; Sdf.Path.HasPrefix compares path
+    # elements, and Usd.PrimRange(root) never leaves the subtree at all.
+    prims = stage.Traverse() if root_path == "/" else Usd.PrimRange(root)
 
-        # Depth filter
-        if depth is not None:
-            prim_depth = len(prim_path_str.rstrip("/").split("/")) - 1
-            if prim_depth - root_depth > depth:
-                continue
+    for prim in prims:
+        prim_path = prim.GetPath()
 
-        # Must be under root_path
-        if root_path != "/" and not prim_path_str.startswith(root_path):
+        # Must be under root_path (element-wise, not character-wise)
+        if root_path != "/" and not prim_path.HasPrefix(root_sdf_path):
+            continue
+
+        # Depth filter, counted in path elements below root
+        if depth is not None and prim_path.pathElementCount - root_depth > depth:
             continue
 
         # Type filter
@@ -303,8 +402,16 @@ def _get_usd_attribute(
     prim_path: str,
     attr_name: str,
     time: float | None = None,
+    full: bool = False,
+    offset: int = 0,
+    limit: int = 64,
 ) -> dict[str, Any]:
-    """Read a USD attribute value at an optional time code."""
+    """Read a USD attribute value at an optional time code.
+
+    A long array answers with a summary as `value` and a window of elements
+    as `slice` (offset/limit, default the first 64); full=True returns the
+    whole array as `value`.
+    """
     stage = _get_lop_stage(node_path)
 
     prim = stage.GetPrimAtPath(prim_path)
@@ -318,15 +425,38 @@ def _get_usd_attribute(
     time_code = Usd.TimeCode(time) if time is not None else Usd.TimeCode.Default()
     value = attr.Get(time_code)
 
-    return {
+    reply: dict[str, Any] = {
         "node_path": node_path,
         "prim_path": prim_path,
         "attr_name": attr_name,
         "type": str(attr.GetTypeName()),
         "is_authored": attr.IsAuthored(),
         "time": time,
-        "value": _usd_value_to_python(value),
     }
+    if full or not _is_usd_array(value) or len(value) <= _ARRAY_SUMMARY_LIMIT:
+        reply["value"] = _usd_value_to_python(value, array_limit=None)
+        return reply
+
+    offset = max(0, int(offset))
+    # At least one: limit=0 answered an empty window with has_more true, so a
+    # caller paging until has_more goes false advanced by zero forever.
+    limit = max(1, int(limit))
+    try:
+        # Vt arrays slice natively; islice walked every element up to offset
+        # (60 ms at offset 499 000 on a 500k Vec3fArray, against 0.08 ms here).
+        page = value[offset : offset + limit]
+    except TypeError:  # a sized iterable that does not support slicing
+        page = itertools.islice(value, offset, offset + limit)
+    window = [_usd_value_to_python(v, array_limit=None) for v in page]
+    reply["value"] = _array_summary(value)
+    reply["slice"] = {
+        "offset": offset,
+        "limit": limit,
+        "count": len(window),
+        "has_more": offset + len(window) < len(value),
+        "values": window,
+    }
+    return reply
 
 
 register_handler("lops.get_usd_attribute", _get_usd_attribute)
@@ -375,10 +505,12 @@ def _get_usd_prim_stats(
     type_counts: dict[str, int] = {}
     total = 0
 
-    for prim in stage.Traverse():
-        path = str(prim.GetPath())
-        if prim_path != "/" and not path.startswith(prim_path):
-            continue
+    root = stage.GetPrimAtPath(prim_path)
+    if not root.IsValid():
+        raise hou.OperationFailed(f"Root prim not found at '{prim_path}' on stage from {node_path}")
+    # Same test as list_usd_prims: a path, not a string prefix.
+    prims = stage.Traverse() if prim_path == "/" else Usd.PrimRange(root)
+    for prim in prims:
         total += 1
         type_name = str(prim.GetTypeName()) or "(untyped)"
         type_counts[type_name] = type_counts.get(type_name, 0) + 1
@@ -559,8 +691,18 @@ register_handler("lops.set_usd_attribute", _set_usd_attribute)
 ###### lops.get_usd_materials
 
 
+# Geometry paths listed per material; the count is always complete.
+_RENDERED_ON_CAP = 50
+
+
 def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
-    """List all materials with their bindings."""
+    """List all materials with their bindings.
+
+    `bound_to` is where a binding is authored (a direct allPurpose binding);
+    `rendered_on` / `rendered_on_count` are the gprims that resolve to the
+    material for rendering, inherited and collection bindings included.
+    get_usd_bound_material says why for a given prim.
+    """
     stage = _get_lop_stage(node_path)
 
     materials: list[dict[str, Any]] = []
@@ -604,6 +746,7 @@ def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
             bindings_map[mat_path] = []
 
     # Find bindings
+    gprims = []
     for prim in stage.Traverse():
         binding = UsdShade.MaterialBindingAPI(prim)
         try:
@@ -613,10 +756,30 @@ def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
                 bindings_map[mat_path].append(str(prim.GetPath()))
         except Exception:
             pass
+        with contextlib.suppress(Exception):
+            if prim.IsA(UsdGeom.Gprim):
+                gprims.append(prim)
+
+    # What each material is rendered on. bound_to only names the prims a
+    # binding is authored on, so geometry bound through a parent or a
+    # collection looked unbound; this resolves every gprim the way Karma does
+    # (purpose "full"), in one batch.
+    rendered_on: dict[str, list[str]] = {}
+    with contextlib.suppress(Exception):
+        if gprims:
+            resolved, _ = UsdShade.MaterialBindingAPI.ComputeBoundMaterials(
+                gprims, UsdShade.Tokens.full
+            )
+            for prim, material in zip(gprims, resolved, strict=False):
+                if material:
+                    rendered_on.setdefault(str(material.GetPath()), []).append(str(prim.GetPath()))
 
     # Attach bindings to materials
     for mat in materials:
         mat["bound_to"] = bindings_map.get(mat["path"], [])
+        on = rendered_on.get(mat["path"], [])
+        mat["rendered_on_count"] = len(on)
+        mat["rendered_on"] = on[:_RENDERED_ON_CAP]
 
     return {
         "node_path": node_path,
@@ -626,6 +789,114 @@ def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
 
 
 register_handler("lops.get_usd_materials", _get_usd_materials)
+
+
+###### lops.get_usd_bound_material
+
+# The purpose Karma renders with is "full", and ComputeBoundMaterial("full")
+# falls back to an allPurpose binding by itself. allPurpose ("all" here) is
+# the narrowest query, not a union: it ignores a full-purpose binding.
+_BINDING_PURPOSES = {"full": "full", "preview": "preview", "all": "allPurpose"}
+
+
+def _binding_source(prim_path: str, rel: Any) -> dict[str, Any]:
+    """Where a resolved binding comes from: the prim, an ancestor, or a collection."""
+    source: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        source["relationship"] = str(rel.GetPath())
+    binding_prim = None
+    with contextlib.suppress(Exception):
+        binding_prim = str(rel.GetPrim().GetPath())
+        source["binding_prim"] = binding_prim
+    is_collection = False
+    with contextlib.suppress(Exception):
+        is_collection = bool(
+            UsdShade.MaterialBindingAPI.CollectionBinding.IsCollectionBindingRel(rel)
+        )
+    if is_collection:
+        source["kind"] = "collection"
+        # material:binding:collection:preview:furn names the purpose too; the
+        # API answers with the collection itself (/set.collection:furn).
+        with contextlib.suppress(Exception):
+            binding = UsdShade.MaterialBindingAPI.CollectionBinding(rel)
+            source["collection"] = str(binding.GetCollectionPath())
+    elif binding_prim == prim_path:
+        source["kind"] = "direct"
+    else:
+        source["kind"] = "inherited"
+    with contextlib.suppress(Exception):
+        source["strength"] = str(UsdShade.MaterialBindingAPI.GetMaterialBindingStrength(rel))
+    return source
+
+
+def _binding_targets(rel: Any) -> list[str]:
+    with contextlib.suppress(Exception):
+        return [str(target) for target in rel.GetTargets()]
+    return []
+
+
+def _get_usd_bound_material(
+    *, node_path: str, prim_paths: Any, purpose: str = "full", **_: Any
+) -> dict[str, Any]:
+    """The material each prim renders with, and why.
+
+    get_usd_materials reports where bindings are authored; a prim bound
+    through its parent, or through a collection, is not listed there. This
+    resolves the binding the way the renderer does (ComputeBoundMaterials, for
+    the whole batch at once) and names the source: direct, inherited from
+    which ancestor, or which collection. A binding whose material prim does
+    not exist is reported as such, not as "unbound".
+    """
+    stage = _get_lop_stage(node_path)
+    token_name = _BINDING_PURPOSES.get(str(purpose).lower())
+    if token_name is None:
+        raise ValueError(f"purpose must be one of {sorted(_BINDING_PURPOSES)}, got {purpose!r}.")
+    token = getattr(UsdShade.Tokens, token_name)
+    if isinstance(prim_paths, str):
+        prim_paths = [prim_paths]
+    if not isinstance(prim_paths, (list, tuple)) or not prim_paths:
+        raise ValueError("prim_paths must be a prim path or a non-empty list of them.")
+
+    rows: list[dict[str, Any]] = []
+    found: list[tuple[dict[str, Any], Any]] = []
+    for raw in prim_paths:
+        prim_path = str(raw)
+        prim = stage.GetPrimAtPath(prim_path)
+        row: dict[str, Any] = {"prim": prim_path, "material": None}
+        if not prim or not prim.IsValid():
+            row["error"] = "prim not found on this stage"
+        else:
+            found.append((row, prim))
+        rows.append(row)
+
+    if found:
+        materials, rels = UsdShade.MaterialBindingAPI.ComputeBoundMaterials(
+            [prim for _, prim in found], token
+        )
+        for (row, prim), material, rel in zip(found, materials, rels, strict=False):
+            if material and material.GetPrim().IsValid():
+                row["material"] = str(material.GetPath())
+            if rel:
+                row["source"] = _binding_source(row["prim"], rel)
+                if row["material"] is None:
+                    # Bound, to a material prim that is not on the stage.
+                    row["missing_material"] = _binding_targets(rel)
+            with contextlib.suppress(Exception):
+                direct = UsdShade.MaterialBindingAPI(prim).GetDirectBinding(token)
+                row["direct_binding"] = str(direct.GetMaterialPath()) or None
+
+    return {
+        "node_path": node_path,
+        "purpose": str(purpose).lower(),
+        "count": len(rows),
+        "bound": sum(1 for row in rows if row["material"]),
+        "missing_material": sum(1 for row in rows if "missing_material" in row),
+        "not_found": sum(1 for row in rows if "error" in row),
+        "bindings": rows,
+    }
+
+
+register_handler("lops.get_usd_bound_material", _get_usd_bound_material)
 
 
 ###### lops.find_usd_prims

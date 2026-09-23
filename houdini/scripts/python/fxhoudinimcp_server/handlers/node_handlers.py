@@ -7,7 +7,10 @@ nodes within Houdini's node graph.
 from __future__ import annotations
 
 import contextlib
+import re
+import time
 from difflib import get_close_matches
+from typing import Any
 
 # Third-party
 import hou
@@ -214,6 +217,89 @@ def move_node(node_path: str, dest_parent: str) -> dict:
 ###### nodes.get_node_info
 
 
+# Parameter kinds that carry no value: pressing, grouping, decorating.
+_VALUELESS_PARM_TYPES = frozenset({"Button", "Folder", "FolderSet", "Separator", "Label"})
+
+
+def _component_default(parm: hou.Parm) -> Any:
+    """The default of *parm* itself, not of the tuple it belongs to.
+
+    ``parmTemplate().defaultValue()`` describes the whole tuple, so ``ty`` on
+    an xform used to be compared with ``(0.0, 0.0, 0.0)`` and every component
+    of every tuple came back "non-default" (34 entries on a bare xform with
+    one edit).
+    """
+    default = parm.parmTemplate().defaultValue()
+    if isinstance(default, (tuple, list)):
+        try:
+            index = parm.componentIndex()
+        except Exception:
+            index = 0
+        if not isinstance(index, int) or index < 0 or index >= len(default):
+            return default[0] if len(default) == 1 else None
+        return default[index]
+    return default
+
+
+def _is_at_default(parm: hou.Parm, value: Any, default: Any) -> bool:
+    """Whether *parm* still holds its default.
+
+    Houdini's own answer (``isAtDefault``, which also sees an expression as a
+    change) is preferred; a component comparison is the fallback for
+    anything that cannot answer.
+    """
+    try:
+        answer = parm.isAtDefault()
+        if isinstance(answer, bool):
+            return answer
+    except Exception:
+        pass
+    # Reached only when isAtDefault() is unavailable or answers non-bool.
+    # Ramp and Data parameters have no comparable defaultValue(), so == is
+    # false for them here and they reach the response -- which is why they
+    # have to survive JSON encoding (see serialize.py).
+    try:
+        return bool(value == default)
+    except Exception:
+        return False
+
+
+def _non_default_parms(node: hou.Node, parms: list[hou.Parm]) -> list[dict[str, Any]]:
+    """The parameters of *node* that differ from their defaults, as summaries.
+
+    Buttons, folders, separators and labels carry no value and are skipped.
+    """
+    summary: list[dict[str, Any]] = []
+    for parm in parms:
+        try:
+            template = parm.parmTemplate()
+            type_name = template.type().name()
+        except Exception:
+            continue
+        if type_name in _VALUELESS_PARM_TYPES:
+            continue
+        try:
+            val = parm.eval()
+        except Exception:
+            continue
+        try:
+            default = _component_default(parm)
+        except Exception:
+            default = None
+        if _is_at_default(parm, val, default):
+            continue
+        summary.append(
+            {
+                "name": parm.name(),
+                "label": parm.description(),
+                "value": to_jsonable(val),
+                "default": to_jsonable(default),
+                "type": type_name,
+            }
+        )
+    return summary
+
+
 def get_node_info(node_path: str) -> dict:
     """Return comprehensive information about a node.
 
@@ -229,35 +315,7 @@ def get_node_info(node_path: str) -> dict:
     # the response compact (a complex node can have 500+ parms, most at default).
     # Use get_parameter_schema to inspect the full parameter list.
     all_parms = node.parms()
-    parms_summary = []
-    for parm in all_parms:
-        try:
-            val = parm.eval()
-        except Exception:
-            continue
-        try:
-            default = parm.parmTemplate().defaultValue()
-            if isinstance(default, tuple) and len(default) == 1:
-                default = default[0]
-        except Exception:
-            default = None
-        # Ramp and Data parameters have no comparable defaultValue(), so this
-        # guard never filters them out and they always reach the response --
-        # which is why they have to survive JSON encoding (see serialize.py).
-        try:
-            if val == default:
-                continue
-        except Exception:
-            pass
-        parms_summary.append(
-            {
-                "name": parm.name(),
-                "label": parm.description(),
-                "value": to_jsonable(val),
-                "default": to_jsonable(default),
-                "type": parm.parmTemplate().type().name(),
-            }
-        )
+    parms_summary = _non_default_parms(node, all_parms)
 
     # Inputs
     inputs = []
@@ -484,6 +542,82 @@ def list_node_types(
 ###### nodes.connect_nodes
 
 
+def _input_table(node: hou.Node) -> list[dict[str, Any]]:
+    """A node's input connectors in order: index, name, label, data type.
+
+    Each read is guarded on its own, so a type whose labels or data types
+    cannot be read still lists its names.
+    """
+    names: list[str] = []
+    labels: list[str] = []
+    data_types: list[str] = []
+    with contextlib.suppress(Exception):
+        names = list(node.inputNames())
+    with contextlib.suppress(Exception):
+        labels = list(node.inputLabels())
+    with contextlib.suppress(Exception):
+        data_types = list(node.inputDataTypes())
+    table: list[dict[str, Any]] = []
+    for index, name in enumerate(names):
+        entry: dict[str, Any] = {"index": index, "name": name}
+        if index < len(labels):
+            entry["label"] = labels[index]
+        if index < len(data_types):
+            entry["data_type"] = data_types[index]
+        table.append(entry)
+    return table
+
+
+_NUMBERED = re.compile(r"(.*?)(\d+)")
+
+
+def _variadic_index(inputs: list[dict[str, Any]], name: str, max_inputs: int) -> int | None:
+    """Index of `input3` on a node that grows inputs as they are wired.
+
+    A merge or switch lists only the connectors it has now (a fresh merge
+    shows `input1` though it takes 9999), so a name further along the same
+    numbered series is still a real connector.
+    """
+    if not inputs or max_inputs <= len(inputs):
+        return None
+    first = _NUMBERED.fullmatch(str(inputs[0].get("name", "")))
+    wanted = _NUMBERED.fullmatch(name)
+    if first is None or wanted is None or wanted.group(1) != first.group(1):
+        return None
+    stem, start = first.group(1), int(first.group(2))
+    if any(entry.get("name") != f"{stem}{start + entry['index']}" for entry in inputs):
+        return None
+    index = int(wanted.group(2)) - start
+    return index if 0 <= index < max_inputs else None
+
+
+def _find_input(inputs: list[dict[str, Any]], input_name: str, max_inputs: int = 0) -> int:
+    """Index of the input called *input_name*: names first, then labels, then
+    the rest of a numbered variadic series. The one rule build_network's dry
+    run and every wiring verb use, so validation and wiring cannot disagree.
+    """
+    for entry in inputs:
+        if entry.get("name") == input_name:
+            return int(entry["index"])
+    for entry in inputs:
+        if entry.get("label") == input_name:
+            return int(entry["index"])
+    variadic = _variadic_index(inputs, input_name, max_inputs)
+    if variadic is not None:
+        return variadic
+    candidates: list[str] = []
+    for entry in inputs:
+        for value in (entry.get("name"), entry.get("label")):
+            if value and value not in candidates:
+                candidates.append(value)
+    close = get_close_matches(input_name, candidates, n=3, cutoff=0.4)
+    if close:
+        hint = f" Did you mean: {close}?"
+    else:
+        hint = f" Inputs: {candidates[:15] + (['...'] if len(candidates) > 15 else [])}"
+    raise ValueError(f"has no input named '{input_name}'.{hint}")
+
+
 def _resolve_input_index(dest: hou.Node, input_index: int, input_name: str | None) -> int:
     """Turn an input name (VOP connector such as "base_color") into its index.
 
@@ -492,15 +626,71 @@ def _resolve_input_index(dest: hou.Node, input_index: int, input_name: str | Non
     """
     if not input_name:
         return int(input_index)
-    names = list(dest.inputNames()) if hasattr(dest, "inputNames") else []
-    if input_name in names:
-        return names.index(input_name)
-    labels = list(dest.inputLabels())
-    if input_name in labels:
-        return labels.index(input_name)
-    close = get_close_matches(input_name, names + labels, n=3, cutoff=0.4)
-    hint = f" Did you mean: {close}?" if close else ""
-    raise ValueError(f"{dest.path()} has no input named '{input_name}'.{hint}")
+    max_inputs = 0
+    with contextlib.suppress(Exception):
+        max_inputs = int(dest.type().maxNumInputs())
+    try:
+        return _find_input(_input_table(dest), str(input_name), max_inputs)
+    except ValueError as exc:
+        raise ValueError(f"{dest.path()} {exc}") from None
+
+
+def _indirect_input_item(subnet: hou.Node, indirect: Any, connectors: list | None = None):
+    """Input connector *indirect* of *subnet*, or ValueError saying why not.
+
+    The one rule for connect_nodes, connect_nodes_batch and build_network.
+    *connectors* is the subnet's indirectInputs() when the caller already
+    listed them.
+    """
+    if isinstance(indirect, float) and indirect.is_integer():
+        indirect = int(indirect)
+    if isinstance(indirect, bool) or not isinstance(indirect, int):
+        raise ValueError(f"indirect_input must be an integer, got {indirect!r}")
+    if connectors is None:
+        try:
+            connectors = list(subnet.indirectInputs())
+        except Exception as exc:
+            raise ValueError(
+                f"{subnet.path()} has no input connectors to wire from: {readable_message(exc)}"
+            ) from exc
+    if not connectors:
+        # Not a subnet (a Box answers an empty tuple on 22.0 rather than the
+        # documented InvalidNodeType), or a subnet with no inputs.
+        raise ValueError(
+            f"{subnet.path()} has no input connectors to wire from: it is not a "
+            f"subnet, or a subnet without inputs."
+        )
+    if not 0 <= indirect < len(connectors):
+        raise ValueError(
+            f"{subnet.path()} has {len(connectors)} input connector(s); asked for #{indirect}."
+        )
+    return connectors[indirect]
+
+
+def _resolve_source(
+    source_path: str, indirect_input: Any, dest: hou.Node, output_index: int
+) -> Any:
+    """The item to wire from: a node, or one of a subnet's indirect inputs.
+
+    A subnet's input connectors are not nodes inside it — they are
+    `SubnetIndirectInput` items with no path of their own, so the first node
+    of a chain built inside a subnet could not be fed from the outside by any
+    verb. `indirect_input=n` names connector n of the subnet at `source_path`.
+    """
+    node = _get_node(source_path)
+    if indirect_input is None:
+        return node
+    item = _indirect_input_item(node, indirect_input)
+    if dest.parent() != node:
+        raise ValueError(
+            f"{dest.path()} is not inside {node.path()}: a subnet's input connector "
+            f"feeds only nodes inside that subnet."
+        )
+    if int(output_index) != 0:
+        raise ValueError(
+            f"a subnet input connector has one output; output_index must be 0, got {output_index}."
+        )
+    return item
 
 
 def connect_nodes(
@@ -509,31 +699,236 @@ def connect_nodes(
     output_index: int = 0,
     input_index: int = 0,
     input_name: str | None = None,
+    indirect_input: int | None = None,
 ) -> dict:
     """Wire two nodes together.
 
     Args:
-        source_path: Path to the source (upstream) node.
+        source_path: Path to the source (upstream) node — or, with
+            `indirect_input`, the subnet whose input connector is the source.
         dest_path: Path to the destination (downstream) node.
         output_index: Output connector index on the source node.
         input_index: Input connector index on the destination node.
         input_name: Input connector name or label; wins over input_index.
+        indirect_input: Index of the subnet input connector at `source_path`
+            to wire from (the node at dest_path must live inside that subnet).
     """
-    source = _get_node(source_path)
     dest = _get_node(dest_path)
+    source = _resolve_source(source_path, indirect_input, dest, output_index)
 
     input_index = _resolve_input_index(dest, input_index, input_name)
     dest.setInput(input_index, source, output_index)
 
     _focus_network_editor(dest, place_unpositioned=False)
 
-    return {
+    result = {
         "success": True,
-        "source_path": source.path(),
+        "source_path": _get_node(source_path).path(),
         "dest_path": dest.path(),
         "output_index": output_index,
         "input_index": input_index,
     }
+    if indirect_input is not None:
+        # source_path stays a path a caller can reuse; the connector is here.
+        result["indirect_input"] = int(indirect_input)
+    return result
+
+
+###### nodes.change_node_type
+
+
+def _non_default_parm_names(node: hou.Node) -> set[str]:
+    names = set()
+    for parm in node.parms():
+        with contextlib.suppress(Exception):
+            if not parm.isAtDefault():
+                names.add(parm.name())
+    return names
+
+
+def change_node_type(
+    node_path: str,
+    new_type: str,
+    keep_name: bool = True,
+    keep_parms: bool = True,
+    keep_network_contents: bool = True,
+) -> dict:
+    """Swap a node for another type in place — wires, name, position, flags
+    and (by default) parameter values and network contents kept.
+
+    This is the Type Properties "change type" / asset "upgrade to version"
+    gesture: an HDA instance moved to an installed newer version keeps its
+    edits. Every value that was set before the swap and is not set after it
+    is named in `parms_dropped` (no home on the new type) or `parms_reset`
+    (back at its default), measured on the node rather than inferred from
+    the flags.
+
+    Args:
+        node_path: Node to change.
+        new_type: Type name in the node's own category (unversioned names
+            map to the preferred version, as create_node does).
+        keep_name: Keep the node's name (default True).
+        keep_parms: Carry parameter values over by name (default True).
+        keep_network_contents: Keep the children of a subnet/asset (default
+            True). False resets an asset to its definition's contents, also
+            when the node already is of the requested type.
+    """
+    from fxhoudinimcp_server.handlers.graph_handlers import _resolve_node_type
+
+    node = _get_node(node_path)
+    category = node.type().category()
+    resolved = _resolve_node_type(category, new_type)
+    if resolved is None:
+        close = get_close_matches(new_type, list(category.nodeTypes()), n=3, cutoff=0.5)
+        hint = f" Did you mean: {close}?" if close else ""
+        raise ValueError(f"Type '{new_type}' does not exist in {category.name()}.{hint}")
+    old_type = node.type().name()
+    same_type = resolved.name() == old_type
+    # Re-applying the same type only does something when the contents are
+    # to be reset; otherwise it would be a no-op that still costs an undo.
+    changing = not same_type or not keep_network_contents
+
+    before_parms = {p.name() for p in node.parms()}
+    before_non_default = _non_default_parm_names(node)
+    changed = node
+    if changing:
+        kwargs = {
+            "keep_name": bool(keep_name),
+            "keep_parms": bool(keep_parms),
+            "keep_network_contents": bool(keep_network_contents),
+        }
+        if same_type:
+            kwargs["force_change_on_node_type_match"] = True
+        try:
+            changed = node.changeNodeType(resolved.name(), **kwargs)
+        except Exception as exc:
+            raise ValueError(
+                f"Could not change {node_path} ({old_type}) to {resolved.name()}: "
+                f"{readable_message(exc)}"
+            ) from exc
+        _focus_network_editor(changed, place_unpositioned=False)
+
+    after_parms = {p.name() for p in changed.parms()}
+    lost = before_non_default - _non_default_parm_names(changed)
+    result: dict[str, Any] = {
+        "success": True,
+        "node_path": changed.path(),
+        "old_type": old_type,
+        "new_type": changed.type().name(),
+        "changed": changing,
+        "keep_parms": bool(keep_parms),
+        "keep_network_contents": bool(keep_network_contents),
+        # Set values with no home on the new type, and set values that are
+        # back at their default: together, everything the swap lost.
+        "parms_dropped": sorted(lost - after_parms),
+        "parms_reset": sorted(lost & after_parms),
+        # Every parameter the new type lacks, set or not.
+        "parms_removed_count": len(before_parms - after_parms),
+        "inputs": [i.path() if i is not None else None for i in changed.inputs()],
+        "outputs": [o.path() for o in changed.outputs()],
+    }
+    if not changing:
+        result["message"] = f"{changed.path()} is already of type {old_type}; nothing changed."
+    with contextlib.suppress(Exception):
+        result["child_count"] = len(changed.children())
+    with contextlib.suppress(Exception):
+        if changed.type().definition() is not None:
+            result["matches_definition"] = changed.matchesCurrentDefinition()
+    return result
+
+
+###### nodes.press_button
+
+# The value types HOM's pressButton accepts in its arguments dict.
+_BUTTON_ARGUMENT_TYPES = (bool, int, float, str)
+
+
+def press_button(
+    node_path: str,
+    parm_name: str,
+    arguments: dict | None = None,
+    cook: bool = False,
+) -> dict:
+    """Press a button parameter and report what the node says afterwards.
+
+    Runs the button's callback exactly as a click would ("Stash Input",
+    "Reload Geometry", an asset's own Build button). The call holds until
+    the callback returns, with no deadline; a callback that opens a dialog
+    holds Houdini's main thread, and with it this bridge, until the dialog
+    is closed.
+
+    A press usually only dirties the node: `errors` and `warnings` are from
+    its last cook, which may predate the press. `cook=True` cooks the node
+    after the press so they describe the result; without it `needs_cook`
+    says whether they are stale (a cook that failed leaves it True too).
+
+    Args:
+        node_path: Node that owns the button.
+        parm_name: The button parameter's name.
+        arguments: Optional kwargs handed to the callback script; values
+            must be int, bool, float or str.
+        cook: Cook the node after the press (default False).
+    """
+    node = _get_node(node_path)
+    parm = node.parm(parm_name)
+    if parm is None:
+        names = [p.name() for p in node.parms()]
+        close = get_close_matches(parm_name, names, n=3, cutoff=0.4)
+        buttons = [p.name() for p in node.parms() if p.parmTemplate().type().name() == "Button"]
+        hint = f" Did you mean: {close}?" if close else ""
+        raise ValueError(
+            f"{node.path()} has no parameter '{parm_name}'.{hint} Buttons on this node: {buttons}"
+        )
+    for key, value in (arguments or {}).items():
+        if not isinstance(value, _BUTTON_ARGUMENT_TYPES):
+            raise ValueError(
+                f"arguments['{key}'] is {type(value).__name__}; a button callback "
+                f"takes only int, bool, float or str values. Nothing was pressed."
+            )
+    template = parm.parmTemplate()
+    parm_type = template.type().name()
+    started = time.perf_counter()
+    try:
+        if arguments:
+            parm.pressButton(dict(arguments))
+        else:
+            parm.pressButton()
+    except Exception as exc:
+        raise ValueError(
+            f"Callback of {node.path()}/{parm_name} failed: {readable_message(exc)}"
+        ) from exc
+    duration_ms = round((time.perf_counter() - started) * 1000, 1)
+    result: dict[str, Any] = {
+        "success": True,
+        "node_path": node.path(),
+        "parm_name": parm.name(),
+        "parm_type": parm_type,
+        "duration_ms": duration_ms,
+        "cooked": False,
+    }
+    if cook:
+        # A failed cook is an answer, not a failure of the press: its
+        # messages land in errors() below.
+        with contextlib.suppress(Exception):
+            node.cook(force=False)
+        result["cooked"] = True
+    with contextlib.suppress(Exception):
+        result["needs_cook"] = node.needsToCook()
+    for key, read in (("errors", node.errors), ("warnings", node.warnings)):
+        try:
+            result[key] = list(read())
+        except Exception:
+            result[key] = []
+    with contextlib.suppress(Exception):
+        # Built-in buttons (File's Reload, Stash's Stash Input) are handled in
+        # C++ and have no script callback; False does not mean inert.
+        result["has_script_callback"] = bool(template.scriptCallback())
+    if parm_type != "Button":
+        result["note"] = (
+            f"'{parm_name}' is a {parm_type} parameter, not a Button; its callback "
+            f"script (if any) was triggered the way pressButton does for any parameter."
+        )
+    return result
 
 
 ###### nodes.connect_nodes_batch
@@ -547,7 +942,9 @@ def connect_nodes_batch(
     Args:
         connections: List of dicts, each with keys:
             source_path, dest_path, output_index (default 0), input_index (default 0),
-            input_name (optional; a connector name or label, wins over input_index).
+            input_name (optional; a connector name or label, wins over input_index),
+            indirect_input (optional; source_path is then a subnet and this is the
+            index of its input connector to wire from).
     """
     results = []
     errors = []
@@ -559,19 +956,20 @@ def connect_nodes_batch(
         out_idx = int(conn.get("output_index", 0))
         in_idx = int(conn.get("input_index", 0))
         try:
-            source = _get_node(src_path)
             dest = _get_node(dst_path)
+            source = _resolve_source(src_path, conn.get("indirect_input"), dest, out_idx)
             in_idx = _resolve_input_index(dest, in_idx, conn.get("input_name"))
             dest.setInput(in_idx, source, out_idx)
             last_dest = dest
-            results.append(
-                {
-                    "source_path": source.path(),
-                    "dest_path": dest.path(),
-                    "output_index": out_idx,
-                    "input_index": in_idx,
-                }
-            )
+            entry = {
+                "source_path": _get_node(src_path).path(),
+                "dest_path": dest.path(),
+                "output_index": out_idx,
+                "input_index": in_idx,
+            }
+            if conn.get("indirect_input") is not None:
+                entry["indirect_input"] = int(conn["indirect_input"])
+            results.append(entry)
         except Exception as exc:
             errors.append(
                 {
@@ -608,21 +1006,23 @@ def disconnect_node(
     """
     node = _get_node(node_path)
     disconnected = []
+    # inputConnections(), not inputs(): inputs() hides a wire from a subnet's
+    # input connector (it reports the node outside the subnet, or None when
+    # that input is open), so such a wire could be made but not removed.
+    connected = sorted({conn.inputIndex() for conn in node.inputConnections()})
 
     if disconnect_all:
-        for i in range(len(node.inputs())):
-            if node.inputs()[i] is not None:
-                node.setInput(i, None)
-                disconnected.append(i)
+        for i in connected:
+            node.setInput(i, None)
+            disconnected.append(i)
     elif input_index is not None:
-        current_inputs = node.inputs()
-        if input_index < len(current_inputs) and current_inputs[input_index] is not None:
+        if input_index in connected:
             node.setInput(input_index, None)
             disconnected.append(input_index)
         else:
             raise ValueError(
                 f"Input index {input_index} is out of range or already disconnected "
-                f"on node {node_path}."
+                f"on node {node_path}. Connected inputs: {connected}."
             )
     else:
         raise ValueError("Provide either input_index or set disconnect_all=True.")
@@ -646,22 +1046,29 @@ def reorder_inputs(node_path: str, new_order: list) -> dict:
                    For example, [1, 0] swaps the first two inputs.
     """
     node = _get_node(node_path)
-    current_inputs = list(node.inputs())
+    # Every wire with the item it comes from and that item's output: a
+    # subnet input connector is an item, not a node, and inputs() hides it.
+    wires = {
+        conn.inputIndex(): (conn.inputItem(), conn.inputItemOutputIndex())
+        for conn in node.inputConnections()
+    }
+    count = max([len(node.inputs())] + [index + 1 for index in wires])
 
-    if len(new_order) > len(current_inputs):
+    if len(new_order) > count:
         raise ValueError(
-            f"new_order has {len(new_order)} entries but node only has "
-            f"{len(current_inputs)} inputs."
+            f"new_order has {len(new_order)} entries but node only has {count} inputs."
         )
+    bad = [old for old in new_order if not isinstance(old, int) or not 0 <= old < count]
+    if bad:
+        raise ValueError(f"new_order refers to inputs {bad}; {node_path} has inputs 0-{count - 1}.")
 
-    # Disconnect all first
-    for i in range(len(current_inputs)):
+    # Checked before anything is disconnected, so a refusal leaves the wires.
+    for i in wires:
         node.setInput(i, None)
-
-    # Reconnect in the new order
     for new_idx, old_idx in enumerate(new_order):
-        if old_idx < len(current_inputs) and current_inputs[old_idx] is not None:
-            node.setInput(new_idx, current_inputs[old_idx])
+        if old_idx in wires:
+            item, output_index = wires[old_idx]
+            node.setInput(new_idx, item, output_index)
 
     return {
         "success": True,
@@ -963,6 +1370,8 @@ register_handler("nodes.list_children", list_children)
 register_handler("nodes.find_nodes", find_nodes)
 register_handler("nodes.list_node_types", list_node_types)
 register_handler("nodes.connect_nodes", connect_nodes)
+register_handler("nodes.change_node_type", change_node_type)
+register_handler("nodes.press_button", press_button)
 register_handler("nodes.connect_nodes_batch", connect_nodes_batch)
 register_handler("nodes.disconnect_node", disconnect_node)
 register_handler("nodes.reorder_inputs", reorder_inputs)

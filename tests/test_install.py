@@ -29,6 +29,17 @@ def _entry(config: dict) -> dict:
     return config["mcpServers"][inst.SERVER_NAME]
 
 
+@pytest.fixture(autouse=True)
+def no_other_clients(monkeypatch):
+    """Cursor, Codex and friends on the developer's machine must never be touched.
+
+    Claude Code and Claude Desktop keep their own seams (claude_code_available,
+    desktop_config_path), which the tests below patch as they always have.
+    """
+    monkeypatch.setattr(inst, "cli_available", lambda key: False)
+    monkeypatch.setattr(inst, "client_config_path", lambda key: None)
+
+
 @pytest.fixture
 def plugin_dir(tmp_path, monkeypatch):
     """A plugin directory that exists, so main() gets past its first guard."""
@@ -721,3 +732,43 @@ def test_readme_never_shows_a_bare_python_client_entry():
     text = _README.read_text(encoding="utf-8")
     assert '"command": "python"' not in text
     assert "fxhoudini -- python -m fxhoudinimcp" not in text
+
+
+###### Every MCP client, not only Claude
+
+
+def test_vscode_uses_the_servers_key_and_marks_stdio():
+    """VS Code's mcp.json has no mcpServers; entries live under `servers`."""
+    merged = inst._merge_desktop_config(
+        {"servers": {"other": {"url": "http://x"}}}, ["/py", "-m", "fxhoudinimcp"], "servers", True
+    )
+    assert merged["servers"]["other"] == {"url": "http://x"}
+    assert merged["servers"][inst.SERVER_NAME]["type"] == "stdio"
+    assert "mcpServers" not in merged
+
+
+def test_auto_keeps_every_detected_client_and_none_empties_it():
+    present = lambda key: key in ("codex", "cursor")  # noqa: E731
+    assert inst.resolve_client_targets(None, present) == ["codex", "cursor"]
+    assert inst.resolve_client_targets(["both"], present) == ["claude-code", "claude-desktop"]
+    assert inst.resolve_client_targets(["cursor", "auto"], present) == ["cursor", "codex"]
+    assert inst.resolve_client_targets(["cursor", "none"], present) == []
+
+
+def test_cli_client_repoints_when_the_entry_already_exists(monkeypatch):
+    monkeypatch.setattr(inst, "cli_available", lambda key: True)
+    calls = _runs(monkeypatch, 1, 0, 0)
+    lines = inst.install_cli_client("codex", dry_run=False)
+    assert [c[:3] for c in calls] == [
+        ["codex", "mcp", "add"],
+        ["codex", "mcp", "remove"],
+        ["codex", "mcp", "add"],
+    ]
+    assert any("Registered" in line for line in lines)
+
+
+def test_readme_names_every_client_the_cli_accepts():
+    text = _README.read_text(encoding="utf-8")
+    for key in inst.CLIENT_KEYS:
+        if key not in ("auto", "none", "both"):
+            assert f"`{key}`" in text, f"README never names --client {key}"

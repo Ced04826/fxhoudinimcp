@@ -2,7 +2,7 @@
 
 ## Overview
 
-fxhoudinimcp exposes **199 tools** across **23 categories**, covering every major Houdini context.
+fxhoudinimcp exposes **206 tools** across **23 categories**, covering every major Houdini context.
 
 Once connected, your AI assistant can:
 
@@ -46,19 +46,23 @@ connection status, and `undo` / `redo`. When `FXHOUDINIMCP_PROJECT_ROOT` is
 set, the file operations here are confined to that directory tree (see
 [Configuration](configuration.md#project-root-sandbox)).
 
-### Node Operations (20 tools)
+### Node Operations (22 tools)
 
 Create, delete, copy, rename, connect and disconnect nodes, reorder inputs,
 manage flags, colours and positions. `create_network_box` and
 `create_sticky_note` let a built graph document itself, and
 `set_object_transform` sets translate, rotate, scale and parent on an object
-in one call.
+in one call. `change_node_type` swaps a node for another type (or an asset
+for a newer version) in place, and `press_button` presses a button parameter
+and reads the node back.
 
-### Parameters (12 tools)
+### Parameters (14 tools)
 
 Get/set values one at a time or in bulk, expressions, channel references
 between parameters, keyframes, locking, reverting to defaults, and spare
-parameters.
+parameters. `get_parm_references` lists who reads a parameter and what it
+reads, and `get_parm_template_tree` reads a node's or type's whole interface
+as a tree of folders.
 
 ### Geometry / SOPs (14 tools)
 

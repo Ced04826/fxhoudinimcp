@@ -66,51 +66,132 @@ def client_command() -> list[str]:
     return [sys.executable, "-m", "fxhoudinimcp"]
 
 
-def desktop_config_path() -> Path | None:
-    """Claude Desktop's config file for this platform, whether or not it exists."""
+def _app_data() -> Path | None:
+    """Where desktop apps keep per-user config on this platform."""
     system = platform.system()
     if system == "Windows":
         base = os.environ.get("APPDATA")
-        if not base:
-            return None
-        return Path(base) / "Claude" / "claude_desktop_config.json"
+        return Path(base) if base else None
     if system == "Darwin":
-        return (
-            Path.home()
-            / "Library"
-            / "Application Support"
-            / "Claude"
-            / "claude_desktop_config.json"
-        )
-    return Path.home() / ".config" / "Claude" / "claude_desktop_config.json"
+        return Path.home() / "Library" / "Application Support"
+    return Path.home() / ".config"
+
+
+# MCP clients configured by editing a JSON file:
+#   key -> (label, top-level servers key, entries carry "type": "stdio", path)
+# A path starting with "~" is under the home directory, anything else under
+# _app_data(). Every one takes the same command and args, so one merge routine
+# serves them all; only the file and the top-level key differ. VS Code has a
+# `code --add-mcp` flag but no way to remove, so it is treated as a file too.
+JSON_CLIENTS: dict[str, tuple[str, str, bool, tuple[str, ...]]] = {
+    "claude-desktop": (
+        "Claude Desktop",
+        "mcpServers",
+        False,
+        ("Claude", "claude_desktop_config.json"),
+    ),
+    "cursor": ("Cursor", "mcpServers", False, ("~", ".cursor", "mcp.json")),
+    "windsurf": (
+        "Windsurf",
+        "mcpServers",
+        False,
+        ("~", ".codeium", "windsurf", "mcp_config.json"),
+    ),
+    "vscode": ("VS Code", "servers", True, ("Code", "User", "mcp.json")),
+    "cline": (
+        "Cline",
+        "mcpServers",
+        False,
+        (
+            "Code",
+            "User",
+            "globalStorage",
+            "saoudrizwan.claude-dev",
+            "settings",
+            "cline_mcp_settings.json",
+        ),
+    ),
+}
+
+# MCP clients registered through their own CLI, which owns the config schema:
+#   key -> (label, executable, `add` argv before the command, `remove` argv)
+# Claude Code and Gemini need "--" or not, and a user scope or not, so the
+# argv is spelled out per client rather than templated.
+CLI_CLIENTS: dict[str, tuple[str, str, list[str], list[str]]] = {
+    "claude-code": (
+        "Claude Code",
+        "claude",
+        ["mcp", "add", "--scope", "user", SERVER_NAME, "--"],
+        ["mcp", "remove", SERVER_NAME, "-s", "user"],
+    ),
+    "codex": ("Codex", "codex", ["mcp", "add", SERVER_NAME, "--"], ["mcp", "remove", SERVER_NAME]),
+    "copilot": (
+        "Copilot CLI",
+        "copilot",
+        ["mcp", "add", SERVER_NAME, "--"],
+        ["mcp", "remove", SERVER_NAME],
+    ),
+    "gemini": (
+        "Gemini CLI",
+        "gemini",
+        ["mcp", "add", "-s", "user", SERVER_NAME],
+        ["mcp", "remove", "-s", "user", SERVER_NAME],
+    ),
+}
+
+CLIENT_KEYS = ("auto", "none", "both", *CLI_CLIENTS, *JSON_CLIENTS)
+
+
+def client_label(key: str) -> str:
+    return (JSON_CLIENTS.get(key) or CLI_CLIENTS[key])[0]
+
+
+def client_config_path(key: str) -> Path | None:
+    """The JSON client's config file for this platform, whether or not it exists."""
+    parts = JSON_CLIENTS[key][3]
+    if parts[0] == "~":
+        return Path.home().joinpath(*parts[1:])
+    base = _app_data()
+    return None if base is None else base.joinpath(*parts)
+
+
+def desktop_config_path() -> Path | None:
+    """Claude Desktop's config file for this platform, whether or not it exists."""
+    return client_config_path("claude-desktop")
+
+
+def cli_available(key: str) -> bool:
+    return shutil.which(CLI_CLIENTS[key][1]) is not None
 
 
 def claude_code_available() -> bool:
-    return shutil.which("claude") is not None
+    return cli_available("claude-code")
 
 
-def claude_code_add_argv(scope: str = "user") -> list[str]:
+def cli_add_argv(key: str) -> list[str]:
+    """The client CLI's `mcp add` invocation, for running or for printing."""
+    _, exe, add, _ = CLI_CLIENTS[key]
+    return [exe, *add, *client_command()]
+
+
+def cli_remove_argv(key: str) -> list[str]:
+    _, exe, _, remove = CLI_CLIENTS[key]
+    return [exe, *remove]
+
+
+def claude_code_add_argv() -> list[str]:
     """The `claude mcp add` invocation, for running or for printing verbatim."""
-    return [
-        "claude",
-        "mcp",
-        "add",
-        "--scope",
-        scope,
-        SERVER_NAME,
-        "--",
-        *client_command(),
-    ]
+    return cli_add_argv("claude-code")
 
 
-def claude_code_remove_argv(scope: str = "user") -> list[str]:
+def claude_code_remove_argv() -> list[str]:
     """The `claude mcp remove` invocation, for running or for printing.
 
     Lives next to its counterpart because `install` needs it too: `claude mcp
     add` cannot update an entry in place, so repointing one means removing it
     first. `uninstall` imports it from here.
     """
-    return ["claude", "mcp", "remove", SERVER_NAME, "-s", scope]
+    return cli_remove_argv("claude-code")
 
 
 def printable_argv(argv: list[str]) -> str:
@@ -152,7 +233,9 @@ def resolve_houdini_dirs(explicit: str | None) -> tuple[list[Path], str]:
     return candidates, f"every candidate on this machine ({len(candidates)})"
 
 
-def _merge_desktop_config(existing: dict, command: list[str]) -> dict:
+def _merge_desktop_config(
+    existing: dict, command: list[str], servers_key: str = "mcpServers", stdio: bool = False
+) -> dict:
     """Point our entry at *command* while preserving everything else.
 
     Someone's Desktop config is likely to hold servers that took effort to set
@@ -163,15 +246,18 @@ def _merge_desktop_config(existing: dict, command: list[str]) -> dict:
     the whole entry looked correct until it met a real config, which carried an
     ``env`` block with HOUDINI_HOST and HOUDINI_PORT: rewriting the entry
     wholesale would have deleted the user's settings while reporting success.
-    Only ``command`` and ``args`` are ours to set.
+    Only ``command`` and ``args`` are ours to set, plus ``type`` for the clients
+    (VS Code) whose entries carry one.
     """
     merged = dict(existing)
-    servers = dict(merged.get("mcpServers") or {})
+    servers = dict(merged.get(servers_key) or {})
     entry = dict(servers.get(SERVER_NAME) or {})
+    if stdio:
+        entry["type"] = "stdio"
     entry["command"] = command[0]
     entry["args"] = list(command[1:])
     servers[SERVER_NAME] = entry
-    merged["mcpServers"] = servers
+    merged[servers_key] = servers
     return merged
 
 
@@ -197,6 +283,18 @@ def pinned_port_warning(entry: dict | None) -> list[str]:
 
 def install_desktop(config: Path, command: list[str], dry_run: bool) -> list[str]:
     """Register the server in Claude Desktop's config. Returns report lines."""
+    return install_json_client("claude-desktop", config, command, dry_run)
+
+
+def restart_note(key: str) -> str:
+    if key == "claude-desktop":
+        return "  Fully quit Claude Desktop (tray > Quit) and relaunch."
+    return f"  Restart {client_label(key)}, or reload its MCP servers."
+
+
+def install_json_client(key: str, config: Path, command: list[str], dry_run: bool) -> list[str]:
+    """Register the server in a JSON-configured client. Returns report lines."""
+    label, servers_key, stdio, _ = JSON_CLIENTS[key]
     lines: list[str] = []
     existing: dict = {}
     if config.is_file():
@@ -204,20 +302,20 @@ def install_desktop(config: Path, command: list[str], dry_run: bool) -> list[str
             existing = json.loads(config.read_text(encoding="utf-8-sig")) or {}
         except Exception as exc:
             return [
-                f"  SKIPPED Claude Desktop: {config} is not readable JSON ({exc}).",
+                f"  SKIPPED {label}: {config} is not readable JSON ({exc}).",
                 "          Fix or remove it, then re-run. It was left untouched.",
             ]
         if not isinstance(existing, dict):
             return [
-                f"  SKIPPED Claude Desktop: {config} is not a JSON object.",
+                f"  SKIPPED {label}: {config} is not a JSON object.",
                 "          It was left untouched.",
             ]
 
-    already = (existing.get("mcpServers") or {}).get(SERVER_NAME)
-    merged = _merge_desktop_config(existing, command)
-    if already == merged["mcpServers"][SERVER_NAME]:
+    already = (existing.get(servers_key) or {}).get(SERVER_NAME)
+    merged = _merge_desktop_config(existing, command, servers_key, stdio)
+    if already == merged[servers_key][SERVER_NAME]:
         return [
-            f"  Claude Desktop already points at this install ({config}).",
+            f"  {label} already points at this install ({config}).",
             *pinned_port_warning(already),
         ]
 
@@ -240,8 +338,71 @@ def install_desktop(config: Path, command: list[str], dry_run: bool) -> list[str
     config.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8", newline="\n")
     lines.append(f"  Registered '{SERVER_NAME}' in {config}")
     lines += pinned_port_warning(already)
-    lines.append("  Fully quit Claude Desktop (tray > Quit) and relaunch.")
+    lines.append(restart_note(key))
     return lines
+
+
+def install_cli_client(key: str, dry_run: bool) -> list[str]:
+    """Register with a client through its own CLI. Returns report lines.
+
+    Claude Code has its own routine because it reads the old value back before
+    repointing. The others get the plainer version: add, and if the CLI says
+    the entry already exists, remove it and add again so a stale interpreter
+    path is repointed rather than kept.
+    """
+    label = client_label(key)
+    argv = cli_add_argv(key)
+    printable = printable_argv(argv)
+    if not cli_available(key):
+        return [
+            f"  {label} not on PATH, so nothing was changed. Run this yourself",
+            f"  if you use {label}:",
+            f"      {printable}",
+        ]
+    if dry_run:
+        return [f"  Would run: {printable}"]
+
+    result = subprocess.run(argv, capture_output=True, text=True)
+    if result.returncode != 0 and "already" in (result.stderr + result.stdout).lower():
+        subprocess.run(cli_remove_argv(key), capture_output=True, text=True)
+        result = subprocess.run(argv, capture_output=True, text=True)
+    if result.returncode == 0:
+        return [f"  Registered '{SERVER_NAME}' with {label}."]
+    return [
+        f"  {label} registration failed: {_first_line(result)}",
+        f"  Run it yourself to see the whole error: {printable}",
+    ]
+
+
+def resolve_client_targets(choices: list[str] | None, present) -> list[str]:
+    """Turn --client values into client keys.
+
+    *present* says whether a client exists here; ``auto`` keeps the ones that
+    do. ``both`` is the pre-2.19 spelling of Claude Code plus Claude Desktop.
+    Several --client flags accumulate; ``none`` empties the list.
+    """
+    choices = choices or ["auto"]
+    if "none" in choices:
+        return []
+    targets: list[str] = []
+    for choice in choices:
+        if choice == "auto":
+            targets += [key for key in (*CLI_CLIENTS, *JSON_CLIENTS) if present(key)]
+        elif choice == "both":
+            targets += ["claude-code", "claude-desktop"]
+        else:
+            targets.append(choice)
+    return list(dict.fromkeys(targets))
+
+
+def client_present_for_install(key: str) -> bool:
+    """A CLI client is present when on PATH, a JSON one when its config dir exists."""
+    if key == "claude-code":
+        return claude_code_available()
+    if key in CLI_CLIENTS:
+        return cli_available(key)
+    config = desktop_config_path() if key == "claude-desktop" else client_config_path(key)
+    return config is not None and config.parent.is_dir()
 
 
 def claude_code_current_command() -> str | None:
@@ -397,10 +558,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--client",
-        choices=("auto", "claude-code", "claude-desktop", "both", "none"),
-        default="auto",
-        help="which MCP client to register with (default: auto, meaning "
-        "whichever of the two is present)",
+        action="append",
+        choices=CLIENT_KEYS,
+        help="which MCP client to register with; repeatable (default: auto, "
+        "meaning every client detected on this machine)",
     )
     parser.add_argument(
         "--client-only",
@@ -522,37 +683,26 @@ def _install_plugin_half(args, plugin: Path) -> int:
 def _install_client_half(args) -> None:
     """Register the server with whichever MCP clients are in scope."""
     print("\nMCP client")
-    wanted = args.client
-    if wanted == "auto":
-        targets = []
-        if claude_code_available():
-            targets.append("claude-code")
-        config = desktop_config_path()
-        if config is not None and config.parent.is_dir():
-            targets.append("claude-desktop")
-        if not targets:
-            print("  Neither Claude Code nor Claude Desktop was detected.")
-            printable = " ".join(claude_code_add_argv())
-            print(f"  For Claude Code:  {printable}")
-            print(f"  For anything else, run: {' '.join(client_command())}")
-            targets = []
-    elif wanted == "both":
-        targets = ["claude-code", "claude-desktop"]
-    elif wanted == "none":
+    targets = resolve_client_targets(args.client, client_present_for_install)
+    if args.client and "none" in args.client:
         print("  Skipped (--client none). Start the server with:")
         print(f"      {' '.join(client_command())}")
-        targets = []
-    else:
-        targets = [wanted]
+    elif not targets:
+        print("  No MCP client was detected.")
+        printable = " ".join(claude_code_add_argv())
+        print(f"  For Claude Code:  {printable}")
+        print(f"  For anything else, run: {' '.join(client_command())}")
 
     for target in targets:
         if target == "claude-code":
-            for line in install_claude_code(args.dry_run):
-                print(line)
+            lines = install_claude_code(args.dry_run)
+        elif target in CLI_CLIENTS:
+            lines = install_cli_client(target, args.dry_run)
         else:
-            config = desktop_config_path()
+            config = client_config_path(target)
             if config is None:
-                print("  Could not locate Claude Desktop's config on this platform.")
-                continue
-            for line in install_desktop(config, client_command(), args.dry_run):
-                print(line)
+                lines = [f"  Could not locate {client_label(target)}'s config on this platform."]
+            else:
+                lines = install_json_client(target, config, client_command(), args.dry_run)
+        for line in lines:
+            print(line)

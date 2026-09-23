@@ -127,3 +127,126 @@ class TestDiscovery:
         assert len(hou.node(geo).children()) == 3
         children = data.get("children", data.get("nodes", []))
         assert len(children) == 3
+
+
+class TestChangeNodeType:
+    def test_swap_keeps_wires_and_names_what_was_lost(self, call):
+        geo = _make_geo(call)
+        box = hou.node(geo).createNode("box")
+        null = hou.node(geo).createNode("null")
+        null.setInput(0, box)
+        box.parm("tx").set(5)
+        box.parm("sizex").set(3)
+        data = call("nodes.change_node_type", node_path=box.path(), new_type="tube")
+        node = hou.node(data["node_path"])
+        assert node.type().name() == "tube"
+        assert data["changed"] is True
+        assert null.inputs()[0].path() == node.path()
+        assert node.parm("tx").eval() == 5
+        # sizex has no home on a tube: it is named, not silently lost.
+        assert "sizex" in data["parms_dropped"]
+        assert "tx" not in data["parms_dropped"] + data["parms_reset"]
+
+    def test_same_type_is_a_no_op_with_the_full_reply(self, call):
+        geo = _make_geo(call)
+        box = hou.node(geo).createNode("box")
+        data = call("nodes.change_node_type", node_path=box.path(), new_type="box")
+        assert data["changed"] is False
+        assert data["parms_dropped"] == [] and data["parms_reset"] == []
+        assert "message" in data
+
+    def test_spare_parms_survive_the_swap(self, call):
+        geo = _make_geo(call)
+        null = hou.node(geo).createNode("null")
+        group = null.parmTemplateGroup()
+        group.append(hou.FloatParmTemplate("tweak", "Tweak", 1))
+        null.setParmTemplateGroup(group)
+        null.parm("tweak").set(3.0)
+        data = call("nodes.change_node_type", node_path=null.path(), new_type="xform")
+        assert hou.node(data["node_path"]).parm("tweak").eval() == 3.0
+        assert "tweak" not in data["parms_dropped"] + data["parms_reset"]
+
+
+class TestPressButton:
+    def test_errors_are_stale_until_cooked(self, call):
+        geo = _make_geo(call)
+        file_sop = hou.node(geo).createNode("file")
+        file_sop.parm("file").set("/nonexistent/fxh_press_button.bgeo")
+        data = call("nodes.press_button", node_path=file_sop.path(), parm_name="reload")
+        assert data["cooked"] is False
+        assert data["needs_cook"] is True
+        # Reload is handled in C++: no script callback, and still not inert.
+        assert data["has_script_callback"] is False
+
+        data = call("nodes.press_button", node_path=file_sop.path(), parm_name="reload", cook=True)
+        assert data["cooked"] is True
+        assert any("fxh_press_button" in e for e in data["errors"])
+
+    def test_an_unsupported_argument_type_is_refused_before_pressing(self, call):
+        geo = _make_geo(call)
+        file_sop = hou.node(geo).createNode("file")
+        error = call(
+            "nodes.press_button",
+            node_path=file_sop.path(),
+            parm_name="reload",
+            arguments={"items": [1, 2]},
+            expect_error=True,
+        )
+        assert "items" in error["message"] and "list" in error["message"]
+
+
+class TestSubnetInputConnectors:
+    def _subnet(self):
+        geo = hou.node("/obj").createNode("geo")
+        subnet = geo.createNode("subnet")
+        inner = subnet.createNode("null")
+        return geo, subnet, inner
+
+    def _wires(self, node):
+        return [(c.inputIndex(), type(c.inputItem()).__name__) for c in node.inputConnections()]
+
+    def test_the_wire_is_made_and_can_be_removed(self, call):
+        _, subnet, inner = self._subnet()
+        data = call(
+            "nodes.connect_nodes",
+            source_path=subnet.path(),
+            dest_path=inner.path(),
+            indirect_input=0,
+        )
+        assert data["source_path"] == subnet.path()
+        assert self._wires(inner) == [(0, "OpSubnetIndirectInput")]
+        # inputs() hides this wire; disconnect_node must still find it.
+        assert inner.inputs() == ()
+        call("nodes.disconnect_node", node_path=inner.path(), disconnect_all=True)
+        assert self._wires(inner) == []
+
+    def test_reorder_keeps_the_connector(self, call):
+        _, subnet, inner = self._subnet()
+        other = subnet.createNode("box")
+        merge = subnet.createNode("merge")
+        merge.setInput(0, subnet.indirectInputs()[0])
+        merge.setInput(1, other)
+        call("nodes.reorder_inputs", node_path=merge.path(), new_order=[1, 0])
+        assert merge.inputConnections()[0].inputItem() == other
+        assert type(merge.inputConnections()[1].inputItem()).__name__ == "OpSubnetIndirectInput"
+
+    def test_a_destination_outside_the_subnet_is_refused_by_name(self, call):
+        geo, subnet, _ = self._subnet()
+        box = geo.createNode("box")
+        error = call(
+            "nodes.connect_nodes",
+            source_path=subnet.path(),
+            dest_path=box.path(),
+            indirect_input=0,
+            expect_error=True,
+        )
+        assert "is not inside" in error["message"]
+
+    def test_build_network_wires_from_the_connector(self, call):
+        _, subnet, _ = self._subnet()
+        call(
+            "graph.build_network",
+            parent_path=subnet.path(),
+            nodes=[{"type": "null", "name": "fed", "inputs": [{"indirect_input": 0}]}],
+        )
+        assert self._wires(subnet.node("fed")) == [(0, "OpSubnetIndirectInput")]
