@@ -25,8 +25,10 @@ from __future__ import annotations
 
 # Built-in
 import contextlib
+import hashlib
 import math
 import os
+import tempfile
 import time
 from typing import Any
 
@@ -80,6 +82,8 @@ _FIT_TOLERANCE = 0.002
 # counted as drawn.
 _DRAWN_THRESHOLD = 30
 _BLANK_FRACTION = 0.0005
+
+_LIGHTING = ("headlight", "viewport")
 
 _VIEW_KEYS = {
     "name",
@@ -756,12 +760,16 @@ def _isolated_objects(isolate: bool | list[str], described: list[str]) -> list[s
 
 
 def _pixel_facts(path: str, rect: list[float] | None) -> dict[str, Any]:
-    """Size of the written image and how much of *rect* is drawn on.
+    """Size of the written image, how much of *rect* is drawn on, and where.
 
-    The background is the median of the side edges (the HUD sits in the
-    corners, and a framed target leaves the margin clear); a pixel counts as
-    drawn when it differs from it by more than _DRAWN_THRESHOLD. Without a
-    rect the whole image is checked.
+    The flipbook writes the background transparent (measured on 22.0.368),
+    so a pixel with any alpha is drawn. An image without transparency falls
+    back to colour: the background is the median of the side edges (the HUD
+    sits in the corners, and a framed target leaves the margin clear) and a
+    pixel counts as drawn when it differs from it by more than
+    _DRAWN_THRESHOLD. Without a rect the whole image is checked.
+    content_rect is the box of the drawn pixels inside the rect (the sheet
+    crops to it).
     """
     try:
         import numpy as np
@@ -775,14 +783,11 @@ def _pixel_facts(path: str, rect: list[float] | None) -> dict[str, Any]:
     image = QtGui.QImage(path)
     if image.isNull():
         return {"readable": False}
-    image = image.convertToFormat(QtGui.QImage.Format_RGB32)
+    image = image.convertToFormat(QtGui.QImage.Format_ARGB32)
     w, h = image.width(), image.height()
     raw = np.frombuffer(image.constBits(), dtype=np.uint8, count=image.sizeInBytes())
-    pixels = raw.reshape(h, image.bytesPerLine())[:, : w * 4].reshape(h, w, 4)[:, :, :3]
-    pixels = pixels.astype(np.int16)
-    lo, hi = int(h * 0.2), max(int(h * 0.8), int(h * 0.2) + 1)
-    edges = np.concatenate([pixels[lo:hi, 0], pixels[lo:hi, w - 1]])
-    background = np.median(edges, axis=0)
+    # ARGB32 is B, G, R, A in memory.
+    channels = raw.reshape(h, image.bytesPerLine())[:, : w * 4].reshape(h, w, 4)
     if rect is None:
         x0, y0, x1, y1 = 0, 0, w, h
     else:
@@ -790,14 +795,50 @@ def _pixel_facts(path: str, rect: list[float] | None) -> dict[str, Any]:
         y0 = min(max(int(math.floor(rect[1])), 0), h - 1)
         x1 = min(max(int(math.ceil(rect[2])), x0 + 1), w)
         y1 = min(max(int(math.ceil(rect[3])), y0 + 1), h)
-    drawn = np.abs(pixels[y0:y1, x0:x1] - background).sum(axis=2) > _DRAWN_THRESHOLD
-    return {"readable": True, "pixels": [w, h], "drawn_fraction": round(float(drawn.mean()), 4)}
+    alpha = channels[:, :, 3]
+    if (alpha < 255).any():
+        drawn = alpha[y0:y1, x0:x1] > 0
+    else:
+        pixels = channels[:, :, :3].astype(np.int16)
+        lo, hi = int(h * 0.2), max(int(h * 0.8), int(h * 0.2) + 1)
+        edges = np.concatenate([pixels[lo:hi, 0], pixels[lo:hi, w - 1]])
+        background = np.median(edges, axis=0)
+        drawn = np.abs(pixels[y0:y1, x0:x1] - background).sum(axis=2) > _DRAWN_THRESHOLD
+    facts: dict[str, Any] = {
+        "readable": True,
+        "pixels": [w, h],
+        "drawn_fraction": round(float(drawn.mean()), 4),
+    }
+    ys, xs = np.nonzero(drawn)
+    if len(xs):
+        facts["content_rect"] = [
+            int(xs.min()) + x0,
+            int(ys.min()) + y0,
+            int(xs.max()) + x0 + 1,
+            int(ys.max()) + y0 + 1,
+        ]
+    return facts
 
 
 def _shoot(
-    scene_viewer, viewport, state, base, view, corners, path, max_size, margin, visible, fixed=None
+    scene_viewer,
+    viewport,
+    state,
+    base,
+    view,
+    corners,
+    path,
+    max_size,
+    margin,
+    visible,
+    fixed=None,
+    prepare=None,
 ):
-    """One flipbook. *fixed* ({"camera", "pixels"}) replays a stored camera as is."""
+    """One flipbook. *fixed* ({"camera", "pixels"}) replays a stored camera as is.
+
+    *prepare*, when given, is called with the placed camera just before the
+    flipbook (the zebra matcap depends on where the camera looks).
+    """
     size = viewport.size()
     width, height = float(size[2]), float(size[3])
     rect = None
@@ -881,6 +922,8 @@ def _shoot(
             ]
 
     shot["isolated"] = visible
+    if prepare is not None:
+        prepare(placed)
     written, facts, retried = _flipbook_checked(
         scene_viewer, viewport, path, out_w, out_h, visible, rect
     )
@@ -902,7 +945,11 @@ _CAMERA_KEYS = ("axes", "pivot", "t", "ortho", "ortho_width", "focal", "aperture
 
 
 def _flipbook_checked(scene_viewer, viewport, path, out_w, out_h, visible, rect):
-    """Flipbook and read the pixels back; one redraw and retry on a blank frame."""
+    """Flipbook and read the pixels back; one redraw and retry on a blank frame.
+
+    Then the transparent background is filled with the viewport's own (see
+    extras.flatten), so every image, alone or on a sheet, has the same one.
+    """
     written = _flipbook(scene_viewer, viewport, path, out_w, out_h, visible)
     facts = _pixel_facts(written, rect) if os.path.isfile(written) else {"readable": False}
     retried = False
@@ -915,7 +962,111 @@ def _flipbook_checked(scene_viewer, viewport, path, out_w, out_h, visible, rect)
         written = _flipbook(scene_viewer, viewport, path, out_w, out_h, visible)
         facts = _pixel_facts(written, rect) if os.path.isfile(written) else {"readable": False}
         retried = True
+    if facts.get("readable"):
+        top, bottom = _background_colours(viewport)
+        try:
+            extras.flatten(written, top, bottom)
+        except Exception as exc:  # noqa: BLE001 - reported with the shot
+            facts["background_problem"] = f"{type(exc).__name__}: {exc}"
     return written, facts, retried
+
+
+def _background_colours(viewport) -> tuple[tuple, tuple]:
+    """Top and bottom background colours of the viewport's colour scheme."""
+    settings = viewport.settings()
+    colours = []
+    for name, fallback in (("BackgroundColor", 0.3), ("BackgroundBottomColor", 0.25)):
+        try:
+            colours.append(tuple(settings.colorFromName(name).rgb()))
+        except Exception:  # noqa: BLE001 - a scheme without the entry
+            colours.append((fallback,) * 3)
+    return colours[0], colours[1]
+
+
+###### Lighting: headlight and zebra matcaps
+
+_MATCAP_DIR = os.path.join(tempfile.gettempdir(), "fxhoudinimcp_matcaps")
+
+
+def _read_look(viewport) -> dict[str, Any]:
+    """The viewport settings a matcap capture changes."""
+    settings = viewport.settings()
+    return {
+        "material_type": settings.getDefaultMaterialType(),
+        "matcap": settings.getDefaultMaterialMatCapFile(),
+        "matcap_intensity": float(settings.getDefaultMaterialMatCapIntensity()),
+        "materials": bool(settings.showingMaterials()),
+    }
+
+
+def _use_matcap(viewport, path: str) -> None:
+    """Draw every surface with the default material as the matcap at *path*; read it back.
+
+    Material display goes off for the shot, so a part with a material gets
+    the same light as one without.
+    """
+    settings = viewport.settings()
+    settings.setDefaultMaterialType(hou.viewportDefaultMaterial.MatCap)
+    settings.setDefaultMaterialMatCapFile(path)
+    settings.setDefaultMaterialMatCapIntensity(1.0)
+    settings.showMaterials(False)
+    look = _read_look(viewport)
+    if (
+        look["material_type"] != hou.viewportDefaultMaterial.MatCap
+        or os.path.normcase(look["matcap"]) != os.path.normcase(path)
+        or look["materials"]
+    ):
+        raise RuntimeError(f"the viewport did not take the matcap {path}: {look}")
+
+
+def _restore_look(viewport, look: dict[str, Any]) -> list[str]:
+    problems: list[str] = []
+    settings = viewport.settings()
+    try:
+        settings.setDefaultMaterialMatCapFile(look["matcap"])
+        settings.setDefaultMaterialMatCapIntensity(look["matcap_intensity"])
+        settings.setDefaultMaterialType(look["material_type"])
+        settings.showMaterials(look["materials"])
+    except Exception as exc:  # noqa: BLE001 - reported
+        problems.append(f"default material: {exc}")
+    return problems
+
+
+def _look_mismatches(viewport, look: dict[str, Any]) -> list[str]:
+    now = _read_look(viewport)
+    return [
+        f"{key} is {now[key]}, was {look[key]}"
+        for key in look
+        if (now[key] != look[key] if key != "matcap_intensity" else not _close(now[key], look[key]))
+    ]
+
+
+def _headlight_file() -> str:
+    """The headlight matcap, written once per set of constants."""
+    tag = hashlib.sha1(repr((extras.HEADLIGHT, extras.MATCAP_SIZE)).encode("utf-8")).hexdigest()[
+        :10
+    ]
+    path = os.path.join(_MATCAP_DIR, f"headlight_{tag}.png").replace("\\", "/")
+    if not os.path.isfile(path):
+        os.makedirs(_MATCAP_DIR, exist_ok=True)
+        extras.write_grey(extras.headlight_matcap(), path)
+    return path
+
+
+def _zebra_file(axes, zebra: dict[str, Any]) -> str:
+    """The zebra matcap for a camera: the world direction turned into camera space.
+
+    One file per direction (a new path, so the viewport cannot show a cached
+    texture from the previous view).
+    """
+    d = extras.camera_direction(axes, zebra["direction"])
+    key = repr(([round(c, 4) for c in d], int(zebra["stripes"]), extras.ZEBRA_BANDS))
+    tag = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    path = os.path.join(_MATCAP_DIR, f"zebra_{tag}.png").replace("\\", "/")
+    if not os.path.isfile(path):
+        os.makedirs(_MATCAP_DIR, exist_ok=True)
+        extras.write_grey(extras.zebra_matcap(d, zebra["stripes"]), path)
+    return path
 
 
 def _drawn(scene_viewer) -> dict[str, Any]:
@@ -957,11 +1108,7 @@ def _make_proxy(sops: list, chain: dict[str, Any] | None = None) -> tuple[Any, d
                 merge.parm(f"objpath{i}").set(node.path())
             merge.parm("xformtype").set("local")
             measure, out = extras.build_chain(
-                proxy,
-                merge,
-                chain.get("clip"),
-                chain.get("overlays") or [],
-                chain.get("zebra") or {},
+                proxy, merge, chain.get("clip"), chain.get("overlays") or []
             )
             out.setDisplayFlag(True)
             out.setRenderFlag(True)
@@ -1193,6 +1340,7 @@ def capture_viewport(
     sheet_max: int = 2000,
     min_edge_px: float = 6.0,
     replay: str | None = None,
+    lighting: str | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Flipbook the Scene Viewer from one or more views, framed on a target.
@@ -1210,7 +1358,16 @@ def capture_viewport(
 
     Every call writes <prefix>_shots.json (the solved cameras); replay reads
     one back and shoots the same views again. Several views are also laid out
-    on <prefix>_sheet.png.
+    on <prefix>_sheet.png, each cell cropped to the drawn target.
+
+    lighting "headlight" (default) draws every surface with a matcap lit from
+    the camera, so a face turned to the camera is bright from any side and
+    the wiring reads on the underside too. The viewport's own lights are not
+    used for it: on 22.0.368 the work light's headAltitude/headAzimuth and
+    headlightDirection change nothing in the drawn image, the light stays
+    over the shoulder. "viewport" keeps the viewer's lighting and materials.
+    The zebra overlay is a matcap too, so it is per pixel on the mesh as is.
+    Default material, matcap and material display are put back and read back.
     """
     started = time.perf_counter()
     if not isinstance(max_size, int) or isinstance(max_size, bool) or not 256 <= max_size <= 4096:
@@ -1242,15 +1399,13 @@ def capture_viewport(
         zebra = record.get("zebra") or zebra
         shading = record.get("shading") if shading is None else shading
         isolate = record.get("isolate", isolate)
+        lighting = record.get("lighting") if lighting is None else lighting
+    lighting = "headlight" if lighting is None else str(lighting).lower()
+    if lighting not in _LIGHTING:
+        raise ValueError(f"lighting must be one of {list(_LIGHTING)}, not {lighting!r}")
     overlays = extras.parse_overlays(overlays)
     if shading is not None and str(shading).lower() not in _SHADING_NAMES:
         raise ValueError(f"unknown shading {shading!r}; use one of {sorted(_SHADING_NAMES)}")
-    shading_note = None
-    if "zebra" in overlays and (shading is None or "wire" in str(shading).lower()):
-        # Zebra shades a subdivided copy; its wires would bury the bands. The
-        # original edges are drawn as lines instead.
-        shading_note = f"zebra: shading set to smooth (asked {shading}); edges drawn as lines"
-        shading = "smooth"
     region = extras.parse_region(region)
     if compare is not None:
         source = hou.node(str(compare))
@@ -1334,10 +1489,26 @@ def capture_viewport(
     }
     if overlays:
         result["overlays"] = {o: extras.OVERLAY_LEGEND[o] for o in overlays}
-    if shading_note:
-        result["shading_note"] = shading_note
     shot_list: list[dict[str, Any]] = []
+    # Default material, matcap and material display as found; put back after
+    # a headlight or zebra capture whatever restore_view says.
+    look = _read_look(viewport)
+    look_changed = False
+    use_zebra = "zebra" in overlays
+    result["lighting"] = {"mode": lighting}
+    if use_zebra:
+        result["lighting"]["zebra"] = "each view is drawn with its own zebra matcap instead"
     try:
+        if lighting == "headlight" or use_zebra:
+            look_changed = True
+            if lighting == "headlight":
+                result["lighting"]["matcap"] = _headlight_file()
+                _use_matcap(viewport, result["lighting"]["matcap"])
+
+        def prepare(placed):
+            if use_zebra:
+                _use_matcap(viewport, _zebra_file(placed["axes"], zebra))
+
         if state["camera_node"] is not None or state["camera_path"]:
             # A camera node's resolution and aspect would decide the frame, and
             # moving the view would move the camera. The viewport's own camera
@@ -1372,7 +1543,7 @@ def capture_viewport(
                     elevation=elevation,
                     projection=spec["projection"] or "persp",
                 )
-            chain = {"clip": shape, "overlays": overlays, "zebra": zebra}
+            chain = {"clip": shape, "overlays": overlays}
             force_proxy = bool(shape or overlays or compare)
             shot_proxies: list[str] = []
             proxies += [shot_proxies]
@@ -1430,6 +1601,7 @@ def capture_viewport(
                 float(margin),
                 visible,
                 stored,
+                prepare,
             )
             if spec["direction"] == "facing":
                 shot["direction"] = {
@@ -1492,6 +1664,12 @@ def capture_viewport(
         )
         if restore_view:
             restore_problems = _restore_state(viewport, state, base) + restore_problems
+        if look_changed:
+            look_problems = _restore_look(viewport, look) + _look_mismatches(viewport, look)
+            result["lighting"]["restored"] = not look_problems
+            if look_problems:
+                result["lighting"]["restore_mismatches"] = look_problems
+            restore_problems += look_problems
 
     if shot_list:
         shots_path = os.path.join(output_dir, f"{stem}_shots.json").replace("\\", "/")
@@ -1505,6 +1683,7 @@ def capture_viewport(
                 "overlays": overlays,
                 "zebra": zebra,
                 "shading": shading,
+                "lighting": lighting,
                 "isolate": isolate,
                 "margin": margin,
                 "shots": shot_list,
@@ -1528,6 +1707,10 @@ def capture_viewport(
             result["problems"].append(f"{shot['name']}: nothing is drawn where the target is")
         if shot.get("target_in_frame") is False:
             result["problems"].append(f"{shot['name']}: the target is not fully in frame")
+        if shot.get("background_problem"):
+            result["problems"].append(
+                f"{shot['name']}: background not filled: {shot['background_problem']}"
+            )
         if (shot.get("drawn") or {}).get("clipped_prims") == 0:
             result["problems"].append(f"{shot['name']}: the clip region holds no faces")
         pair = shot.get("compare") or {}
@@ -1629,9 +1812,14 @@ def _make_sheet(
         return
     cells = []
     for shot in shots:
-        image = (shot.get("compare") or {}).get("image") or shot["path"]
+        pair = (shot.get("compare") or {}).get("image")
         label = f"{shot['name']}   az {shot['azimuth']:g}  el {shot['elevation']:g}"
-        cells.append({"path": image, "label": label, "shot": shot})
+        cell = {"path": pair or shot["path"], "label": label, "shot": shot}
+        if not pair:
+            # The cell shows the drawn target and a small border, not the
+            # framing margin and the slack of the box corners around it.
+            cell["crop"] = extras.crop_box(shot.get("content_rect"), shot["pixels"])
+        cells.append(cell)
     header_bits = []
     if compare:
         header_bits.append("each cell: SOURCE left, RESULT right")
@@ -1644,8 +1832,12 @@ def _make_sheet(
         sizes = []
         _, QtGui = extras._qt()
         for cell in cells:
-            image = QtGui.QImage(cell["path"])
-            sizes.append((image.width(), image.height()))
+            crop = cell.get("crop")
+            if crop:
+                sizes.append((crop[2] - crop[0], crop[3] - crop[1]))
+            else:
+                image = QtGui.QImage(cell["path"])
+                sizes.append((image.width(), image.height()))
         head = extras.LABEL_H if header_bits else 0
         layout = extras.sheet_layout(sizes, sheet_max - head, columns)
         for cell, scale in zip(cells, layout["scales"], strict=True):
@@ -1657,6 +1849,8 @@ def _make_sheet(
                 cell["label"] += f"   edge {shot['sheet_edge_px']:g}px"
                 cell["warn"] = shot["sheet_edge_px"] < min_edge_px
             shot["sheet_scale"] = round(scale, 4)
+            if cell.get("crop"):
+                shot["sheet_crop"] = cell["crop"]
         composed = extras.compose_sheet(
             cells, path, sheet_max, columns, "   |   ".join(header_bits) or None
         )

@@ -34,8 +34,18 @@ OVERLAY_LEGEND = {
     "ngons": "n-gons magenta",
     "poles": "poles: 3-edge cyan, 5+-edge orange",
     "stretch": "stretch: grey (aspect <= 1.5) to red (>= 4)",
-    "zebra": "zebra: black/white bands of N . direction",
+    "zebra": "zebra: black/white bands of N . direction, per pixel",
 }
+
+# Headlight matcap: brightness from how squarely a surface faces the light,
+# which sits just left of the camera. Straight on is `high`, edge-on `low`.
+# The floor keeps every face well above the Wire Shaded line colour (0.2 in
+# the stock schemes), so the wiring reads on the dark side too; the light is
+# off-axis sideways so the two sides of a corner seen at 45 degrees differ.
+HEADLIGHT = {"low": 0.42, "high": 0.88, "light": (-0.34, 0.0, 0.94)}
+ZEBRA_BANDS = (0.06, 1.0)
+MATCAP_SIZE = 256
+ZEBRA_MATCAP_SIZE = 512
 
 REGION_KEYS = {"bbox", "center", "radius", "group", "prims", "node"}
 
@@ -251,6 +261,82 @@ def sheet_layout(
     }
 
 
+def crop_box(content, size, pad_fraction: float = 0.03) -> list[int] | None:
+    """Pixel box [x0, y0, x1, y1] (x1/y1 exclusive) around *content*, padded, inside the image.
+
+    *content* is the drawn target's pixel box; the crop always holds all of
+    it. None when there is nothing to crop to.
+    """
+    if not content:
+        return None
+    w, h = int(size[0]), int(size[1])
+    pad = max(4, round(max(w, h) * pad_fraction))
+    x0 = max(0, int(math.floor(content[0])) - pad)
+    y0 = max(0, int(math.floor(content[1])) - pad)
+    x1 = min(w, int(math.ceil(content[2])) + pad)
+    y1 = min(h, int(math.ceil(content[3])) + pad)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    return [x0, y0, x1, y1]
+
+
+def camera_direction(axes, direction) -> list[float]:
+    """*direction* (world) in camera space: components along right, up, back."""
+    d = [float(c) for c in direction]
+    length = math.sqrt(sum(c * c for c in d)) or 1.0
+    d = [c / length for c in d]
+    return [sum(axes[i][j] * d[j] for j in range(3)) for i in range(3)]
+
+
+def _matcap_normals(size: int):
+    """Camera-space normal per matcap texel.
+
+    Measured on 22.0.368: texel column follows the normal's x (left to
+    right), texel row its y (top of the image is +y), values are used as
+    stored. Texels outside the disc take the rim normal, so a silhouette
+    never samples a seam.
+    """
+    import numpy as np
+
+    centres = (np.arange(size) + 0.5) / size * 2.0 - 1.0
+    nx, ny = np.meshgrid(centres, -centres)
+    r = np.hypot(nx, ny)
+    over = r > 1.0
+    nx = np.where(over, nx / np.maximum(r, 1e-9), nx)
+    ny = np.where(over, ny / np.maximum(r, 1e-9), ny)
+    nz = np.sqrt(np.clip(1.0 - nx * nx - ny * ny, 0.0, 1.0))
+    return nx, ny, nz
+
+
+def headlight_matcap(size: int = MATCAP_SIZE):
+    """(size, size) grey levels 0..1 of the headlight matcap."""
+    import numpy as np
+
+    nx, ny, nz = _matcap_normals(size)
+    lx, ly, lz = HEADLIGHT["light"]
+    length = math.sqrt(lx * lx + ly * ly + lz * lz)
+    facing = np.clip((nx * lx + ny * ly + nz * lz) / length, 0.0, 1.0)
+    return HEADLIGHT["low"] + (HEADLIGHT["high"] - HEADLIGHT["low"]) * facing
+
+
+def zebra_matcap(direction_camera, stripes: int, size: int = ZEBRA_MATCAP_SIZE):
+    """(size, size) grey levels of bands of N . direction, direction in camera space.
+
+    The viewport looks the matcap up per pixel with the mesh's interpolated
+    normal, so the bands follow the surface being checked, not a denser copy.
+    Bands are shifted a quarter period: a face square to the direction (N . d
+    of -1, 0 or 1) sits in the middle of a band, not on a band edge where the
+    smallest wobble of its normal would flip it.
+    """
+    import numpy as np
+
+    nx, ny, nz = _matcap_normals(size)
+    d = direction_camera
+    value = nx * d[0] + ny * d[1] + nz * d[2]
+    band = np.mod((value + 1.0) * 0.5 * int(stripes) + 0.25, 1.0) < 0.5
+    return np.where(band, ZEBRA_BANDS[0], ZEBRA_BANDS[1])
+
+
 def edge_pixels(segments, params: dict[str, Any], width, height, out_w) -> dict[str, Any] | None:
     """Projected length of edges, in output-image pixels.
 
@@ -367,20 +453,6 @@ f@__aspect = aspect;"""
     return "\n".join(lines)
 
 
-def zebra_vex(direction, stripes: int) -> str:
-    """Vertex wrangle multiplying v@Cd by black/white bands of dot(N, direction)."""
-    d = [float(c) for c in direction]
-    length = math.sqrt(sum(c * c for c in d)) or 1.0
-    d = [c / length for c in d]
-    return (
-        f"vector dir = set({d[0]!r}, {d[1]!r}, {d[2]!r});\n"
-        "vector n = normalize(v@N);\n"
-        f"float s = (dot(n, dir) + 1.0) * 0.5 * {int(stripes)};\n"
-        "float band = frac(s) < 0.5 ? 0.06 : 1.0;\n"
-        'v@Cd = (haspointattrib(0, "Cd") || hasvertexattrib(0, "Cd") ? v@Cd : {1,1,1}) * band;\n'
-    )
-
-
 def clip_vex(clip: dict[str, Any]) -> str:
     """Primitive wrangle removing faces with no point and no centroid in the clip volume."""
     if clip["shape"] == "sphere":
@@ -445,6 +517,49 @@ def _font(QtGui, size: int):
     return font
 
 
+def write_grey(values, path: str) -> str:
+    """Save a (h, w) array of grey levels 0..1 as an opaque PNG."""
+    import numpy as np
+
+    _, QtGui = _qt()
+    grey = np.clip(np.round(np.asarray(values, float) * 255.0), 0, 255).astype(np.uint8)
+    h, w = grey.shape
+    rgba = np.empty((h, w, 4), np.uint8)
+    rgba[..., 0] = rgba[..., 1] = rgba[..., 2] = grey
+    rgba[..., 3] = 255
+    image = QtGui.QImage(rgba.data, w, h, w * 4, QtGui.QImage.Format_ARGB32).copy()
+    if not image.save(path):
+        raise RuntimeError(f"could not write {path}")
+    return path
+
+
+def flatten(path: str, top, bottom) -> bool:
+    """Put a flipbook image over the viewport's background, top to bottom gradient.
+
+    The flipbook writes the background as transparent: an image viewer shows
+    it white or checkered while a sheet cell shows the sheet's own fill. Over
+    the scheme's own colours every image looks like the viewport. Returns
+    whether anything was transparent.
+    """
+    QtCore, QtGui = _qt()
+    image = QtGui.QImage(path)
+    if image.isNull() or not image.hasAlphaChannel():
+        return False
+    flat = QtGui.QImage(image.width(), image.height(), QtGui.QImage.Format_RGB32)
+    gradient = QtGui.QLinearGradient(0, 0, 0, image.height())
+    gradient.setColorAt(0.0, QtGui.QColor.fromRgbF(*top))
+    gradient.setColorAt(1.0, QtGui.QColor.fromRgbF(*bottom))
+    painter = QtGui.QPainter(flat)
+    try:
+        painter.fillRect(flat.rect(), QtGui.QBrush(gradient))
+        painter.drawImage(0, 0, image)
+    finally:
+        painter.end()
+    if not flat.save(path):
+        raise RuntimeError(f"could not write {path}")
+    return True
+
+
 def compose_pair(left: str, right: str, labels: tuple[str, str], path: str) -> dict[str, Any]:
     """Two same-camera images side by side, each with a label strip above."""
     QtCore, QtGui = _qt()
@@ -480,12 +595,21 @@ def compose_pair(left: str, right: str, labels: tuple[str, str], path: str) -> d
 def compose_sheet(
     cells: list[dict[str, Any]], path: str, max_side: int, columns: int | None, header: str | None
 ) -> dict[str, Any]:
-    """Contact sheet: each cell {path, label}; returns layout and per-cell scale."""
+    """Contact sheet: each cell {path, label, crop?}; returns layout and per-cell scale.
+
+    crop ([x0, y0, x1, y1], see crop_box) trims the empty border around the
+    target so it fills more of its cell.
+    """
     QtCore, QtGui = _qt()
-    images = [QtGui.QImage(cell["path"]) for cell in cells]
-    for cell, image in zip(cells, images, strict=True):
+    images = []
+    for cell in cells:
+        image = QtGui.QImage(cell["path"])
         if image.isNull():
             raise RuntimeError(f"cannot read {cell['path']}")
+        crop = cell.get("crop")
+        if crop:
+            image = image.copy(QtCore.QRect(crop[0], crop[1], crop[2] - crop[0], crop[3] - crop[1]))
+        images.append(image)
     head = LABEL_H if header else 0
     layout = sheet_layout([(im.width(), im.height()) for im in images], max_side - head, columns)
     width, height = layout["size"]
@@ -641,14 +765,13 @@ def region_facts(region: dict[str, Any], default_node) -> dict[str, Any]:
     }
 
 
-def build_chain(proxy, merge, clip: dict[str, Any] | None, overlays: list[str], zebra: dict):
+def build_chain(proxy, merge, clip: dict[str, Any] | None, overlays: list[str]):
     """Clip and overlay nodes after *merge* inside *proxy*; returns (measure, out).
 
     measure is the clipped geometry (what the edge metric reads), out the
-    node that gets the display flag. Zebra needs a denser surface than a
-    retopo cage for its bands to read, so it shades a bilinear subdivision
-    (same shape) and draws the original edges on top as lines; the caller
-    switches wire shading off for it.
+    node that gets the display flag. Zebra is not in the chain: it is a
+    matcap the viewport applies per pixel (see zebra_matcap), and the
+    geometry is left as it is.
     """
     node = merge
     if clip is not None:
@@ -662,47 +785,12 @@ def build_chain(proxy, merge, clip: dict[str, Any] | None, overlays: list[str], 
         node = cut
     measure = node
     faces = [o for o in overlays if o not in ("zebra", "poles")]
-    if not overlays:
-        return measure, node
-    if "zebra" in overlays:
-        normal = proxy.createNode("normal", "zebra_normals")
-        normal.setInput(0, node)
-        normal.parm("type").set("typevertex")
-        node = normal
     if faces:
         wv = proxy.createNode("attribwrangle", "face_colours")
         wv.setInput(0, node)
         wv.parm("class").set("vertex")
         wv.parm("snippet").set(vertex_vex(faces))
         node = wv
-    if "zebra" in overlays:
-        count = max(1, measure.geometry().intrinsicValue("primitivecount"))
-        depth = 3
-        while depth > 0 and count * 4**depth > 1_500_000:
-            depth -= 1
-        surface = node
-        if depth:
-            sub = proxy.createNode("subdivide", "zebra_dense")
-            sub.setInput(0, node)
-            sub.parm("algorithm").set("osdbilinear")
-            sub.parm("iterations").set(depth)
-            with contextlib.suppress(Exception):
-                sub.parm("updatenmls").set(False)
-            surface = sub
-        wz = proxy.createNode("attribwrangle", "zebra_bands")
-        wz.setInput(0, surface)
-        wz.parm("class").set("vertex")
-        wz.parm("snippet").set(zebra_vex(zebra["direction"], zebra["stripes"]))
-        lines = proxy.createNode("convertline", "zebra_edges")
-        lines.setInput(0, measure)
-        dark = proxy.createNode("attribwrangle", "zebra_edge_colour")
-        dark.setInput(0, lines)
-        dark.parm("class").set("point")
-        dark.parm("snippet").set("v@Cd = {0.95, 0.35, 0.1};")
-        both = proxy.createNode("merge", "zebra_with_edges")
-        both.setInput(0, wz)
-        both.setInput(1, dark)
-        node = both
     if "poles" in overlays:
         # Poles as small spheres on the points: a vertex colour would bleed
         # across every face around the point and hide the face colours.

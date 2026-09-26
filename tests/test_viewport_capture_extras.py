@@ -96,9 +96,10 @@ class TestOverlays:
         assert "nv == 3" in code and "nv > 4" not in code and "aspect" not in code
         assert "aspect" in ex.vertex_vex(["stretch"])
 
-    def test_zebra_direction_is_normalised(self):
-        code = ex.zebra_vex([0, 2, 0], 10)
-        assert "set(0.0, 1.0, 0.0)" in code and "* 10" in code
+    def test_zebra_is_not_in_the_node_chain(self):
+        # Zebra is a per-pixel matcap now: no subdivided copy, no VEX bands.
+        assert not hasattr(ex, "zebra_vex")
+        assert "zebra" not in ex.vertex_vex(["triangles", "ngons"])
 
     def test_clip_vex_keeps_a_face_by_any_point_or_its_centroid(self):
         code = ex.clip_vex({"shape": "box", "bbox": [0, 0, 0, 1, 2, 3]})
@@ -158,6 +159,51 @@ class TestDominantNormal:
 
     def test_nothing_to_face(self):
         assert ex.dominant_normal([], []) is None
+
+
+class TestCropAndDirection:
+    def test_the_crop_holds_the_content_with_a_border(self):
+        crop = ex.crop_box([200, 100, 800, 500], (1000, 600))
+        assert crop == [170, 70, 830, 530]
+        assert crop[0] <= 200 and crop[1] <= 100 and crop[2] >= 800 and crop[3] >= 500
+
+    def test_the_crop_stays_inside_the_image(self):
+        assert ex.crop_box([2, 0, 999, 600], (1000, 600)) == [0, 0, 1000, 600]
+        assert ex.crop_box(None, (1000, 600)) is None
+
+    def test_world_direction_in_camera_space(self):
+        front = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+        assert ex.camera_direction(front, [0, 2, 0]) == pytest.approx([0, 1, 0])
+        # Looking from +X (the Right view): world +X points back at the camera.
+        right = vc.view_rotation(90, 0)
+        assert ex.camera_direction(right, [1, 0, 0]) == pytest.approx([0, 0, 1], abs=1e-9)
+
+
+@needs_numpy
+class TestMatcaps:
+    def test_headlight_is_brightest_facing_the_camera_and_never_dark(self):
+        values = ex.headlight_matcap(64)
+        centre = values[32, 32]
+        rim = values[32, 0], values[32, 63], values[0, 32], values[63, 32]
+        assert centre > max(rim)
+        assert values.min() >= ex.HEADLIGHT["low"] - 1e-9
+        assert values.max() <= ex.HEADLIGHT["high"] + 1e-9
+        # The light is left of the camera: the left rim is lit more than the right.
+        assert values[32, 8] > values[32, 55]
+
+    def test_zebra_bands_follow_the_direction_in_camera_space(self):
+        up = ex.zebra_matcap([0, 1, 0], 8, 128)
+        # Bands of N . up are horizontal in the matcap: constant along a row.
+        assert (up[40] == up[40, 64]).all()
+        assert set(up.ravel().tolist()) == set(ex.ZEBRA_BANDS)
+        side = ex.zebra_matcap([1, 0, 0], 8, 128)
+        assert (side[:, 40] == side[64, 40]).all()
+
+    def test_a_face_square_to_the_direction_sits_mid_band(self):
+        # The centre texel is N = (0, 0, 1): N . d = 1 for d along the view.
+        # Its neighbours stay in the same band, so a flat face does not flicker.
+        values = ex.zebra_matcap([0, 0, 1], 16, 256)
+        assert (values[120:136, 120:136] == values[128, 128]).all()
 
 
 class TestSheetLayout:
@@ -264,6 +310,7 @@ class TestHandlerRefusals:
             ({"sheet_max": 100}, "sheet_max"),
             ({"zebra_stripes": 0}, "zebra_stripes"),
             ({"zebra_direction": [0, 0, 0]}, "zebra_direction"),
+            ({"lighting": "studio"}, "lighting"),
             ({"region": {"prims": []}}, "prims"),
             ({"views": [{"direction": "facing", "region": "x"}]}, "dict"),
             ({"replay": "x.json", "views": ["front"]}, "replay"),
@@ -297,3 +344,12 @@ class TestWrapper:
         assert params["clip"] is True and params["compare"] == "/obj/a/SRC"
         assert params["overlays"] == ["zebra"] and params["orbit"] is True
         assert "replay" not in params and params["sheet_max"] == 2000
+        assert "lighting" not in params
+
+    @pytest.mark.asyncio
+    async def test_lighting_is_passed_through(self, mock_ctx, mock_bridge):
+        from fxhoudinimcp.tools.viewport_capture import capture_viewport
+
+        await capture_viewport(mock_ctx, "C:/tmp/shots", lighting="viewport")
+        _, params = mock_bridge.execute.call_args.args
+        assert params["lighting"] == "viewport"

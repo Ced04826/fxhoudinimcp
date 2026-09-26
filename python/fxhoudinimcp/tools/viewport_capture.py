@@ -40,6 +40,7 @@ async def capture_viewport(
     sheet_max: int = 2000,
     min_edge_px: float = 6.0,
     replay: str | None = None,
+    lighting: str | None = None,
 ) -> dict:
     """Capture what the Scene Viewer shows, from several views in one call,
     each framed so the target is whole and fills the image.
@@ -82,6 +83,12 @@ async def capture_viewport(
     (long side sheet_max), each cell labelled with its view name, azimuth
     and elevation, and edge_px says how long an edge is on screen: below
     min_edge_px a warning says the wiring cannot be read there.
+
+    Surfaces are lit from the camera by default (lighting="headlight"): a
+    face turned to the camera is bright from any side, a face seen edge-on
+    darker but never so dark that the wire lines vanish, so the wiring of an
+    underside reads as well as the top. Every image has the viewport's
+    background, alone or on a sheet.
 
     Look at the images with your file reader; nothing is inlined.
 
@@ -138,14 +145,18 @@ async def capture_viewport(
         overlays: Any of "triangles" (blue), "ngons" (magenta), "poles"
             (interior points with other than 4 edges: 3 cyan, 5+ orange),
             "stretch" (face aspect, grey to red at 4:1), "zebra" (bands of
-            N . zebra_direction; shading becomes smooth and the edges are
-            drawn as lines). On the proxy object only. Default none.
+            N . zebra_direction per pixel, from the mesh's own interpolated
+            normals: the geometry is not subdivided or changed; pass
+            shading="smooth_wire" to see the edges over the bands). Face
+            colours and pole markers are on the proxy object only; zebra
+            replaces the headlight for the call. Default none.
         zebra_direction: Fixed direction for the zebra bands, default [0,1,0].
         zebra_stripes: Bands across the full normal range, default 16.
         orbit: True for rings at elevation 30 and -20 times 8 azimuths (16
             views), or {"elevations": [...], "azimuths": count or [...],
             "projection": ...}; added after views.
         sheet: Lay all views out on one PNG; default when there are several.
+            Each cell is cropped to the drawn target plus a small border.
         sheet_columns: Columns of the sheet; default about square.
         sheet_max: Long side of the sheet in pixels, default 2000 (what Read
             shows without shrinking).
@@ -154,6 +165,10 @@ async def capture_viewport(
         replay: Path of a <prefix>_shots.json: shoots its views again with
             the same cameras, targets, clip, overlays and compare; views,
             orbit, bbox and region are not taken.
+        lighting: "headlight" (default; a replay keeps the recorded one)
+            draws every surface with a matcap lit from the camera and
+            material display off, for the capture only. "viewport" keeps
+            the viewer's own lights, materials and default material.
 
     Returns per view: path, pixels, isolated (the objects drawn alone, or
     null), target_rect (image pixels, origin top
@@ -164,8 +179,10 @@ async def capture_viewport(
     projection, looking_along, pivot, and ortho_width or distance with
     fov_x_deg, azimuth/elevation, edge_px (mean/median/p10 on-screen edge
     length) and sheet_edge_px, region, clip (with drawn.clipped_prims),
-    compare (source image, pair image). Also shots_file, sheet (path,
-    pixels, columns, rows), overlays (legend) and warnings. success is false when an image is missing or blank where the
+    compare (source image, pair image), content_rect (image pixels of the
+    drawn target) and sheet_crop. Also shots_file, sheet (path, pixels,
+    columns, rows), overlays (legend), lighting (mode, matcap, restored)
+    and warnings. success is false when an image is missing or blank where the
     target is, a target is not fully in frame or not drawn, or the viewer
     could not be restored; problems says which.
     """
@@ -198,6 +215,7 @@ async def capture_viewport(
         ("sheet", sheet),
         ("sheet_columns", sheet_columns),
         ("replay", replay),
+        ("lighting", lighting),
     ):
         if value is not None:
             params[key] = value
