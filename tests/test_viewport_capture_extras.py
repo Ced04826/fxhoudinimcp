@@ -97,7 +97,7 @@ class TestOverlays:
         assert "aspect" in ex.vertex_vex(["stretch"])
 
     def test_zebra_is_not_in_the_node_chain(self):
-        # Zebra is a per-pixel matcap now: no subdivided copy, no VEX bands.
+        # Zebra is a per-pixel material: no subdivided copy, no VEX bands.
         assert not hasattr(ex, "zebra_vex")
         assert "zebra" not in ex.vertex_vex(["triangles", "ngons"])
 
@@ -171,13 +171,6 @@ class TestCropAndDirection:
         assert ex.crop_box([2, 0, 999, 600], (1000, 600)) == [0, 0, 1000, 600]
         assert ex.crop_box(None, (1000, 600)) is None
 
-    def test_world_direction_in_camera_space(self):
-        front = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
-        assert ex.camera_direction(front, [0, 2, 0]) == pytest.approx([0, 1, 0])
-        # Looking from +X (the Right view): world +X points back at the camera.
-        right = vc.view_rotation(90, 0)
-        assert ex.camera_direction(right, [1, 0, 0]) == pytest.approx([0, 0, 1], abs=1e-9)
-
 
 @needs_numpy
 class TestMatcaps:
@@ -191,19 +184,35 @@ class TestMatcaps:
         # The light is left of the camera: the left rim is lit more than the right.
         assert values[32, 8] > values[32, 55]
 
-    def test_zebra_bands_follow_the_direction_in_camera_space(self):
-        up = ex.zebra_matcap([0, 1, 0], 8, 128)
-        # Bands of N . up are horizontal in the matcap: constant along a row.
-        assert (up[40] == up[40, 64]).all()
-        assert set(up.ravel().tolist()) == set(ex.ZEBRA_BANDS)
-        side = ex.zebra_matcap([1, 0, 0], 8, 128)
-        assert (side[:, 40] == side[64, 40]).all()
 
-    def test_a_face_square_to_the_direction_sits_mid_band(self):
-        # The centre texel is N = (0, 0, 1): N . d = 1 for d along the view.
-        # Its neighbours stay in the same band, so a flat face does not flicker.
-        values = ex.zebra_matcap([0, 0, 1], 16, 256)
-        assert (values[120:136, 120:136] == values[128, 128]).all()
+class TestZebra:
+    def _tilted(self, degrees):
+        a = math.radians(degrees)
+        return [math.sin(a), math.cos(a), 0.0]
+
+    def test_faces_square_to_the_direction_sit_mid_light_band(self):
+        dark, light = ex.ZEBRA_BANDS
+        for normal in ([0, 1, 0], [0, -1, 0], [1, 0, 0], [0, 0, 2]):
+            assert ex.zebra_band(normal, [0, 3, 0], 16) == light
+        # A quarter band either side (180 / 16 / 4 degrees) stays light.
+        assert ex.zebra_band(self._tilted(2.5), [0, 1, 0], 16) == light
+        assert ex.zebra_band(self._tilted(92.5), [0, 1, 0], 16) == light
+
+    def test_bands_are_equal_angles_wide(self):
+        dark, light = ex.ZEBRA_BANDS
+        # 16 bands over 180 degrees: dark from 2.8125 to 8.4375, light again after.
+        assert ex.zebra_band(self._tilted(3.5), [0, 1, 0], 16) == dark
+        assert ex.zebra_band(self._tilted(8.0), [0, 1, 0], 16) == dark
+        assert ex.zebra_band(self._tilted(9.0), [0, 1, 0], 16) == light
+        # The same band widths near 90 degrees, where N . d moves fastest.
+        assert ex.zebra_band(self._tilted(93.5), [0, 1, 0], 16) == dark
+
+    def test_settings_normalise_and_reject_a_zero_direction(self):
+        s = ex.zebra_settings([0, 0, 5], 8)
+        assert s["direction"] == pytest.approx([0, 0, 1])
+        assert s["scale"] == pytest.approx(8 / math.pi)
+        with pytest.raises(ValueError, match="non-zero"):
+            ex.zebra_settings([0, 0, 0], 8)
 
 
 class TestSheetLayout:

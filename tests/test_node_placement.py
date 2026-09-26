@@ -423,11 +423,13 @@ _PLACEMENT_EXEMPT = {
     ("import_file", "lopnet"),
     ("import_file", "geo"),
     # capture_viewport's proxy object and its node chain (Object Merge, clip,
-    # overlays): drawn for one flipbook through the object mask and destroyed
-    # after the shot.
+    # overlays, the zebra material): drawn for one flipbook through the object
+    # mask and destroyed after the shot.
     ("_make_proxy", "obj_root"),
     ("_make_proxy", "proxy"),
     ("build_chain", "proxy"),
+    ("build_zebra_material", "proxy"),
+    ("build_zebra_material", "net"),
 }
 
 

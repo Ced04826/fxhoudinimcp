@@ -145,13 +145,20 @@ async def capture_viewport(
         overlays: Any of "triangles" (blue), "ngons" (magenta), "poles"
             (interior points with other than 4 edges: 3 cyan, 5+ orange),
             "stretch" (face aspect, grey to red at 4:1), "zebra" (bands of
-            N . zebra_direction per pixel, from the mesh's own interpolated
-            normals: the geometry is not subdivided or changed; pass
-            shading="smooth_wire" to see the edges over the bands). Face
-            colours and pole markers are on the proxy object only; zebra
-            replaces the headlight for the call. Default none.
-        zebra_direction: Fixed direction for the zebra bands, default [0,1,0].
-        zebra_stripes: Bands across the full normal range, default 16.
+            the angle between the normal and zebra_direction, per pixel, from
+            the mesh's own interpolated normals; the geometry is not
+            subdivided or changed). A face square to the direction is white,
+            so flat faces are one colour and a bump shows as rings; the
+            bands stay on the surface from every view. Pass
+            shading="smooth_wire" to see the edges over the bands. Face
+            colours and pole markers are on the proxy object only; the zebra
+            is a temporary MaterialX material on it, with material display
+            on for the call. Default none.
+        zebra_direction: World direction the zebra angle is measured from,
+            default [0,1,0].
+        zebra_stripes: Bands over 0-180 degrees, default 16 (each band
+            11.25 degrees, so a tilt of about 3 degrees off a flat face
+            turns it dark).
         orbit: True for rings at elevation 30 and -20 times 8 azimuths (16
             views), or {"elevations": [...], "azimuths": count or [...],
             "projection": ...}; added after views.

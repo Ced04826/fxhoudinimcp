@@ -832,13 +832,8 @@ def _shoot(
     margin,
     visible,
     fixed=None,
-    prepare=None,
 ):
-    """One flipbook. *fixed* ({"camera", "pixels"}) replays a stored camera as is.
-
-    *prepare*, when given, is called with the placed camera just before the
-    flipbook (the zebra matcap depends on where the camera looks).
-    """
+    """One flipbook. *fixed* ({"camera", "pixels"}) replays a stored camera as is."""
     size = viewport.size()
     width, height = float(size[2]), float(size[3])
     rect = None
@@ -922,8 +917,6 @@ def _shoot(
             ]
 
     shot["isolated"] = visible
-    if prepare is not None:
-        prepare(placed)
     written, facts, retried = _flipbook_checked(
         scene_viewer, viewport, path, out_w, out_h, visible, rect
     )
@@ -983,7 +976,7 @@ def _background_colours(viewport) -> tuple[tuple, tuple]:
     return colours[0], colours[1]
 
 
-###### Lighting: headlight and zebra matcaps
+###### Lighting: headlight matcap, material display for the zebra
 
 _MATCAP_DIR = os.path.join(tempfile.gettempdir(), "fxhoudinimcp_matcaps")
 
@@ -1053,20 +1046,16 @@ def _headlight_file() -> str:
     return path
 
 
-def _zebra_file(axes, zebra: dict[str, Any]) -> str:
-    """The zebra matcap for a camera: the world direction turned into camera space.
+def _show_materials(viewport) -> None:
+    """Material display on, read back: the zebra is a material on the proxy.
 
-    One file per direction (a new path, so the viewport cannot show a cached
-    texture from the previous view).
+    With a headlight capture the default material stays the headlight matcap,
+    so pole markers and anything else without a material keep that light.
     """
-    d = extras.camera_direction(axes, zebra["direction"])
-    key = repr(([round(c, 4) for c in d], int(zebra["stripes"]), extras.ZEBRA_BANDS))
-    tag = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-    path = os.path.join(_MATCAP_DIR, f"zebra_{tag}.png").replace("\\", "/")
-    if not os.path.isfile(path):
-        os.makedirs(_MATCAP_DIR, exist_ok=True)
-        extras.write_grey(extras.zebra_matcap(d, zebra["stripes"]), path)
-    return path
+    settings = viewport.settings()
+    settings.showMaterials(True)
+    if not settings.showingMaterials():
+        raise RuntimeError("the viewport did not turn material display on for the zebra")
 
 
 def _drawn(scene_viewer) -> dict[str, Any]:
@@ -1108,7 +1097,7 @@ def _make_proxy(sops: list, chain: dict[str, Any] | None = None) -> tuple[Any, d
                 merge.parm(f"objpath{i}").set(node.path())
             merge.parm("xformtype").set("local")
             measure, out = extras.build_chain(
-                proxy, merge, chain.get("clip"), chain.get("overlays") or []
+                proxy, merge, chain.get("clip"), chain.get("overlays") or [], chain.get("zebra")
             )
             out.setDisplayFlag(True)
             out.setRenderFlag(True)
@@ -1366,7 +1355,8 @@ def capture_viewport(
     used for it: on 22.0.368 the work light's headAltitude/headAzimuth and
     headlightDirection change nothing in the drawn image, the light stays
     over the shoulder. "viewport" keeps the viewer's lighting and materials.
-    The zebra overlay is a matcap too, so it is per pixel on the mesh as is.
+    The zebra overlay is a MaterialX material on the proxy, evaluated per
+    pixel on the mesh's own normals; material display is on for it.
     Default material, matcap and material display are put back and read back.
     """
     started = time.perf_counter()
@@ -1497,17 +1487,17 @@ def capture_viewport(
     use_zebra = "zebra" in overlays
     result["lighting"] = {"mode": lighting}
     if use_zebra:
-        result["lighting"]["zebra"] = "each view is drawn with its own zebra matcap instead"
+        result["lighting"]["zebra"] = (
+            "the targets are drawn with a per-pixel zebra material on the proxy instead"
+        )
     try:
         if lighting == "headlight" or use_zebra:
             look_changed = True
             if lighting == "headlight":
                 result["lighting"]["matcap"] = _headlight_file()
                 _use_matcap(viewport, result["lighting"]["matcap"])
-
-        def prepare(placed):
             if use_zebra:
-                _use_matcap(viewport, _zebra_file(placed["axes"], zebra))
+                _show_materials(viewport)
 
         if state["camera_node"] is not None or state["camera_path"]:
             # A camera node's resolution and aspect would decide the frame, and
@@ -1543,7 +1533,7 @@ def capture_viewport(
                     elevation=elevation,
                     projection=spec["projection"] or "persp",
                 )
-            chain = {"clip": shape, "overlays": overlays}
+            chain = {"clip": shape, "overlays": overlays, "zebra": zebra}
             force_proxy = bool(shape or overlays or compare)
             shot_proxies: list[str] = []
             proxies += [shot_proxies]
@@ -1601,7 +1591,6 @@ def capture_viewport(
                 float(margin),
                 visible,
                 stored,
-                prepare,
             )
             if spec["direction"] == "facing":
                 shot["direction"] = {

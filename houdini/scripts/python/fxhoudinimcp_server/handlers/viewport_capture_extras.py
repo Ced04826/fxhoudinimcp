@@ -34,7 +34,7 @@ OVERLAY_LEGEND = {
     "ngons": "n-gons magenta",
     "poles": "poles: 3-edge cyan, 5+-edge orange",
     "stretch": "stretch: grey (aspect <= 1.5) to red (>= 4)",
-    "zebra": "zebra: black/white bands of N . direction, per pixel",
+    "zebra": "zebra: black/white bands of the angle between N and the direction, per pixel",
 }
 
 # Headlight matcap: brightness from how squarely a surface faces the light,
@@ -43,9 +43,12 @@ OVERLAY_LEGEND = {
 # the stock schemes), so the wiring reads on the dark side too; the light is
 # off-axis sideways so the two sides of a corner seen at 45 degrees differ.
 HEADLIGHT = {"low": 0.42, "high": 0.88, "light": (-0.34, 0.0, 0.94)}
-ZEBRA_BANDS = (0.06, 1.0)
 MATCAP_SIZE = 256
-ZEBRA_MATCAP_SIZE = 512
+# Zebra emission, (dark, light), linear: the viewport's display transform
+# shows 0.004 near black. A face square to the direction (angle 0, 90 or 180
+# degrees) sits in the middle of a light band, so face colours (triangles,
+# n-gons, stretch) multiplied onto it stay readable.
+ZEBRA_BANDS = (0.004, 1.0)
 
 REGION_KEYS = {"bbox", "center", "radius", "group", "prims", "node"}
 
@@ -280,12 +283,37 @@ def crop_box(content, size, pad_fraction: float = 0.03) -> list[int] | None:
     return [x0, y0, x1, y1]
 
 
-def camera_direction(axes, direction) -> list[float]:
-    """*direction* (world) in camera space: components along right, up, back."""
+def zebra_settings(direction, stripes: int) -> dict[str, Any]:
+    """The numbers the zebra material is built from.
+
+    Bands are of the angle between the shading normal and *direction* (world
+    space), *stripes* of them over 0..180 degrees, so every band is the same
+    angle wide: a tilt of a few degrees off a face square to the direction
+    turns a band as surely as it does anywhere else (bands of N . d hardly
+    move there, the cosine being flat at 0). World space: the bands stay on
+    the surface from every view, so the cells of an orbit sheet agree.
+    """
     d = [float(c) for c in direction]
-    length = math.sqrt(sum(c * c for c in d)) or 1.0
-    d = [c / length for c in d]
-    return [sum(axes[i][j] * d[j] for j in range(3)) for i in range(3)]
+    length = math.sqrt(sum(c * c for c in d))
+    if len(d) != 3 or length == 0.0:
+        raise ValueError(f"zebra direction must be a non-zero [x, y, z], not {direction!r}")
+    return {
+        "direction": [c / length for c in d],
+        "scale": int(stripes) / math.pi,
+        "phase": 0.25,
+        "dark": ZEBRA_BANDS[0],
+        "light": ZEBRA_BANDS[1],
+    }
+
+
+def zebra_band(normal, direction, stripes: int) -> float:
+    """The zebra material's value for one normal (the same arithmetic, in Python)."""
+    s = zebra_settings(direction, stripes)
+    length = math.sqrt(sum(float(c) * float(c) for c in normal)) or 1.0
+    cosine = sum(float(n) / length * d for n, d in zip(normal, s["direction"], strict=True))
+    angle = math.acos(max(-1.0, min(1.0, cosine)))
+    wrapped = math.fmod(angle * s["scale"] + s["phase"], 1.0)
+    return s["dark"] if wrapped > 0.5 else s["light"]
 
 
 def _matcap_normals(size: int):
@@ -317,24 +345,6 @@ def headlight_matcap(size: int = MATCAP_SIZE):
     length = math.sqrt(lx * lx + ly * ly + lz * lz)
     facing = np.clip((nx * lx + ny * ly + nz * lz) / length, 0.0, 1.0)
     return HEADLIGHT["low"] + (HEADLIGHT["high"] - HEADLIGHT["low"]) * facing
-
-
-def zebra_matcap(direction_camera, stripes: int, size: int = ZEBRA_MATCAP_SIZE):
-    """(size, size) grey levels of bands of N . direction, direction in camera space.
-
-    The viewport looks the matcap up per pixel with the mesh's interpolated
-    normal, so the bands follow the surface being checked, not a denser copy.
-    Bands are shifted a quarter period: a face square to the direction (N . d
-    of -1, 0 or 1) sits in the middle of a band, not on a band edge where the
-    smallest wobble of its normal would flip it.
-    """
-    import numpy as np
-
-    nx, ny, nz = _matcap_normals(size)
-    d = direction_camera
-    value = nx * d[0] + ny * d[1] + nz * d[2]
-    band = np.mod((value + 1.0) * 0.5 * int(stripes) + 0.25, 1.0) < 0.5
-    return np.where(band, ZEBRA_BANDS[0], ZEBRA_BANDS[1])
 
 
 def edge_pixels(segments, params: dict[str, Any], width, height, out_w) -> dict[str, Any] | None:
@@ -765,13 +775,68 @@ def region_facts(region: dict[str, Any], default_node) -> dict[str, Any]:
     }
 
 
-def build_chain(proxy, merge, clip: dict[str, Any] | None, overlays: list[str]):
+def build_zebra_material(proxy, zebra: dict[str, Any]) -> str:
+    """A MaterialX zebra material in a Material Network inside *proxy*; its path.
+
+    Unlit emission of the band the angle between the world-space shading
+    normal and the direction falls in (see zebra_settings), times the point
+    or vertex colour (white where there is none). The viewport evaluates it
+    per pixel on the normals the mesh is drawn with, so a low-poly surface
+    shows its own shading and nothing of a denser copy or of the view. It
+    lives and dies with the proxy.
+    """
+    s = zebra_settings(zebra["direction"], zebra["stripes"])
+    net = proxy.createNode("matnet", "zebra_material")
+    normal = net.createNode("mtlxnormal", "normal")
+    normal.parm("space").set("world")
+    unit = net.createNode("mtlxnormalize", "unit")
+    unit.setInput(0, normal)
+    dot = net.createNode("mtlxdotproduct", "n_dot_d")
+    dot.parm("signature").set("vector3")
+    dot.setInput(0, unit)
+    dot.parmTuple("in2_vector3").set(s["direction"])
+    clamp = net.createNode("mtlxclamp", "clamp")
+    clamp.setInput(0, dot)
+    clamp.parm("low").set(-1.0)
+    clamp.parm("high").set(1.0)
+    angle = net.createNode("mtlxacos", "angle")
+    angle.setInput(0, clamp)
+    scale = net.createNode("mtlxmultiply", "bands")
+    scale.setInput(0, angle)
+    scale.parm("in2").set(s["scale"])
+    phase = net.createNode("mtlxadd", "phase")
+    phase.setInput(0, scale)
+    phase.parm("in2").set(s["phase"])
+    wrap = net.createNode("mtlxmodulo", "wrap")
+    wrap.setInput(0, phase)
+    wrap.parm("in2").set(1.0)
+    band = net.createNode("mtlxifgreater", "band")
+    band.setInput(0, wrap)
+    band.parm("value2").set(0.5)
+    band.parm("in1").set(s["dark"])
+    band.parm("in2").set(s["light"])
+    colour = net.createNode("mtlxgeomcolor", "face_colour")
+    surface = net.createNode("mtlxsurface_unlit", "zebra")
+    # The band drives the float emission; a float-to-colour convert node
+    # draws black in the 22.0.368 viewport.
+    surface.setInput(0, band)
+    surface.setInput(1, colour)
+    return surface.path()
+
+
+def build_chain(
+    proxy,
+    merge,
+    clip: dict[str, Any] | None,
+    overlays: list[str],
+    zebra: dict[str, Any] | None = None,
+):
     """Clip and overlay nodes after *merge* inside *proxy*; returns (measure, out).
 
     measure is the clipped geometry (what the edge metric reads), out the
-    node that gets the display flag. Zebra is not in the chain: it is a
-    matcap the viewport applies per pixel (see zebra_matcap), and the
-    geometry is left as it is.
+    node that gets the display flag. Zebra assigns a material to the proxy's
+    faces (see build_zebra_material); points and normals stay as they are.
+    Pole markers are merged after it and keep the default material.
     """
     node = merge
     if clip is not None:
@@ -791,6 +856,13 @@ def build_chain(proxy, merge, clip: dict[str, Any] | None, overlays: list[str]):
         wv.parm("class").set("vertex")
         wv.parm("snippet").set(vertex_vex(faces))
         node = wv
+    if "zebra" in overlays:
+        assign = proxy.createNode("material", "zebra_assign")
+        assign.setInput(0, node)
+        assign.parm("shop_materialpath1").set(
+            build_zebra_material(proxy, zebra or {"direction": [0, 1, 0], "stripes": 16})
+        )
+        node = assign
     if "poles" in overlays:
         # Poles as small spheres on the points: a vertex colour would bleed
         # across every face around the point and hide the face colours.
