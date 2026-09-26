@@ -28,6 +28,18 @@ async def capture_viewport(
     follow_targets: bool = True,
     show_target: bool = False,
     isolate: bool | list[str] = True,
+    region: dict[str, Any] | None = None,
+    clip: bool = False,
+    compare: str | None = None,
+    overlays: list[str] | None = None,
+    zebra_direction: list[float] | None = None,
+    zebra_stripes: int = 16,
+    orbit: bool | dict[str, Any] | None = None,
+    sheet: bool | None = None,
+    sheet_columns: int | None = None,
+    sheet_max: int = 2000,
+    min_edge_px: float = 6.0,
+    replay: str | None = None,
 ) -> dict:
     """Capture what the Scene Viewer shows, from several views in one call,
     each framed so the target is whole and fills the image.
@@ -62,6 +74,15 @@ async def capture_viewport(
     the targets' objects, through the flipbook's own object mask: nothing in
     the scene or the viewer changes.
 
+    Reading wiring: look at an orbit sheet (orbit=True, 16 cells) to find
+    suspect places, then shoot close-ups there: region + clip, the "facing"
+    direction, overlays; compare against the source for missing features.
+    Every call writes <prefix>_shots.json; replay it after a repair to shoot
+    the same views. Several views are also laid out on <prefix>_sheet.png
+    (long side sheet_max), each cell labelled with its view name, azimuth
+    and elevation, and edge_px says how long an edge is on screen: below
+    min_edge_px a warning says the wiring cannot be read there.
+
     Look at the images with your file reader; nothing is inlined.
 
     Args:
@@ -72,10 +93,13 @@ async def capture_viewport(
             "persp"; custom angles default to persp), "name", and per-view
             "targets"/"bbox", each replacing the shared one on its own (a
             per-view bbox keeps the shared targets; "targets": [] drops
-            them). Directions: "front", "back", "left", "right",
-            "top", "bottom" (orthographic), "persp" (the perspective view's
-            current angle), "current" (the view as it is). Default
-            ["current"].
+            them; the same for "region" and "clip"). Directions: "front",
+            "back", "left", "right", "top", "bottom" (orthographic), "persp"
+            (the perspective view's current angle), "current" (the view as
+            it is), "facing" (straight at the side of the region most of its
+            area faces -- both sides of a thin part do not cancel; needs a
+            region; the receipt gives the normal). Default ["current"].
+            Every view reports the azimuth/elevation it was shot from.
         targets: SOP or object node paths to draw; framed by the union of
             their bounding boxes unless bbox is given. Without targets or
             bbox, "current" is captured as is and other directions frame
@@ -101,6 +125,35 @@ async def capture_viewport(
             everything the viewer shows, for context. A list of node paths
             draws those objects (a SOP path means its object), e.g. the body
             and a wheel together.
+        region: Where to shoot, instead of bbox: {"center": [x,y,z],
+            "radius": r}, {"bbox": [...]}, {"group": name} (primitive group,
+            else point group) or {"prims": [numbers]}; group and prims read
+            the first SOP target, or "node". World space. Frames the region.
+        clip: Draw only the faces in the region (its sphere, else its box; a
+            face stays when one of its points or its centroid is inside), so
+            the near side of the part does not hide the far side. Done in the proxy object; your nodes are
+            untouched.
+        compare: A source SOP shot with exactly the same camera; each view
+            also gets <name>_compare.png, SOURCE left and RESULT right.
+        overlays: Any of "triangles" (blue), "ngons" (magenta), "poles"
+            (interior points with other than 4 edges: 3 cyan, 5+ orange),
+            "stretch" (face aspect, grey to red at 4:1), "zebra" (bands of
+            N . zebra_direction; shading becomes smooth and the edges are
+            drawn as lines). On the proxy object only. Default none.
+        zebra_direction: Fixed direction for the zebra bands, default [0,1,0].
+        zebra_stripes: Bands across the full normal range, default 16.
+        orbit: True for rings at elevation 30 and -20 times 8 azimuths (16
+            views), or {"elevations": [...], "azimuths": count or [...],
+            "projection": ...}; added after views.
+        sheet: Lay all views out on one PNG; default when there are several.
+        sheet_columns: Columns of the sheet; default about square.
+        sheet_max: Long side of the sheet in pixels, default 2000 (what Read
+            shows without shrinking).
+        min_edge_px: Mean on-screen edge length below which a view warns
+            that the wiring cannot be read, default 6.
+        replay: Path of a <prefix>_shots.json: shoots its views again with
+            the same cameras, targets, clip, overlays and compare; views,
+            orbit, bbox and region are not taken.
 
     Returns per view: path, pixels, isolated (the objects drawn alone, or
     null), target_rect (image pixels, origin top
@@ -109,7 +162,10 @@ async def capture_viewport(
     frame_bbox (the world box fitted), drawn (via, network, display_node,
     targets_drawn, and proxy with proxy_points/target_points),
     projection, looking_along, pivot, and ortho_width or distance with
-    fov_x_deg. success is false when an image is missing or blank where the
+    fov_x_deg, azimuth/elevation, edge_px (mean/median/p10 on-screen edge
+    length) and sheet_edge_px, region, clip (with drawn.clipped_prims),
+    compare (source image, pair image). Also shots_file, sheet (path,
+    pixels, columns, rows), overlays (legend) and warnings. success is false when an image is missing or blank where the
     target is, a target is not fully in frame or not drawn, or the viewer
     could not be restored; problems says which.
     """
@@ -123,6 +179,10 @@ async def capture_viewport(
         "follow_targets": follow_targets,
         "show_target": show_target,
         "isolate": isolate,
+        "clip": clip,
+        "zebra_stripes": zebra_stripes,
+        "sheet_max": sheet_max,
+        "min_edge_px": min_edge_px,
     }
     for key, value in (
         ("views", views),
@@ -130,6 +190,14 @@ async def capture_viewport(
         ("bbox", bbox),
         ("shading", shading),
         ("pane_name", pane_name),
+        ("region", region),
+        ("compare", compare),
+        ("overlays", overlays),
+        ("zebra_direction", zebra_direction),
+        ("orbit", orbit),
+        ("sheet", sheet),
+        ("sheet_columns", sheet_columns),
+        ("replay", replay),
     ):
         if value is not None:
             params[key] = value

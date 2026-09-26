@@ -275,7 +275,7 @@ class TestTargetsAreDrawn:
         proxy.path.return_value = "/obj/__fxmcp_capture_proxy"
         made = []
 
-        def make(sops):
+        def make(sops, chain=None):
             made.append([n.path() for n in sops])
             return proxy, {"proxy": proxy.path(), "proxy_points": 8, "target_points": 8}
 

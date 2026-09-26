@@ -35,6 +35,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.handlers import viewport_capture_extras as extras
 from fxhoudinimcp_server.handlers.rendering_handlers import _find_flipbook_output
 from fxhoudinimcp_server.handlers.viewport_handlers import _find_scene_viewer, _no_mplay
 
@@ -80,7 +81,17 @@ _FIT_TOLERANCE = 0.002
 _DRAWN_THRESHOLD = 30
 _BLANK_FRACTION = 0.0005
 
-_VIEW_KEYS = {"name", "direction", "azimuth", "elevation", "projection", "targets", "bbox"}
+_VIEW_KEYS = {
+    "name",
+    "direction",
+    "azimuth",
+    "elevation",
+    "projection",
+    "targets",
+    "bbox",
+    "region",
+    "clip",
+}
 
 
 ###### Pure helpers (no hou; unit-tested)
@@ -323,7 +334,12 @@ def parse_view(spec: Any, index: int) -> dict[str, Any]:
         raise ValueError(
             f"views[{index}]: projection must be 'ortho' or 'persp', not {projection!r}"
         )
-    common = {"targets": spec.get("targets"), "bbox": spec.get("bbox")}
+    common = {
+        "targets": spec.get("targets"),
+        "bbox": spec.get("bbox"),
+        "region": extras.parse_region(spec.get("region"), f"views[{index}].region"),
+        "clip": spec.get("clip"),
+    }
     if has_angles:
         if direction is not None:
             raise ValueError(f"views[{index}]: give a direction or azimuth/elevation, not both")
@@ -342,10 +358,10 @@ def parse_view(spec: Any, index: int) -> dict[str, Any]:
     direction = str(direction or "current").lower()
     if direction == "perspective":
         direction = "persp"
-    if direction not in _AXIS_VIEWS and direction not in ("current", "persp"):
+    if direction not in _AXIS_VIEWS and direction not in ("current", "persp", "facing"):
         raise ValueError(
             f"views[{index}]: unknown direction {direction!r}; use one of "
-            f"{sorted(_AXIS_VIEWS) + ['persp', 'current']}, or azimuth/elevation"
+            f"{sorted(_AXIS_VIEWS) + ['persp', 'current', 'facing']}, or azimuth/elevation"
         )
     if projection is not None and direction in _AXIS_VIEWS and projection != "ortho":
         raise ValueError(f"views[{index}]: the {direction} view is orthographic")
@@ -778,40 +794,56 @@ def _pixel_facts(path: str, rect: list[float] | None) -> dict[str, Any]:
     return {"readable": True, "pixels": [w, h], "drawn_fraction": round(float(drawn.mean()), 4)}
 
 
-def _shoot(scene_viewer, viewport, state, base, view, corners, path, max_size, margin, visible):
+def _shoot(
+    scene_viewer, viewport, state, base, view, corners, path, max_size, margin, visible, fixed=None
+):
+    """One flipbook. *fixed* ({"camera", "pixels"}) replays a stored camera as is."""
     size = viewport.size()
     width, height = float(size[2]), float(size[3])
-    params = _orient(viewport, state, view, base)
     rect = None
-    if corners:
-        center, radius = _center_radius(corners)
-        params, out_w, out_h, _ = fit(
-            corners,
-            centred_on(params, center, radius),
-            width,
-            height,
-            max_size,
-            margin,
-            min_distance=radius * 1.05,
-        )
+    if fixed is not None:
+        # A stored camera: the perspective viewport takes any rotation and
+        # either projection, so every stored view replays there unchanged.
+        _enter_type(viewport, state, hou.geometryViewportType.Perspective)
+        params = {k: fixed["camera"][k] for k in _CAMERA_KEYS}
+        out_w, out_h = (int(v) for v in fixed["pixels"])
         _write_camera(viewport, params)
     else:
-        _write_camera(viewport, params)
-        if view["direction"] != "current":
-            viewport.frameAll()
-        if width >= height:
-            out_w, out_h = int(max_size), max(_MIN_SIDE, round(max_size * height / width))
+        params = _orient(viewport, state, view, base)
+        if corners:
+            center, radius = _center_radius(corners)
+            params, out_w, out_h, _ = fit(
+                corners,
+                centred_on(params, center, radius),
+                width,
+                height,
+                max_size,
+                margin,
+                min_distance=radius * 1.05,
+            )
+            _write_camera(viewport, params)
         else:
-            out_w, out_h = max(_MIN_SIDE, round(max_size * width / height)), int(max_size)
+            _write_camera(viewport, params)
+            if view["direction"] != "current":
+                viewport.frameAll()
+            if width >= height:
+                out_w, out_h = int(max_size), max(_MIN_SIDE, round(max_size * height / width))
+            else:
+                out_w, out_h = max(_MIN_SIDE, round(max_size * width / height)), int(max_size)
 
     # What Houdini holds now, not what was asked for.
     placed = _read_camera(viewport)
+    azimuth, elevation = extras.angles_of(placed["axes"])
     shot: dict[str, Any] = {
         "name": view["name"],
         "direction": view["direction"]
         or {"azimuth": view["azimuth"], "elevation": view["elevation"]},
         "viewport_type": viewport.type().name(),
         "projection": "ortho" if placed["ortho"] else "persp",
+        # The camera's own angles, whatever the view was asked as: shoot a
+        # close-up from this cell with these.
+        "azimuth": azimuth,
+        "elevation": elevation,
         "pivot": [round(v, 6) for v in placed["pivot"]],
         # The camera looks along -back.
         "looking_along": [round(-v, 6) for v in placed["axes"][2]],
@@ -825,9 +857,9 @@ def _shoot(scene_viewer, viewport, state, base, view, corners, path, max_size, m
         shot["fov_x_deg"] = round(
             math.degrees(2.0 * math.atan(placed["aperture"] / 2.0 / placed["focal"])), 2
         )
+    if _camera_differences(params, placed):
+        shot["camera_not_as_set"] = _camera_differences(params, placed)
     if corners:
-        if _camera_differences(params, placed):
-            shot["camera_not_as_set"] = _camera_differences(params, placed)
         points = [project(c, placed, width, height) for c in corners]
         if any(p is None for p in points):
             shot["target_in_frame"] = False
@@ -849,16 +881,10 @@ def _shoot(scene_viewer, viewport, state, base, view, corners, path, max_size, m
             ]
 
     shot["isolated"] = visible
-    written = _flipbook(scene_viewer, viewport, path, out_w, out_h, visible)
-    facts = _pixel_facts(written, rect) if os.path.isfile(written) else {"readable": False}
-    if facts.get("drawn_fraction") is not None and facts["drawn_fraction"] < _BLANK_FRACTION:
-        # One redraw and one retry before the verdict: a viewport that has
-        # just changed type has been seen to hand the flipbook an empty frame.
-        with contextlib.suppress(Exception):
-            viewport.draw()
-        time.sleep(0.2)
-        written = _flipbook(scene_viewer, viewport, path, out_w, out_h, visible)
-        facts = _pixel_facts(written, rect) if os.path.isfile(written) else {"readable": False}
+    written, facts, retried = _flipbook_checked(
+        scene_viewer, viewport, path, out_w, out_h, visible, rect
+    )
+    if retried:
         shot["retried"] = True
     shot["path"] = written
     shot["file_exists"] = os.path.isfile(written)
@@ -866,7 +892,30 @@ def _shoot(scene_viewer, viewport, state, base, view, corners, path, max_size, m
         shot["bytes"] = os.path.getsize(written)
     shot.update(facts)
     shot.setdefault("pixels", [out_w, out_h])
+    # For the shot list and the edge metric; popped before the receipt.
+    shot["_camera"] = placed
+    shot["_frame"] = (width, height, out_w, out_h, rect)
     return shot
+
+
+_CAMERA_KEYS = ("axes", "pivot", "t", "ortho", "ortho_width", "focal", "aperture")
+
+
+def _flipbook_checked(scene_viewer, viewport, path, out_w, out_h, visible, rect):
+    """Flipbook and read the pixels back; one redraw and retry on a blank frame."""
+    written = _flipbook(scene_viewer, viewport, path, out_w, out_h, visible)
+    facts = _pixel_facts(written, rect) if os.path.isfile(written) else {"readable": False}
+    retried = False
+    if facts.get("drawn_fraction") is not None and facts["drawn_fraction"] < _BLANK_FRACTION:
+        # A viewport that has just changed type has been seen to hand the
+        # flipbook an empty frame.
+        with contextlib.suppress(Exception):
+            viewport.draw()
+        time.sleep(0.2)
+        written = _flipbook(scene_viewer, viewport, path, out_w, out_h, visible)
+        facts = _pixel_facts(written, rect) if os.path.isfile(written) else {"readable": False}
+        retried = True
+    return written, facts, retried
 
 
 def _drawn(scene_viewer) -> dict[str, Any]:
@@ -883,15 +932,17 @@ def _drawn(scene_viewer) -> dict[str, Any]:
 _PROXY_NAME = "__fxmcp_capture_proxy"
 
 
-def _make_proxy(sops: list) -> tuple[Any, dict[str, Any]]:
+def _make_proxy(sops: list, chain: dict[str, Any] | None = None) -> tuple[Any, dict[str, Any]]:
     """A temporary object at /obj that draws *sops* in world space.
 
     An Object Merge "into this object" on an object with no transform: the
     geometry the targets cook to, where it sits in the world, drawn by an
-    object the flipbook mask can show alone. No flag, network or parameter of
+    object the flipbook mask can show alone. *chain* adds the clip and the
+    overlays after it (extras.build_chain). No flag, network or parameter of
     the user's nodes is touched, and nothing enters the undo history. Returns
     (proxy object, facts); the caller destroys it.
     """
+    chain = chain or {}
     with hou.undos.disabler():
         obj_root = hou.node("/obj")
         name, index = _PROXY_NAME, 1
@@ -905,12 +956,23 @@ def _make_proxy(sops: list) -> tuple[Any, dict[str, Any]]:
             for i, node in enumerate(sops, start=1):
                 merge.parm(f"objpath{i}").set(node.path())
             merge.parm("xformtype").set("local")
-            merge.setDisplayFlag(True)
-            merge.setRenderFlag(True)
+            measure, out = extras.build_chain(
+                proxy,
+                merge,
+                chain.get("clip"),
+                chain.get("overlays") or [],
+                chain.get("zebra") or {},
+            )
+            out.setDisplayFlag(True)
+            out.setRenderFlag(True)
             proxy.setDisplayFlag(True)
-            merge.cook(force=True)
+            out.cook(force=True)
+            errors = [e for n in proxy.children() for e in n.errors()]
+            if errors:
+                raise RuntimeError(f"the capture proxy chain failed: {errors[:3]}")
             merged = merge.geometry()
             points = merged.intrinsicValue("pointcount") if merged is not None else 0
+            kept = measure.geometry().intrinsicValue("primitivecount")
         except Exception:
             proxy.destroy()
             raise
@@ -918,11 +980,22 @@ def _make_proxy(sops: list) -> tuple[Any, dict[str, Any]]:
     for node in sops:
         with contextlib.suppress(Exception):
             expected += node.geometry().intrinsicValue("pointcount")
-    return proxy, {"proxy": proxy.path(), "proxy_points": points, "target_points": expected}
+    facts = {"proxy": proxy.path(), "proxy_points": points, "target_points": expected}
+    if chain.get("clip") is not None:
+        facts["clipped_prims"] = kept
+    facts["_measure"] = measure.path()
+    return proxy, facts
 
 
 def _show_targets(
-    scene_viewer, described, follow, show_target, moved_flags, proxies=None
+    scene_viewer,
+    described,
+    follow,
+    show_target,
+    moved_flags,
+    proxies=None,
+    force_proxy=False,
+    chain=None,
 ) -> dict[str, Any]:
     """Point the viewer at the targets and report whether it draws them.
 
@@ -931,16 +1004,18 @@ def _show_targets(
     Any other SOP target -- upstream of the display flag, or in a network
     other than the one the viewer can follow -- is drawn through a temporary
     proxy object (see _make_proxy), with the viewer at /obj for the shot,
-    unless show_target moves the display flag onto it instead. Without a
-    proxy list (proxies=None) such a target is reported as framed but not
-    drawn. *moved_flags* collects {network: previous display node} for every
-    display flag moved here; *proxies* collects the proxy objects made.
+    unless show_target moves the display flag onto it instead. force_proxy
+    (a clip, overlays or a comparison, which live in the proxy's chain)
+    always takes the proxy. Without a proxy list (proxies=None) such a target
+    is reported as framed but not drawn. *moved_flags* collects {network:
+    previous display node} for every display flag moved here; *proxies*
+    collects the proxy objects made.
     """
     nodes = [hou.node(path) for path in described]
     sops = [n for n in nodes if n is not None and n.type().category().name() == "Sop"]
     objects = [n for n in nodes if n is not None and n.type().category().name() == "Object"]
     facts: dict[str, Any] = {"via": "viewer"}
-    if follow and sops:
+    if follow and sops and not force_proxy:
         networks = sorted({n.parent().path() for n in sops})
         if len(networks) == 1:
             if scene_viewer.pwd().path() != networks[0]:
@@ -953,16 +1028,16 @@ def _show_targets(
         parent = node.parent()
         display = parent.displayNode() if hasattr(parent, "displayNode") else None
         showing = display is not None and display.path() == node.path()
-        if show_target and not showing and parent.path() == network.path():
+        if show_target and not showing and parent.path() == network.path() and not force_proxy:
             moved_flags.setdefault(parent.path(), display.path() if display is not None else None)
             node.setDisplayFlag(True)
             display = parent.displayNode()
             showing = display is not None and display.path() == node.path()
-        drawn[node.path()] = showing and parent.path() == network.path()
-    if proxies is not None and any(not drawn[n.path()] for n in sops):
+        drawn[node.path()] = showing and parent.path() == network.path() and not force_proxy
+    if proxies is not None and sops and any(not drawn[n.path()] for n in sops):
         # One proxy for all SOP targets: the viewer can be in one network only,
         # and at /obj the natively drawn ones would disappear too.
-        proxy, proxy_facts = _make_proxy(sops)
+        proxy, proxy_facts = _make_proxy(sops, chain)
         proxies.append(proxy.path())
         scene_viewer.setPwd(hou.node("/obj"))
         network = scene_viewer.pwd()
@@ -1020,6 +1095,75 @@ def _restore_targets(
     return problems
 
 
+def _edge_metric(shot, drawn, described) -> dict[str, Any] | None:
+    """Mean projected edge length of what was drawn, in the image's pixels."""
+    width, height, out_w, _, _ = shot["_frame"]
+    segments = []
+    measure = drawn.get("_measure")
+    if measure and hou.node(measure) is not None:
+        segments.append(extras.segments_of(hou.node(measure).geometry()))
+    else:
+        for path in described:
+            node = hou.node(path)
+            if node is None:
+                continue
+            with contextlib.suppress(Exception):
+                geometry, transform = _geometry_of(node)
+                if geometry is not None:
+                    segments.append(extras.segments_of(geometry, transform))
+    segments = [s for s in segments if len(s)]
+    if not segments:
+        return None
+    import numpy as np
+
+    return extras.edge_pixels(np.concatenate(segments), shot["_camera"], width, height, out_w)
+
+
+def _resolve_view(spec, targets, bbox, region, clip):
+    """Framing, drawing and clip of one view.
+
+    Returns (corners, described, framed_by, region_facts or None, clip shape
+    or None). A view's own targets/bbox/region/clip replace the shared ones.
+    """
+    view_targets = targets if spec["targets"] is None else spec["targets"]
+    view_region = region if spec.get("region") is None else spec["region"]
+    view_bbox = bbox if spec["bbox"] is None else spec["bbox"]
+    if spec.get("region") is not None and spec["bbox"] is None:
+        view_bbox = None
+    if spec["bbox"] is not None and spec.get("region") is None:
+        view_region = None
+    if view_region is not None and view_bbox is not None:
+        raise ValueError(f"view {spec['name']}: give bbox or region, not both")
+    corners, described, framed_by = _target_corners(view_targets, view_bbox)
+    facts = None
+    if view_region is not None:
+        first = next(
+            (
+                hou.node(p)
+                for p in described
+                if hou.node(p) is not None and hou.node(p).type().category().name() == "Sop"
+            ),
+            None,
+        )
+        facts = extras.region_facts(view_region, first)
+        corners = facts["corners"]
+        framed_by = f"region:{view_region['kind']}"
+    view_clip = clip if spec.get("clip") is None else spec["clip"]
+    shape = None
+    if view_clip:
+        if facts is not None:
+            shape = extras.clip_shape(view_region, facts["frame_box"])
+        elif view_bbox is not None:
+            shape = {"shape": "box", "bbox": [float(v) for v in view_bbox]}
+        else:
+            raise ValueError(f"view {spec['name']}: clip needs a region or a bbox to clip to")
+    if spec["direction"] == "facing" and (facts is None or facts["normal"] is None):
+        raise ValueError(
+            f"view {spec['name']}: 'facing' needs a region with faces in it to take the normal from"
+        )
+    return corners, described, framed_by, facts, shape
+
+
 ###### Handler: viewport.capture_viewport
 
 
@@ -1037,45 +1181,133 @@ def capture_viewport(
     follow_targets: bool = True,
     show_target: bool = False,
     isolate: Any = True,
+    region: dict | None = None,
+    clip: bool = False,
+    compare: str | None = None,
+    overlays: Any = None,
+    zebra_direction: list | None = None,
+    zebra_stripes: int = 16,
+    orbit: Any = None,
+    sheet: bool | None = None,
+    sheet_columns: int | None = None,
+    sheet_max: int = 2000,
+    min_edge_px: float = 6.0,
+    replay: str | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Flipbook the Scene Viewer from one or more views, framed on a target.
 
     See the module docstring for what is captured and how framing is checked.
-    targets decide what is drawn, bbox (when given) decides the framing.
-    follow_targets points the viewer at the SOP targets' network for the
-    capture; a SOP target that is not its network's display node is drawn
+    targets decide what is drawn; bbox or region, when given, decide the
+    framing. follow_targets points the viewer at the SOP targets' network for
+    the capture; a SOP target that is not its network's display node -- and
+    every SOP target when clip, overlays or compare is used -- is drawn
     through a temporary proxy object at /obj (see _show_targets), or, with
     show_target, by moving the display flag onto it. Network, flags and
     proxies are put back or removed afterwards. isolate draws only the
     targets' objects (or the objects listed), so other displayed objects and
     their ghosts do not overlap the target.
+
+    Every call writes <prefix>_shots.json (the solved cameras); replay reads
+    one back and shoots the same views again. Several views are also laid out
+    on <prefix>_sheet.png.
     """
     started = time.perf_counter()
     if not isinstance(max_size, int) or isinstance(max_size, bool) or not 256 <= max_size <= 4096:
         raise ValueError(f"max_size must be an integer within 256..4096, not {max_size!r}")
     if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not 0.0 <= margin <= 0.4:
         raise ValueError(f"margin must be within 0..0.4, not {margin!r}")
+    if (
+        isinstance(sheet_max, bool)
+        or not isinstance(sheet_max, int)
+        or not 256 <= sheet_max <= 8000
+    ):
+        raise ValueError(f"sheet_max must be an integer within 256..8000, not {sheet_max!r}")
+    if isinstance(zebra_stripes, bool) or not isinstance(zebra_stripes, int) or zebra_stripes < 1:
+        raise ValueError(f"zebra_stripes must be a positive integer, not {zebra_stripes!r}")
+    zebra = {"direction": list(zebra_direction or [0.0, 1.0, 0.0]), "stripes": zebra_stripes}
+    if len(zebra["direction"]) != 3 or not any(float(c) for c in zebra["direction"]):
+        raise ValueError(f"zebra_direction must be a non-zero [x, y, z], not {zebra_direction!r}")
+
+    record = None
+    if replay is not None:
+        if views is not None or orbit or bbox is not None or region is not None:
+            raise ValueError(
+                "replay takes the views from the shot list; drop views/orbit/bbox/region"
+            )
+        record = extras.read_shot_list(replay)
+        targets = record.get("targets")
+        compare = record.get("compare") if compare is None else compare
+        overlays = record.get("overlays") if overlays is None else overlays
+        zebra = record.get("zebra") or zebra
+        shading = record.get("shading") if shading is None else shading
+        isolate = record.get("isolate", isolate)
+    overlays = extras.parse_overlays(overlays)
     if shading is not None and str(shading).lower() not in _SHADING_NAMES:
         raise ValueError(f"unknown shading {shading!r}; use one of {sorted(_SHADING_NAMES)}")
-    specs = [parse_view(spec, i) for i, spec in enumerate(views or ["current"])]
+    shading_note = None
+    if "zebra" in overlays and (shading is None or "wire" in str(shading).lower()):
+        # Zebra shades a subdivided copy; its wires would bury the bands. The
+        # original edges are drawn as lines instead.
+        shading_note = f"zebra: shading set to smooth (asked {shading}); edges drawn as lines"
+        shading = "smooth"
+    region = extras.parse_region(region)
+    if compare is not None:
+        source = hou.node(str(compare))
+        if source is None or source.type().category().name() != "Sop":
+            raise ValueError(f"compare must be a SOP node path, not {compare!r}")
+        compare = source.path()
+
+    fixed: list[dict[str, Any] | None]
+    if record is not None:
+        specs, fixed = [], []
+        for shot in record["shots"]:
+            specs.append(
+                {
+                    "name": shot["name"],
+                    "direction": None,
+                    "azimuth": shot.get("azimuth"),
+                    "elevation": shot.get("elevation"),
+                    "projection": None,
+                    "targets": shot.get("targets"),
+                    "bbox": None,
+                    "region": None,
+                    "clip": None,
+                    "_clip_shape": shot.get("clip"),
+                }
+            )
+            fixed.append(shot)
+    else:
+        raw = list(views or [])
+        specs = [parse_view(spec, i) for i, spec in enumerate(raw)]
+        specs += [
+            parse_view(spec, len(specs) + i) for i, spec in enumerate(extras.orbit_views(orbit))
+        ]
+        if not specs:
+            specs = [parse_view("current", 0)]
+        fixed = [None] * len(specs)
     names = [safe_name(spec["name"]) for spec in specs]
     duplicates = sorted({n for n in names if names.count(n) > 1})
     if duplicates:
         raise ValueError(f"view names must be unique, repeated: {duplicates}")
 
-    # Targets are resolved before the viewer is touched, so a bad path costs
-    # nothing but the error. A view's own targets and bbox replace the shared ones one by one: a
-    # per-view bbox keeps the shared targets as what is drawn (targets: []
-    # drops them), and a per-view target list keeps the shared bbox.
+    # Targets and regions are resolved before the viewer is touched, so a bad
+    # path costs nothing but the error. A view's own targets, bbox, region and
+    # clip replace the shared ones one by one: a per-view bbox keeps the
+    # shared targets as what is drawn (targets: [] drops them).
     isolate = _parse_isolate(isolate)
-    per_view = [
-        _target_corners(
-            targets if spec["targets"] is None else spec["targets"],
-            bbox if spec["bbox"] is None else spec["bbox"],
-        )
-        for spec in specs
-    ]
+    per_view = []
+    for spec in specs:
+        if record is not None:
+            # The stored framing box, so the in-frame check means what it did.
+            box = next(
+                s.get("frame_bbox") for s in record["shots"] if safe_name(s["name"]) == spec["name"]
+            )
+            _, described, _ = _target_corners(spec["targets"], None)
+            corners = _box_corners(box[:3], box[3:], None) if box else []
+            per_view.append((corners, described, "replay", None, spec["_clip_shape"]))
+        else:
+            per_view.append(_resolve_view(spec, targets, bbox, region, clip))
 
     os.makedirs(output_dir, exist_ok=True)
     scene_viewer = _find_scene_viewer(pane_name)
@@ -1087,6 +1319,7 @@ def capture_viewport(
     moved_flags: dict[str, str | None] = {}
     proxies: list[list[str]] = []
     restore_problems: list[str] = []
+    stem = safe_name(prefix)
 
     result: dict[str, Any] = {
         "viewport": viewport.name(),
@@ -1097,7 +1330,13 @@ def capture_viewport(
         "camera_detached": None,
         "views": [],
         "problems": [],
+        "warnings": [],
     }
+    if overlays:
+        result["overlays"] = {o: extras.OVERLAY_LEGEND[o] for o in overlays}
+    if shading_note:
+        result["shading_note"] = shading_note
+    shot_list: list[dict[str, Any]] = []
     try:
         if state["camera_node"] is not None or state["camera_path"]:
             # A camera node's resolution and aspect would decide the frame, and
@@ -1120,8 +1359,21 @@ def capture_viewport(
         if shading is not None:
             _apply_shading(viewport, shading)
         result["shading"] = _current_shading(viewport)
-        for spec, name, (corners, described, framed_by) in zip(specs, names, per_view, strict=True):
-            path = os.path.join(output_dir, f"{safe_name(prefix)}_{name}.png").replace("\\", "/")
+        for spec, name, (corners, described, framed_by, rfacts, shape), stored in zip(
+            specs, names, per_view, fixed, strict=True
+        ):
+            path = os.path.join(output_dir, f"{stem}_{name}.png").replace("\\", "/")
+            view = dict(spec)
+            if spec["direction"] == "facing":
+                azimuth, elevation = extras.facing_angles(rfacts["normal"])
+                view.update(
+                    direction=None,
+                    azimuth=azimuth,
+                    elevation=elevation,
+                    projection=spec["projection"] or "persp",
+                )
+            chain = {"clip": shape, "overlays": overlays, "zebra": zebra}
+            force_proxy = bool(shape or overlays or compare)
             shot_proxies: list[str] = []
             proxies += [shot_proxies]
             # Each view starts from the caller's network: an earlier view may have
@@ -1130,7 +1382,14 @@ def capture_viewport(
             if scene_viewer.pwd().path() != viewer_network:
                 scene_viewer.setPwd(hou.node(viewer_network))
             drawn = _show_targets(
-                scene_viewer, described, follow_targets, show_target, moved_flags, shot_proxies
+                scene_viewer,
+                described,
+                follow_targets,
+                show_target,
+                moved_flags,
+                shot_proxies,
+                force_proxy,
+                chain,
             )
             proxied = set()
             if drawn.get("via") == "proxy":
@@ -1164,18 +1423,56 @@ def capture_viewport(
                 viewport,
                 state,
                 base,
-                spec,
+                view,
                 corners,
                 path,
                 max_size,
                 float(margin),
                 visible,
+                stored,
             )
-            # framed: what decided the framing ("bbox" or the target paths);
-            # frame_bbox: the world box that was fitted into the image.
+            if spec["direction"] == "facing":
+                shot["direction"] = {
+                    "facing": rfacts["normal"],
+                    "azimuth": view["azimuth"],
+                    "elevation": view["elevation"],
+                }
+            # framed: what decided the framing ("bbox", "region:<kind>" or the
+            # target paths); frame_bbox: the world box fitted into the image.
             shot["framed"] = framed_by
             shot["frame_bbox"] = _frame_box(corners)
+            if rfacts is not None:
+                shot["region"] = {
+                    "node": rfacts["node"],
+                    "faces": rfacts["prims"],
+                    "normal": rfacts["normal"],
+                }
+            if shape is not None:
+                shot["clip"] = shape
+            metric = _edge_metric(shot, drawn, described)
+            if metric is not None:
+                shot["edge_px"] = metric
+            if compare is not None and shot.get("file_exists"):
+                _shoot_compare(
+                    scene_viewer, viewport, shot, compare, chain, isolate, stem, name, described
+                )
+            drawn.pop("_measure", None)
             shot["drawn"] = drawn
+            camera = shot.pop("_camera")
+            shot.pop("_frame")
+            shot_list.append(
+                {
+                    "name": name,
+                    "targets": described,
+                    "azimuth": shot["azimuth"],
+                    "elevation": shot["elevation"],
+                    "framed": framed_by,
+                    "frame_bbox": shot["frame_bbox"],
+                    "clip": shape,
+                    "camera": {k: camera[k] for k in _CAMERA_KEYS},
+                    "pixels": list(shot["pixels"]),
+                }
+            )
             result["views"].append(shot)
             # A proxy lives for its own shot only: with isolate=False the next
             # view would draw it too.
@@ -1196,6 +1493,32 @@ def capture_viewport(
         if restore_view:
             restore_problems = _restore_state(viewport, state, base) + restore_problems
 
+    if shot_list:
+        shots_path = os.path.join(output_dir, f"{stem}_shots.json").replace("\\", "/")
+        extras.write_shot_list(
+            shots_path,
+            {
+                "kind": "fxhoudinimcp.capture_viewport.shots",
+                "version": 1,
+                "targets": targets if record is None else record.get("targets"),
+                "compare": compare,
+                "overlays": overlays,
+                "zebra": zebra,
+                "shading": shading,
+                "isolate": isolate,
+                "margin": margin,
+                "shots": shot_list,
+            },
+        )
+        result["shots_file"] = shots_path
+    if record is not None:
+        result["replayed"] = replay
+
+    _make_sheet(
+        result, output_dir, stem, sheet, sheet_columns, sheet_max, compare, overlays, min_edge_px
+    )
+    _readability(result, min_edge_px)
+
     for shot in result["views"]:
         if not shot.get("file_exists"):
             result["problems"].append(f"{shot['name']}: no image was written")
@@ -1205,6 +1528,11 @@ def capture_viewport(
             result["problems"].append(f"{shot['name']}: nothing is drawn where the target is")
         if shot.get("target_in_frame") is False:
             result["problems"].append(f"{shot['name']}: the target is not fully in frame")
+        if (shot.get("drawn") or {}).get("clipped_prims") == 0:
+            result["problems"].append(f"{shot['name']}: the clip region holds no faces")
+        pair = shot.get("compare") or {}
+        if pair.get("problem"):
+            result["problems"].append(f"{shot['name']}: {pair['problem']}")
         drawn = shot.get("drawn") or {}
         for target in drawn.get("hidden_by_isolate") or []:
             result["problems"].append(
@@ -1239,9 +1567,124 @@ def capture_viewport(
         result["restored"] = None
         # Display flags this call moved are put back whatever restore_view says.
         result["problems"] += restore_problems
+    if not result["warnings"]:
+        result.pop("warnings")
     result["success"] = not result["problems"] and result["restored"] is not False
     result["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
     return result
+
+
+def _shoot_compare(scene_viewer, viewport, shot, compare, chain, isolate, stem, name, described):
+    """The source through its own proxy, same camera and size; then the pair image."""
+    out_w, out_h = shot["pixels"]
+    rect = shot["_frame"][4]
+    source_path = os.path.join(os.path.dirname(shot["path"]), f"{stem}_{name}_source.png")
+    source_path = source_path.replace("\\", "/")
+    pair: dict[str, Any] = {"source": compare}
+    proxy = None
+    try:
+        proxy, facts = _make_proxy([hou.node(compare)], chain)
+        if scene_viewer.pwd().path() != "/obj":
+            scene_viewer.setPwd(hou.node("/obj"))
+            # setPwd rewrites the camera: put this shot's camera back.
+            _write_camera(viewport, shot["_camera"])
+        visible = [proxy.path()] if isolate is not False else None
+        written, pixel, _ = _flipbook_checked(
+            scene_viewer, viewport, source_path, out_w, out_h, visible, rect
+        )
+        pair.update(source_image=written, source_drawn_fraction=pixel.get("drawn_fraction"))
+        if facts.get("clipped_prims") is not None:
+            pair["source_clipped_prims"] = facts["clipped_prims"]
+        if _camera_differences(shot["_camera"], _read_camera(viewport)):
+            pair["problem"] = "the camera moved between the result and the source shot"
+        elif not extras.file_ok(written):
+            pair["problem"] = "no source image was written"
+        else:
+            combined = os.path.join(
+                os.path.dirname(shot["path"]), f"{stem}_{name}_compare.png"
+            ).replace("\\", "/")
+            composed = extras.compose_pair(
+                written,
+                shot["path"],
+                (f"SOURCE  {compare}", f"RESULT  {', '.join(described)}"),
+                combined,
+            )
+            pair.update(image=composed["path"], pixels=composed["pixels"])
+    except Exception as exc:  # noqa: BLE001 - reported as a problem
+        pair["problem"] = f"compare failed: {type(exc).__name__}: {exc}"
+    finally:
+        if proxy is not None:
+            with hou.undos.disabler(), contextlib.suppress(Exception):
+                proxy.destroy()
+    shot["compare"] = pair
+
+
+def _make_sheet(
+    result, output_dir, stem, sheet, columns, sheet_max, compare, overlays, min_edge_px
+):
+    shots = [s for s in result["views"] if s.get("file_exists")]
+    if sheet is None:
+        sheet = len(result["views"]) > 1
+    if not sheet or not shots:
+        return
+    cells = []
+    for shot in shots:
+        image = (shot.get("compare") or {}).get("image") or shot["path"]
+        label = f"{shot['name']}   az {shot['azimuth']:g}  el {shot['elevation']:g}"
+        cells.append({"path": image, "label": label, "shot": shot})
+    header_bits = []
+    if compare:
+        header_bits.append("each cell: SOURCE left, RESULT right")
+    if overlays:
+        header_bits.append("; ".join(extras.OVERLAY_LEGEND[o] for o in overlays))
+    path = os.path.join(output_dir, f"{stem}_sheet.png").replace("\\", "/")
+    try:
+        # Labels are drawn before the edge metric is known per cell scale, so
+        # scale first, then label.
+        sizes = []
+        _, QtGui = extras._qt()
+        for cell in cells:
+            image = QtGui.QImage(cell["path"])
+            sizes.append((image.width(), image.height()))
+        head = extras.LABEL_H if header_bits else 0
+        layout = extras.sheet_layout(sizes, sheet_max - head, columns)
+        for cell, scale in zip(cells, layout["scales"], strict=True):
+            shot = cell["shot"]
+            edge = (shot.get("edge_px") or {}).get("median")
+            if edge is not None:
+                # A pair image holds the result at full size: same scale.
+                shot["sheet_edge_px"] = round(edge * scale, 2)
+                cell["label"] += f"   edge {shot['sheet_edge_px']:g}px"
+                cell["warn"] = shot["sheet_edge_px"] < min_edge_px
+            shot["sheet_scale"] = round(scale, 4)
+        composed = extras.compose_sheet(
+            cells, path, sheet_max, columns, "   |   ".join(header_bits) or None
+        )
+    except Exception as exc:  # noqa: BLE001 - reported
+        result["problems"].append(f"contact sheet failed: {type(exc).__name__}: {exc}")
+        return
+    result["sheet"] = {k: composed[k] for k in ("path", "pixels", "columns", "rows")}
+
+
+def _readability(result, min_edge_px):
+    """Warn where edges are too short on screen to read the wiring.
+
+    The median, not the mean: a few long edges (a cover plate, a big flat
+    face) lift the mean while the dense wiring next to them is unreadable.
+    """
+    for shot in result["views"]:
+        where = "sheet" if "sheet_edge_px" in shot else "image"
+        value = shot.get("sheet_edge_px")
+        if value is None:
+            value = (shot.get("edge_px") or {}).get("median")
+        if value is None:
+            continue
+        if value < min_edge_px:
+            result["warnings"].append(
+                f"{shot['name']}: median edge {value:g}px in the {where} (< {min_edge_px:g}); "
+                f"the wiring cannot be read -- split the views or shoot a close-up "
+                f"(az {shot['azimuth']:g}, el {shot['elevation']:g})"
+            )
 
 
 register_handler("viewport.capture_viewport", capture_viewport)
