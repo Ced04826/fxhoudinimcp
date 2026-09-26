@@ -257,7 +257,16 @@ def fxapi(request):
     inline = _query_value(request, "json")
     filename = _query_value(request, "file")
     if bool(inline) == bool(filename):
-        return _rpc_error("INVALID_REQUEST", "Provide exactly one of 'json' or 'file'")
+        # A "?" inside an inline payload lands here too: hwebserver decodes the
+        # query a second time and re-splits it, so "json" disappears. The
+        # bridge sends such payloads through the file tunnel; an older bridge
+        # does not.
+        return _rpc_error(
+            "INVALID_REQUEST",
+            "Provide exactly one of 'json' or 'file' (an inline payload containing "
+            "'?' or '&' is re-split by hwebserver; update the MCP server's bridge, "
+            "which sends such payloads through the file tunnel)",
+        )
 
     try:
         raw = inline if inline is not None else _read_tunnel_file(filename)

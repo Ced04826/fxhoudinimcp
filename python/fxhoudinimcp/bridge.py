@@ -41,7 +41,13 @@ TUNNEL_DIRECTORY = "fxhoudinimcp"
 # 22.0.368 the code ``x = 1 + 2`` reached execute_python as ``x = 1   2`` and a
 # ``+=`` in a wrangle silently became ``=``. The file tunnel is read verbatim,
 # so any payload containing these goes through it regardless of size.
-_INLINE_UNSAFE = ("+", "%")
+# The same second pass re-splits the query: an encoded "&" (``%26``) ends the
+# ``json`` value, which then fails to parse, and an encoded "?" (``%3F``)
+# starts a new query string, so the plugin sees no ``json`` at all and answers
+# "Provide exactly one of 'json' or 'file'" -- VEX ternaries and ``&&`` in
+# wrangle code hit both. A probe of every ASCII punctuation character on
+# 22.0.368 found only these four damaged.
+_INLINE_UNSAFE = ("+", "%", "&", "?")
 
 
 def _rpc_payload(func_name: str, **kwargs: Any) -> str:

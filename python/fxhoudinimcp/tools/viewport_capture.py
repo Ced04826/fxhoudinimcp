@@ -45,12 +45,17 @@ async def capture_viewport(
     written pixels. The viewer's view type, cameras and shading are restored
     afterwards and read back (`restored`).
 
-    The viewer draws the display node of the network it is in, so a target
-    elsewhere would be framed but not drawn. The capture points the viewer
-    at the SOP targets' network (follow_targets) and checks each target is
-    what is drawn (`drawn.targets_drawn`); a target that is not its network's
-    display node is a problem unless show_target moves the display flag onto
-    it for the capture. Network and flags are put back afterwards.
+    targets decide what is drawn; bbox, when given, decides the framing on
+    its own, so a close-up of part of a target inside a subnet is one call
+    (targets + bbox). The viewer draws the display node of the network it is
+    in: the capture points it at the SOP targets' network (follow_targets),
+    and a target that is not that network's display node (or targets in
+    several networks) is drawn through a temporary proxy object at /obj --
+    an Object Merge of the targets, removed after the shot -- so no display
+    flag anywhere moves. show_target moves the flag onto the target instead.
+    `drawn` says how (`via`: viewer or proxy) and `targets_drawn` whether
+    each target is in the image. Network, flags and camera are put back
+    afterwards.
 
     At /obj every displayed object is drawn, and inside a SOP network the
     other objects are ghosted over the one being edited. isolate draws only
@@ -65,14 +70,19 @@ async def capture_viewport(
             "azimuth"/"elevation" (degrees; azimuth 0 looks from +Z, 90 from
             +X; elevation 90 from above), optional "projection" ("ortho" or
             "persp"; custom angles default to persp), "name", and per-view
-            "targets"/"bbox". Directions: "front", "back", "left", "right",
+            "targets"/"bbox", each replacing the shared one on its own (a
+            per-view bbox keeps the shared targets; "targets": [] drops
+            them). Directions: "front", "back", "left", "right",
             "top", "bottom" (orthographic), "persp" (the perspective view's
             current angle), "current" (the view as it is). Default
             ["current"].
-        targets: SOP or object node paths to frame; the union of their
-            bounding boxes. Without targets or bbox, "current" is captured
-            as is and other directions frame everything.
+        targets: SOP or object node paths to draw; framed by the union of
+            their bounding boxes unless bbox is given. Without targets or
+            bbox, "current" is captured as is and other directions frame
+            everything.
         bbox: World-space box to frame, [xmin, ymin, zmin, xmax, ymax, zmax].
+            With targets: frames this box only, the targets are what is
+            drawn.
         shading: Shading for the capture, e.g. "smooth_wire" to see the
             wiring, "wire", "smooth", "flat_wire", "hidden_line". Applied to
             the edited object, other objects and selected objects, and
@@ -95,7 +105,9 @@ async def capture_viewport(
     Returns per view: path, pixels, isolated (the objects drawn alone, or
     null), target_rect (image pixels, origin top
     left), target_in_frame, target_fill, drawn_fraction (share of the target
-    region actually drawn on), drawn (network, display_node, targets_drawn),
+    region actually drawn on), framed ("bbox" or the target paths),
+    frame_bbox (the world box fitted), drawn (via, network, display_node,
+    targets_drawn, and proxy with proxy_points/target_points),
     projection, looking_along, pivot, and ortho_width or distance with
     fov_x_deg. success is false when an image is missing or blank where the
     target is, a target is not fully in frame or not drawn, or the viewer

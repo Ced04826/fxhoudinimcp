@@ -264,9 +264,70 @@ class TestTargetsAreDrawn:
         assert facts["targets_drawn"] == {"/obj/geo1/net/mid": True}
         assert moved == {"/obj/geo1/net": "/obj/geo1/net/out"}
 
-    def test_a_bbox_alone_needs_no_drawing_check(self):
-        facts = vc._show_targets(MagicMock(), ["bbox"], True, False, {})
+    def test_a_non_display_target_is_drawn_through_a_proxy(self, monkeypatch):
+        other, net = self._network("/obj/geo1/other"), self._network("/obj/geo1/net")
+        net._display = self._sop("/obj/geo1/net/out", net)
+        target = self._sop("/obj/geo1/net/mid", net)
+        obj = self._network("/obj")
+        nodes = {"/obj/geo1/net/mid": target, "/obj/geo1/net": net, "/obj": obj}
+        monkeypatch.setattr(vc.hou, "node", lambda path: nodes.get(path))
+        proxy = MagicMock()
+        proxy.path.return_value = "/obj/__fxmcp_capture_proxy"
+        made = []
+
+        def make(sops):
+            made.append([n.path() for n in sops])
+            return proxy, {"proxy": proxy.path(), "proxy_points": 8, "target_points": 8}
+
+        monkeypatch.setattr(vc, "_make_proxy", make)
+        viewer = MagicMock()
+        viewer._pwd = other
+        viewer.pwd.side_effect = lambda: viewer._pwd
+        viewer.setPwd.side_effect = lambda node: setattr(viewer, "_pwd", node)
+        moved, proxies = {}, []
+
+        facts = vc._show_targets(viewer, ["/obj/geo1/net/mid"], True, False, moved, proxies)
+        assert made == [["/obj/geo1/net/mid"]]
+        assert proxies == ["/obj/__fxmcp_capture_proxy"]
+        assert facts["via"] == "proxy" and facts["network"] == "/obj"
+        assert facts["targets_drawn"] == {"/obj/geo1/net/mid": True}
+        assert moved == {}, "no display flag is moved"
+
+    def test_no_targets_need_no_drawing_check(self):
+        facts = vc._show_targets(MagicMock(), [], True, False, {})
         assert facts["targets_drawn"] == {}
+
+
+class TestTargetsDrawBboxFrames:
+    """targets decide what is drawn, bbox decides the framing."""
+
+    @pytest.fixture
+    def scene(self, monkeypatch):
+        node = MagicMock()
+        node.path.return_value = "/obj/geo1/sub/part"
+        box = MagicMock()
+        box.minvec.return_value = (0.0, 0.0, 0.0)
+        box.maxvec.return_value = (10.0, 1.0, 1.0)
+        geometry = MagicMock()
+        geometry.intrinsicValue.return_value = 100
+        geometry.boundingBox.return_value = box
+        monkeypatch.setattr(vc.hou, "node", lambda path: node)
+        monkeypatch.setattr(vc, "_geometry_of", lambda n: (geometry, None))
+        monkeypatch.setattr(vc.hou, "Vector3", lambda x, y, z: (x, y, z))
+
+    def test_bbox_alone_decides_the_framing(self, scene):
+        corners, drawn, framed = vc._target_corners(["/obj/geo1/sub/part"], [0, 0, 0, 1, 1, 1])
+        assert drawn == ["/obj/geo1/sub/part"]
+        assert framed == "bbox"
+        assert vc._frame_box(corners) == [0, 0, 0, 1, 1, 1]
+
+    def test_without_bbox_the_targets_are_framed(self, scene):
+        corners, drawn, framed = vc._target_corners(["/obj/geo1/sub/part"], None)
+        assert framed == ["/obj/geo1/sub/part"]
+        assert vc._frame_box(corners) == [0, 0, 0, 10, 1, 1]
+
+    def test_nothing_given_frames_nothing(self, scene):
+        assert vc._target_corners(None, None) == ([], [], None)
 
 
 class TestIsolate:
@@ -315,8 +376,8 @@ class TestIsolate:
 
     def test_true_isolates_the_targets_objects_only(self, monkeypatch):
         self._scene(monkeypatch)
-        described = ["/obj/a/box1", "bbox", "/obj/sub/c/tube1"]
+        described = ["/obj/a/box1", "/obj/sub/c/tube1"]
         assert vc._isolated_objects(True, described) == ["/obj/a", "/obj/sub/c"]
-        assert vc._isolated_objects(True, ["bbox"]) is None
+        assert vc._isolated_objects(True, []) is None
         assert vc._isolated_objects(False, described) is None
-        assert vc._isolated_objects(["/obj/a"], ["bbox"]) == ["/obj/a"]
+        assert vc._isolated_objects(["/obj/a"], []) == ["/obj/a"]

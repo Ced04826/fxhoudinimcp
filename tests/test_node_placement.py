@@ -422,6 +422,10 @@ _PLACEMENT_EXEMPT = {
     # leaves the first node of a network where it is, so there is nothing to do.
     ("import_file", "lopnet"),
     ("import_file", "geo"),
+    # capture_viewport's proxy object and its one Object Merge: drawn for one
+    # flipbook through the object mask and destroyed after the shot.
+    ("_make_proxy", "obj_root"),
+    ("_make_proxy", "proxy"),
 }
 
 

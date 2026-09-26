@@ -46,18 +46,31 @@ class TestRPCTransport:
             if path is not None:
                 path.unlink(missing_ok=True)
 
-    @pytest.mark.parametrize("code", ["x = 1 + 2", "s = '%2B'", "@P += @N * 0.1;"])
-    def test_plus_and_percent_never_travel_inline(self, code):
-        """hwebserver decodes the query string twice, so ``+`` arrives as a space.
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "x = 1 + 2",
+            "s = '%2B'",
+            "@P += @N * 0.1;",
+            "f@a = @Cd.r > 0.5 ? 1 : 0;",
+            "if (@P.y > 0 && @P.x < 1) v@Cd = {0,0.2,1};",
+            "result = '?'",
+            "result = 1 & 1",
+        ],
+    )
+    def test_query_unsafe_characters_never_travel_inline(self, code):
+        """hwebserver decodes the query string twice and then splits it again.
 
         Verified on 22.0.368: the one-line ``x = 1 + 2`` reached execute_python as
-        ``x = 1   2``. Payloads carrying these characters must take the file
+        ``x = 1   2``; an ``&`` cut the ``json`` value short (JSONDecodeError)
+        and a ``?`` hid it altogether ("Provide exactly one of 'json' or
+        'file'"). Payloads carrying these characters must take the file
         tunnel, which is read verbatim, however short they are.
         """
         payload = _rpc_payload("mcp.execute", command="code.execute_python", params={"code": code})
         params, path = _rpc_query(payload)
         try:
-            assert path is not None, "payload with '+' or '%' went inline"
+            assert path is not None, "payload with '+', '%', '&' or '?' went inline"
             assert params == {"file": str(path)}
             assert json.loads(path.read_text(encoding="utf-8"))[2]["params"]["code"] == code
         finally:

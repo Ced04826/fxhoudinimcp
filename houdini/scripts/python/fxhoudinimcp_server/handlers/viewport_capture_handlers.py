@@ -366,18 +366,16 @@ def safe_name(name: Any) -> str:
 ###### Targets
 
 
-def _target_corners(targets: Any, bbox: Any) -> tuple[list, list[str]]:
-    """World-space corners of the union of *targets* and *bbox*, and what they are."""
-    corners: list = []
+def _target_corners(targets: Any, bbox: Any) -> tuple[list, list[str], Any]:
+    """Framing corners, the target paths to draw, and what the framing came from.
+
+    targets decide what is drawn; bbox, when given, decides the framing on its
+    own, so a close-up of part of a target is one call. Without a bbox the
+    union of the targets' bounding boxes is framed. The third value is
+    "bbox", the list of target paths, or None when there is nothing to frame.
+    """
+    target_corners: list = []
     described: list[str] = []
-    if bbox is not None:
-        if not isinstance(bbox, (list, tuple)) or len(bbox) != 6:
-            raise ValueError(f"bbox must be [xmin, ymin, zmin, xmax, ymax, zmax], not {bbox!r}")
-        lo, hi = [float(v) for v in bbox[:3]], [float(v) for v in bbox[3:]]
-        if any(h < low for low, h in zip(lo, hi, strict=True)):
-            raise ValueError(f"bbox max is below min: {bbox!r}")
-        corners += _box_corners(lo, hi, None)
-        described.append("bbox")
     if isinstance(targets, str):
         targets = [targets]
     for path in targets or []:
@@ -388,9 +386,25 @@ def _target_corners(targets: Any, bbox: Any) -> tuple[list, list[str]]:
         if geometry is None or geometry.intrinsicValue("pointcount") == 0:
             raise ValueError(f"target {node.path()} has no points to frame")
         box = geometry.boundingBox()
-        corners += _box_corners(list(box.minvec()), list(box.maxvec()), transform)
+        target_corners += _box_corners(list(box.minvec()), list(box.maxvec()), transform)
         described.append(node.path())
-    return corners, described
+    if bbox is not None:
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 6:
+            raise ValueError(f"bbox must be [xmin, ymin, zmin, xmax, ymax, zmax], not {bbox!r}")
+        lo, hi = [float(v) for v in bbox[:3]], [float(v) for v in bbox[3:]]
+        if any(h < low for low, h in zip(lo, hi, strict=True)):
+            raise ValueError(f"bbox max is below min: {bbox!r}")
+        return _box_corners(lo, hi, None), described, "bbox"
+    return target_corners, described, (described or None)
+
+
+def _frame_box(corners: list) -> list[float] | None:
+    """[xmin, ymin, zmin, xmax, ymax, zmax] of the framing corners, for the receipt."""
+    if not corners:
+        return None
+    lo = [min(c[i] for c in corners) for i in range(3)]
+    hi = [max(c[i] for c in corners) for i in range(3)]
+    return [round(v, 6) for v in lo + hi]
 
 
 def _geometry_of(node: hou.Node) -> tuple[Any, Any]:
@@ -721,7 +735,7 @@ def _isolated_objects(isolate: bool | list[str], described: list[str]) -> list[s
         return None
     if isolate is not True:
         return isolate
-    owners = [_owning_object(hou.node(path)) for path in described if path != "bbox"]
+    owners = [_owning_object(hou.node(path)) for path in described]
     return sorted({owner.path() for owner in owners if owner is not None}) or None
 
 
@@ -866,19 +880,66 @@ def _drawn(scene_viewer) -> dict[str, Any]:
     return facts
 
 
-def _show_targets(scene_viewer, described, follow, show_target, moved_flags) -> dict[str, Any]:
+_PROXY_NAME = "__fxmcp_capture_proxy"
+
+
+def _make_proxy(sops: list) -> tuple[Any, dict[str, Any]]:
+    """A temporary object at /obj that draws *sops* in world space.
+
+    An Object Merge "into this object" on an object with no transform: the
+    geometry the targets cook to, where it sits in the world, drawn by an
+    object the flipbook mask can show alone. No flag, network or parameter of
+    the user's nodes is touched, and nothing enters the undo history. Returns
+    (proxy object, facts); the caller destroys it.
+    """
+    with hou.undos.disabler():
+        obj_root = hou.node("/obj")
+        name, index = _PROXY_NAME, 1
+        while obj_root.node(name) is not None:
+            index += 1
+            name = f"{_PROXY_NAME}{index}"
+        proxy = obj_root.createNode("geo", name, run_init_scripts=False)
+        try:
+            merge = proxy.createNode("object_merge", "targets")
+            merge.parm("numobj").set(len(sops))
+            for i, node in enumerate(sops, start=1):
+                merge.parm(f"objpath{i}").set(node.path())
+            merge.parm("xformtype").set("local")
+            merge.setDisplayFlag(True)
+            merge.setRenderFlag(True)
+            proxy.setDisplayFlag(True)
+            merge.cook(force=True)
+            merged = merge.geometry()
+            points = merged.intrinsicValue("pointcount") if merged is not None else 0
+        except Exception:
+            proxy.destroy()
+            raise
+    expected = 0
+    for node in sops:
+        with contextlib.suppress(Exception):
+            expected += node.geometry().intrinsicValue("pointcount")
+    return proxy, {"proxy": proxy.path(), "proxy_points": points, "target_points": expected}
+
+
+def _show_targets(
+    scene_viewer, described, follow, show_target, moved_flags, proxies=None
+) -> dict[str, Any]:
     """Point the viewer at the targets and report whether it draws them.
 
-    The viewer draws the display node of the network it is in. A target in
-    another network, or one that is not its network's display node, gets
-    framed but not drawn, and the image shows whatever else sits there -- a
-    capture that looked like evidence and was not. *moved_flags* collects
-    {network: previous display node} for every display flag moved here.
+    The viewer draws the display node of the network it is in. A SOP target
+    that is its network's display node is drawn there as the artist sees it.
+    Any other SOP target -- upstream of the display flag, or in a network
+    other than the one the viewer can follow -- is drawn through a temporary
+    proxy object (see _make_proxy), with the viewer at /obj for the shot,
+    unless show_target moves the display flag onto it instead. Without a
+    proxy list (proxies=None) such a target is reported as framed but not
+    drawn. *moved_flags* collects {network: previous display node} for every
+    display flag moved here; *proxies* collects the proxy objects made.
     """
-    nodes = [hou.node(path) for path in described if path != "bbox"]
+    nodes = [hou.node(path) for path in described]
     sops = [n for n in nodes if n is not None and n.type().category().name() == "Sop"]
     objects = [n for n in nodes if n is not None and n.type().category().name() == "Object"]
-    facts: dict[str, Any] = {}
+    facts: dict[str, Any] = {"via": "viewer"}
     if follow and sops:
         networks = sorted({n.parent().path() for n in sops})
         if len(networks) == 1:
@@ -898,6 +959,18 @@ def _show_targets(scene_viewer, described, follow, show_target, moved_flags) -> 
             display = parent.displayNode()
             showing = display is not None and display.path() == node.path()
         drawn[node.path()] = showing and parent.path() == network.path()
+    if proxies is not None and any(not drawn[n.path()] for n in sops):
+        # One proxy for all SOP targets: the viewer can be in one network only,
+        # and at /obj the natively drawn ones would disappear too.
+        proxy, proxy_facts = _make_proxy(sops)
+        proxies.append(proxy.path())
+        scene_viewer.setPwd(hou.node("/obj"))
+        network = scene_viewer.pwd()
+        whole = proxy_facts["proxy_points"] == proxy_facts["target_points"]
+        for node in sops:
+            drawn[node.path()] = whole
+        facts.update(via="proxy", **proxy_facts)
+        facts.pop("note", None)
     for node in objects:
         drawn[node.path()] = bool(node.isDisplayFlagSet())
     display = network.displayNode() if hasattr(network, "displayNode") else None
@@ -910,10 +983,21 @@ def _show_targets(scene_viewer, described, follow, show_target, moved_flags) -> 
 
 
 def _restore_targets(
-    scene_viewer, viewer_network: str, moved_flags, restore_view: bool
+    scene_viewer, viewer_network: str, moved_flags, restore_view: bool, proxies=()
 ) -> list[str]:
-    """Put back the display flags moved and, with restore_view, the viewer's network."""
+    """Remove the proxies, put back the display flags moved and the viewer's network.
+
+    The viewer's network goes back before its camera does (see
+    capture_viewport): on 22.0.368 setPwd rewrites the viewport camera.
+    """
     problems: list[str] = []
+    for path in proxies:
+        with hou.undos.disabler(), contextlib.suppress(Exception):
+            node = hou.node(path)
+            if node is not None:
+                node.destroy()
+        if hou.node(path) is not None:
+            problems.append(f"the capture proxy {path} could not be removed")
     for network, previous in moved_flags.items():
         if previous is None:
             continue
@@ -958,11 +1042,14 @@ def capture_viewport(
     """Flipbook the Scene Viewer from one or more views, framed on a target.
 
     See the module docstring for what is captured and how framing is checked.
+    targets decide what is drawn, bbox (when given) decides the framing.
     follow_targets points the viewer at the SOP targets' network for the
-    capture; show_target moves the display flag onto a SOP target that is not
-    its network's display node. Both are put back afterwards. isolate draws
-    only the targets' objects (or the objects listed), so other displayed
-    objects and their ghosts do not overlap the target.
+    capture; a SOP target that is not its network's display node is drawn
+    through a temporary proxy object at /obj (see _show_targets), or, with
+    show_target, by moving the display flag onto it. Network, flags and
+    proxies are put back or removed afterwards. isolate draws only the
+    targets' objects (or the objects listed), so other displayed objects and
+    their ghosts do not overlap the target.
     """
     started = time.perf_counter()
     if not isinstance(max_size, int) or isinstance(max_size, bool) or not 256 <= max_size <= 4096:
@@ -978,13 +1065,15 @@ def capture_viewport(
         raise ValueError(f"view names must be unique, repeated: {duplicates}")
 
     # Targets are resolved before the viewer is touched, so a bad path costs
-    # nothing but the error.
+    # nothing but the error. A view's own targets and bbox replace the shared ones one by one: a
+    # per-view bbox keeps the shared targets as what is drawn (targets: []
+    # drops them), and a per-view target list keeps the shared bbox.
     isolate = _parse_isolate(isolate)
-    shared = _target_corners(targets, bbox)
     per_view = [
-        _target_corners(spec["targets"], spec["bbox"])
-        if spec["targets"] is not None or spec["bbox"] is not None
-        else shared
+        _target_corners(
+            targets if spec["targets"] is None else spec["targets"],
+            bbox if spec["bbox"] is None else spec["bbox"],
+        )
         for spec in specs
     ]
 
@@ -996,6 +1085,8 @@ def capture_viewport(
     base = state["camera"]
     viewer_network = scene_viewer.pwd().path()
     moved_flags: dict[str, str | None] = {}
+    proxies: list[list[str]] = []
+    restore_problems: list[str] = []
 
     result: dict[str, Any] = {
         "viewport": viewport.name(),
@@ -1007,7 +1098,6 @@ def capture_viewport(
         "views": [],
         "problems": [],
     }
-    restore_problems: list[str] = []
     try:
         if state["camera_node"] is not None or state["camera_path"]:
             # A camera node's resolution and aspect would decide the frame, and
@@ -1030,13 +1120,39 @@ def capture_viewport(
         if shading is not None:
             _apply_shading(viewport, shading)
         result["shading"] = _current_shading(viewport)
-        for spec, name, (corners, described) in zip(specs, names, per_view, strict=True):
+        for spec, name, (corners, described, framed_by) in zip(specs, names, per_view, strict=True):
             path = os.path.join(output_dir, f"{safe_name(prefix)}_{name}.png").replace("\\", "/")
-            drawn = _show_targets(scene_viewer, described, follow_targets, show_target, moved_flags)
-            visible = _isolated_objects(isolate, described)
+            shot_proxies: list[str] = []
+            proxies += [shot_proxies]
+            # Each view starts from the caller's network: an earlier view may have
+            # followed its targets elsewhere or gone to /obj for a proxy. The
+            # camera is written for every shot, so setPwd's camera change is moot.
+            if scene_viewer.pwd().path() != viewer_network:
+                scene_viewer.setPwd(hou.node(viewer_network))
+            drawn = _show_targets(
+                scene_viewer, described, follow_targets, show_target, moved_flags, shot_proxies
+            )
+            proxied = set()
+            if drawn.get("via") == "proxy":
+                proxied = {
+                    p
+                    for p in described
+                    if hou.node(p) is not None and hou.node(p).type().category().name() == "Sop"
+                }
+                if isolate is True:
+                    others = [p for p in described if p not in proxied]
+                    visible = sorted(set(shot_proxies) | set(_isolated_objects(True, others) or []))
+                elif isolate is False:
+                    visible = None
+                else:
+                    visible = sorted(set(isolate) | set(shot_proxies))
+            else:
+                visible = _isolated_objects(isolate, described)
             if visible:
                 hidden = []
                 for target in drawn["targets_drawn"]:
+                    if target in proxied:
+                        continue
                     owner = _owning_object(hou.node(target))
                     if owner is None or owner.path() not in visible:
                         hidden.append(target)
@@ -1055,15 +1171,30 @@ def capture_viewport(
                 float(margin),
                 visible,
             )
-            shot["framed"] = described or None
+            # framed: what decided the framing ("bbox" or the target paths);
+            # frame_bbox: the world box that was fitted into the image.
+            shot["framed"] = framed_by
+            shot["frame_bbox"] = _frame_box(corners)
             shot["drawn"] = drawn
             result["views"].append(shot)
+            # A proxy lives for its own shot only: with isolate=False the next
+            # view would draw it too.
+            restore_problems += _restore_targets(
+                scene_viewer, viewer_network, {}, False, shot_proxies
+            )
+            shot_proxies.clear()
     finally:
-        if restore_view:
-            restore_problems = _restore_state(viewport, state, base)
+        # Network and flags first: setPwd rewrites the viewport camera, so the
+        # camera is written back after it.
         restore_problems += _restore_targets(
-            scene_viewer, viewer_network, moved_flags, restore_view
+            scene_viewer,
+            viewer_network,
+            moved_flags,
+            restore_view,
+            [p for group in proxies for p in group],
         )
+        if restore_view:
+            restore_problems = _restore_state(viewport, state, base) + restore_problems
 
     for shot in result["views"]:
         if not shot.get("file_exists"):
@@ -1083,7 +1214,13 @@ def capture_viewport(
         for target, showing in (drawn.get("targets_drawn") or {}).items():
             if target in (drawn.get("hidden_by_isolate") or []):
                 continue
-            if not showing:
+            if not showing and drawn.get("via") == "proxy":
+                result["problems"].append(
+                    f"{shot['name']}: {target} is framed but the capture proxy drew "
+                    f"{drawn.get('proxy_points')} points of the targets' "
+                    f"{drawn.get('target_points')}"
+                )
+            elif not showing:
                 result["problems"].append(
                     f"{shot['name']}: {target} is framed but not drawn -- the viewer draws "
                     f"{drawn.get('display_node')} in {drawn.get('network')}; set its display "
