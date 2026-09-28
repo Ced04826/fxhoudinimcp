@@ -9,8 +9,10 @@ plus the few that answer the same questions (attributes, groups, sections,
 docs); "full" registers everything. The script client (fxhoudinimcp.client)
 always sees every tool: the switch only decides what an MCP client is shown.
 
-The instruction header states the count, and under a toolset that there are
-more, so an agent does not conclude that a tool it cannot see does not exist.
+The rest are not gone: under a toolset three gateway tools are registered as
+well (see gateway.py), list_toolsets, describe_tools and call_tool, the way
+the Unreal MCP exposes its toolsets, so a DOP or USD tool is two calls away
+with no restart and no config change. The instruction header says so.
 """
 
 from __future__ import annotations
@@ -90,10 +92,15 @@ MODELING = frozenset(
 
 TOOLSETS: dict[str, frozenset[str] | None] = {"full": None, "modeling": MODELING}
 
+# Registered under any toolset that leaves tools out; see gateway.py.
+GATEWAY = frozenset({"list_toolsets", "describe_tools", "call_tool"})
+
 # Filled by fxhoudinimcp.server as the tool modules register: tool name ->
-# the tool module's short name (the category).
+# the tool module's short name (the category), and tool name -> function for
+# every tool, registered or not, which is what call_tool runs.
 REGISTERED: dict[str, str] = {}
 SKIPPED: dict[str, str] = {}
+FUNCTIONS: dict[str, object] = {}
 
 _warned: set[str] = set()
 
@@ -115,18 +122,17 @@ def active() -> str:
 
 def allows(tool_name: str, toolset: str) -> bool:
     members = TOOLSETS.get(toolset)
-    return members is None or tool_name in members
+    return members is None or tool_name in members or tool_name in GATEWAY
 
 
-def summary(registered: dict[str, str], skipped: dict[str, str], toolset: str) -> str:
+def summary(registered: dict[str, str], skipped: dict[str, str]) -> str:
     """The instruction header's count: "215 tools across 26 categories", or
-    "50 of 215 tools (toolset modeling)" when a toolset left some out."""
+    "53 tools, 165 more via list_toolsets" when a toolset left some out."""
     if skipped:
-        total = len(registered) + len(skipped)
-        return f"{len(registered)} of {total} tools (toolset {toolset})"
+        return f"{len(registered)} tools, {len(skipped)} more via list_toolsets"
     categories = len(set(registered.values()))
     return f"{len(registered)} tools across {categories} categories"
 
 
 def current_summary() -> str:
-    return summary(REGISTERED, SKIPPED, active())
+    return summary(REGISTERED, SKIPPED)

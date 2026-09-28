@@ -7,6 +7,7 @@ Each submodule uses the `@mcp.tool()` decorator at import time.
 
 from __future__ import annotations
 
+from fxhoudinimcp import gateway
 from fxhoudinimcp.server import apply_instructions
 
 # Internal. Importing a tool module registers its tools on mcp.
@@ -39,5 +40,7 @@ from fxhoudinimcp.tools import (
     workflows,  # noqa: F401
 )
 
-# The instruction header counts what was just registered.
+# The gateway to the tools a toolset left out, then the instruction header,
+# which counts what was just registered.
+gateway.register()
 apply_instructions()

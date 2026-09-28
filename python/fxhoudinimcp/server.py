@@ -234,6 +234,7 @@ def _compact_tool(*args, **kwargs):
     def decorator(function):
         name = kwargs.get("name") or function.__name__
         category = function.__module__.rsplit(".", 1)[-1]
+        toolsets.FUNCTIONS[name] = function
         if not toolsets.allows(name, _TOOLSET):
             toolsets.SKIPPED[name] = category
             return function

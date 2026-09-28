@@ -219,7 +219,7 @@ class TestInstructionSize:
 
         # The longest header either toolset renders, with three-digit counts.
         longest = max(
-            ("215 tools across 26 categories", "999 of 999 tools (toolset modeling)"), key=len
+            ("215 tools across 26 categories", "999 tools, 999 more via list_toolsets"), key=len
         )
         for value in ("0", "1"):
             monkeypatch.setenv("FXHOUDINIMCP_AUTO_LAYOUT", value)
