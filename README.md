@@ -487,6 +487,7 @@ Once connected, your AI assistant can:
 | `FXHOUDINIMCP_TIMEOUT` | `120` | Seconds a command may run before the plugin reports a timeout |
 | `FXHOUDINIMCP_TIMEOUT_<COMMAND>` | unset | Per-command override, the dotted command name uppercased with dots as underscores: `FXHOUDINIMCP_TIMEOUT_TOPS_COOK_TOP_NODE=900` |
 | `FXHOUDINIMCP_OUTPUT_GRACE` | `2` | Seconds a clean render or cache write may take to show its file before the tool reports that nothing was written. Raise it when output lands on a slow network share |
+| `FXHOUDINIMCP_TOOLSET` | `full` | Which tools the MCP server registers: `full`, or `modeling` for the modeling set in `python/fxhoudinimcp/toolsets.py`. Every registered tool's name is listed to every session; the instructions header says when some were left out. `fxhoudinimcp.client` always reaches every tool |
 | `MCP_TRANSPORT` | `stdio` | MCP transport (`stdio` or `streamable-http`) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 

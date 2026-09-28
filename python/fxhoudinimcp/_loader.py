@@ -66,13 +66,18 @@ def load_markdown(name: str, **kwargs: str) -> str:
         **kwargs: Values to substitute into ``{placeholder}`` tokens in the
             markdown text.  The special keys ``network_housekeeping`` and
             ``layout_guidance`` are automatically populated from
-            ``shared/`` if not explicitly provided.
+            ``shared/`` if not explicitly provided; ``tool_summary`` from the
+            tools registered so far (toolsets.py).
 
     Returns:
         The formatted markdown string.
     """
     text = _read(name)
 
+    if "{tool_summary}" in text and "tool_summary" not in kwargs:
+        from fxhoudinimcp.toolsets import current_summary
+
+        kwargs["tool_summary"] = current_summary()
     if "{layout_guidance}" in text and "layout_guidance" not in kwargs:
         kwargs["layout_guidance"] = _layout_guidance()
     if "{network_housekeeping}" in text and "network_housekeeping" not in kwargs:

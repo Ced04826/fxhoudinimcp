@@ -173,7 +173,10 @@ class TestInstructionHeaderCounts:
         from fxhoudinimcp._loader import load_markdown
         from fxhoudinimcp.server import mcp
 
-        text = load_markdown("instructions/server_instructions.md")
+        # The header is rendered from the registry (toolsets.summary); this
+        # checks the rendering against what the server actually lists.
+        text = mcp.instructions
+        assert text == load_markdown("instructions/server_instructions.md")
         match = self._HEADER.search(text)
         assert match, "the 'N tools across M categories' sentence has gone missing"
 
@@ -214,9 +217,13 @@ class TestInstructionSize:
     def test_server_instructions_fit_the_client_cap(self, monkeypatch):
         from fxhoudinimcp._loader import load_markdown
 
+        # The longest header either toolset renders, with three-digit counts.
+        longest = max(
+            ("215 tools across 26 categories", "999 of 999 tools (toolset modeling)"), key=len
+        )
         for value in ("0", "1"):
             monkeypatch.setenv("FXHOUDINIMCP_AUTO_LAYOUT", value)
-            text = load_markdown("instructions/server_instructions.md")
+            text = load_markdown("instructions/server_instructions.md", tool_summary=longest)
             assert len(text) <= self._CAP, f"{len(text)} chars with AUTO_LAYOUT={value}"
 
     def test_discipline_guide_serves_the_full_rules(self):

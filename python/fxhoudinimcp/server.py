@@ -16,10 +16,11 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
+from fxhoudinimcp import toolsets
 from fxhoudinimcp._loader import load_markdown
 
 # Third-party
-from fxhoudinimcp._sdk import Server, build_server
+from fxhoudinimcp._sdk import Server, build_server, set_instructions
 from fxhoudinimcp._version import __version__
 
 # Internal
@@ -217,16 +218,27 @@ def compact_json(result: dict) -> str:
 
 _sdk_tool = mcp.tool
 
+# Read once: FXHOUDINIMCP_TOOLSET decides which tools this process registers.
+_TOOLSET = toolsets.active()
+
 
 def _compact_tool(*args, **kwargs):
     """mcp.tool(), registering a copy that answers in compact JSON.
 
     The module-level function stays the original, returning its dict, so code
-    and tests that call a tool directly see no difference.
+    and tests that call a tool directly see no difference. A tool the active
+    toolset leaves out is not registered at all (see toolsets.py).
     """
     register = _sdk_tool(*args, **kwargs)
 
     def decorator(function):
+        name = kwargs.get("name") or function.__name__
+        category = function.__module__.rsplit(".", 1)[-1]
+        if not toolsets.allows(name, _TOOLSET):
+            toolsets.SKIPPED[name] = category
+            return function
+        toolsets.REGISTERED[name] = category
+
         @functools.wraps(function)
         async def compact(*call_args, **call_kwargs):
             result = await function(*call_args, **call_kwargs)
@@ -245,3 +257,13 @@ def _compact_tool(*args, **kwargs):
 
 
 mcp.tool = _compact_tool
+
+
+def apply_instructions() -> None:
+    """Re-render the instructions once the tools are registered.
+
+    The header states how many tools this process registered, which is only
+    known after every tool module has been imported; fxhoudinimcp.tools calls
+    this at the end of its import.
+    """
+    set_instructions(mcp, load_markdown("instructions/server_instructions.md"))

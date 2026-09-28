@@ -79,10 +79,13 @@ async def capture_viewport(
     suspect places, then shoot close-ups there: region + clip, the "facing"
     direction, overlays; compare against the source for missing features.
     Every call writes <prefix>_shots.json; replay it after a repair to shoot
-    the same views. Several views are also laid out on <prefix>_sheet.png
+    the same views, or with other targets to shoot the source the same way.
+    A later call under the same prefix adds its views to the list (same name
+    replaces). Several views are also laid out on <prefix>_sheet.png
     (long side sheet_max), each cell labelled with its view name, azimuth
     and elevation, and edge_px says how long an edge is on screen: below
-    min_edge_px a warning says the wiring cannot be read there.
+    min_edge_px a warning says the wiring cannot be read there, and
+    close_up_hints gives boxes around the densest places to shoot next.
 
     Surfaces are lit from the camera by default (lighting="headlight"): a
     face turned to the camera is bright from any side, a face seen edge-on
@@ -136,10 +139,10 @@ async def capture_viewport(
             "radius": r}, {"bbox": [...]}, {"group": name} (primitive group,
             else point group) or {"prims": [numbers]}; group and prims read
             the first SOP target, or "node". World space. Frames the region.
-        clip: Draw only the faces in the region (its sphere, else its box; a
-            face stays when one of its points or its centroid is inside), so
-            the near side of the part does not hide the far side. Done in the proxy object; your nodes are
-            untouched.
+        clip: Draw only what is inside the region (its sphere, else its box):
+            faces crossing the boundary are cut at it, faces inside are
+            whole, so the near side of the part does not hide the far side.
+            Done in the proxy object; your nodes are untouched.
         compare: A source SOP shot with exactly the same camera; each view
             also gets <name>_compare.png, SOURCE left and RESULT right.
         overlays: Any of "triangles" (blue), "ngons" (magenta), "poles"
@@ -170,8 +173,10 @@ async def capture_viewport(
         min_edge_px: Mean on-screen edge length below which a view warns
             that the wiring cannot be read, default 6.
         replay: Path of a <prefix>_shots.json: shoots its views again with
-            the same cameras, targets, clip, overlays and compare; views,
-            orbit, bbox and region are not taken.
+            the same cameras, clip, overlays and compare, and the recorded
+            targets unless targets is given (then those, in every view:
+            the source shot to match). views, orbit, bbox and region are not
+            taken.
         lighting: "headlight" (default; a replay keeps the recorded one)
             draws every surface with a matcap lit from the camera and
             material display off, for the capture only. "viewport" keeps
@@ -187,9 +192,11 @@ async def capture_viewport(
     fov_x_deg, azimuth/elevation, edge_px (mean/median/p10 on-screen edge
     length) and sheet_edge_px, region, clip (with drawn.clipped_prims),
     compare (source image, pair image), content_rect (image pixels of the
-    drawn target) and sheet_crop. Also shots_file, sheet (path, pixels,
-    columns, rows), overlays (legend), lighting (mode, matcap, restored)
-    and warnings. success is false when an image is missing or blank where the
+    drawn target) and sheet_crop. Also shots_file (shots_kept: views kept
+    from an earlier call under the prefix), replay_targets ("recorded" or
+    "given"), close_up_hints (boxes with point counts, when edges are too
+    short), sheet (path, pixels, columns, rows), overlays (legend), lighting
+    (mode, matcap, restored) and warnings. success is false when an image is missing or blank where the
     target is, a target is not fully in frame or not drawn, or the viewer
     could not be restored; problems says which.
     """

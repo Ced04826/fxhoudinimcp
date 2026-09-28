@@ -19,16 +19,12 @@ class TestToolDiscovery:
         assert "capture_viewport" in found
         assert all(callable(fn) for fn in found.values())
 
-    def test_the_discovered_set_is_the_server_s(self):
-        # The header count in server_instructions.md is checked against the
-        # server's registry elsewhere; the client must see the same tools.
-        import re
+    def test_the_discovered_set_is_every_tool_the_server_knows(self):
+        # Registered or left out by FXHOUDINIMCP_TOOLSET, a script can call it.
+        from fxhoudinimcp import toolsets
 
-        from fxhoudinimcp._loader import load_markdown
-
-        header = load_markdown("instructions/server_instructions.md").splitlines()[0]
-        claimed = int(re.search(r"(\d+) tools", header).group(1))
-        assert len(client.tools()) == claimed
+        known = set(toolsets.REGISTERED) | set(toolsets.SKIPPED)
+        assert set(client.tools()) == known
 
 
 class TestCall:

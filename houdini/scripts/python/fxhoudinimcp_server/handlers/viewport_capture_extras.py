@@ -383,6 +383,65 @@ def edge_pixels(segments, params: dict[str, Any], width, height, out_w) -> dict[
     }
 
 
+def close_up_boxes(points, cell: float, limit: int = 6, pad: float = 0.1) -> list[dict[str, Any]]:
+    """Where the drawn geometry is densest, as boxes about *cell* across.
+
+    *points* is an (n, 3) array of world positions. Windows *cell* across,
+    stepped by half a cell, are scored by how many points they hold; the
+    fullest comes back as the tight box of its populated half-cells, grown by
+    *pad* of its size (at least 2% of a cell), its points are set aside, and
+    so on, most points first. Stepping by half a cell means anything up to half a cell
+    across lies whole in some window, wherever the grid falls. Many points in
+    little space is where the wiring is finest: on a 1.5 m part holding
+    hardware a few millimetres across, the latches and hinges, which a
+    whole-part view drew under a pixel per edge (DETAIL12).
+    """
+    import numpy as np
+
+    pts = np.asarray(points, float).reshape(-1, 3)
+    if not len(pts) or not cell > 0:
+        return []
+    half = cell / 2.0
+    origin = pts.min(0)
+    boxes = []
+    while pts.size and len(boxes) < limit:
+        keys = np.floor((pts - origin) / half).astype(np.int64)
+        span = keys.max(0) + 2
+        codes, counts = np.unique(
+            (keys[:, 0] * span[1] + keys[:, 1]) * span[2] + keys[:, 2], return_counts=True
+        )
+        cells = np.stack(
+            [codes // (span[1] * span[2]), (codes // span[2]) % span[1], codes % span[2]], 1
+        )
+        score = np.zeros(len(codes), np.int64)
+        for dx in (0, 1):
+            for dy in (0, 1):
+                for dz in (0, 1):
+                    other = ((cells[:, 0] + dx) * span[1] + cells[:, 1] + dy) * span[2] + (
+                        cells[:, 2] + dz
+                    )
+                    at = np.minimum(np.searchsorted(codes, other), len(codes) - 1)
+                    score += np.where(codes[at] == other, counts[at], 0)
+        best = cells[int(np.argmax(score))]
+        inside = np.all((keys >= best) & (keys <= best + 1), axis=1)
+        # The box is fitted to the window's populated half-cells only: a lone
+        # vertex of a big face that falls in the window pulled the box, and
+        # the close-up, off the hardware.
+        at = np.searchsorted(codes, (keys[:, 0] * span[1] + keys[:, 1]) * span[2] + keys[:, 2])
+        dense = inside & (counts[at] >= max(2, 0.02 * inside.sum()))
+        members = pts[dense if dense.any() else inside]
+        lo, hi = members.min(0), members.max(0)
+        grow = np.maximum((hi - lo) * pad, cell * 0.02)
+        box = np.concatenate([lo - grow, hi + grow])
+        count = len(members)
+        # A lone vertex of a big face is not a place to look at.
+        if boxes and count < max(8, 0.05 * boxes[0]["points"]):
+            break
+        boxes.append({"bbox": [round(float(v), 6) for v in box], "points": count})
+        pts = pts[~inside]
+    return boxes
+
+
 ###### Overlay VEX
 
 
@@ -463,26 +522,37 @@ f@__aspect = aspect;"""
     return "\n".join(lines)
 
 
-def clip_vex(clip: dict[str, Any]) -> str:
-    """Primitive wrangle removing faces with no point and no centroid in the clip volume."""
+def clip_box(clip: dict[str, Any]) -> list[float]:
+    """The box the clip planes cut to: the clip box, or the sphere's cube."""
     if clip["shape"] == "sphere":
         c, r = clip["center"], float(clip["radius"])
-        test = f"distance(q, set({c[0]!r}, {c[1]!r}, {c[2]!r})) <= {r!r}"
-    else:
-        lo, hi = clip["bbox"][:3], clip["bbox"][3:]
-        test = (
-            f"q.x >= {lo[0]!r} && q.y >= {lo[1]!r} && q.z >= {lo[2]!r} && "
-            f"q.x <= {hi[0]!r} && q.y <= {hi[1]!r} && q.z <= {hi[2]!r}"
-        )
+        return [c[0] - r, c[1] - r, c[2] - r, c[0] + r, c[1] + r, c[2] + r]
+    return [float(v) for v in clip["bbox"]]
+
+
+def clip_planes(box: list[float]) -> list[tuple[list[float], list[float]]]:
+    """(origin, direction) of the six planes that keep *box*: Clip SOP, "above"."""
+    planes = []
+    for axis in range(3):
+        for bound, sign in ((box[axis], 1.0), (box[axis + 3], -1.0)):
+            origin = [0.0, 0.0, 0.0]
+            direction = [0.0, 0.0, 0.0]
+            origin[axis] = float(bound)
+            direction[axis] = sign
+            planes.append((origin, direction))
+    return planes
+
+
+def sphere_keep_vex(clip: dict[str, Any]) -> str:
+    """Primitive wrangle removing faces that do not reach the clip sphere.
+
+    The face's own closest point to the centre, not its points or centroid:
+    after the cube cut a face can cross the sphere with every point outside.
+    """
+    c, r = clip["center"], float(clip["radius"])
     return (
-        "int keep = 0;\n"
-        "vector q = v@P;\n"
-        f"if ({test}) keep = 1;\n"
-        "foreach (int pt; primpoints(0, @primnum)) {\n"
-        '    q = point(0, "P", pt);\n'
-        f"    if ({test}) keep = 1;\n"
-        "}\n"
-        "if (!keep) removeprim(0, @primnum, 1);\n"
+        f"vector c = set({c[0]!r}, {c[1]!r}, {c[2]!r});\n"
+        f"if (xyzdist(0, itoa(@primnum), c) > {r!r}) removeprim(0, @primnum, 1);\n"
     )
 
 
@@ -840,14 +910,24 @@ def build_chain(
     """
     node = merge
     if clip is not None:
-        # A face stays when one of its points or its centroid is inside: the
-        # wiring around the region stays whole, while a large face that only
-        # passes through the region (a cover plate far away) goes.
-        cut = proxy.createNode("attribwrangle", "clip_region")
-        cut.setInput(0, node)
-        cut.parm("class").set("primitive")
-        cut.parm("snippet").set(clip_vex(clip))
-        node = cut
+        # Faces crossing the boundary are cut there, not dropped whole: the
+        # faces of a straight rod can run its whole length with no point and
+        # no centroid inside a close-up's box, and the rod vanished from it
+        # (CHASSIS11). Faces wholly inside are untouched, so their wiring
+        # reads as modelled; the cut edges lie on the clip boundary.
+        for index, (origin, direction) in enumerate(clip_planes(clip_box(clip)), start=1):
+            cut = proxy.createNode("clip::2.0", f"clip_plane{index}")
+            cut.setInput(0, node)
+            cut.parm("clipop").set("above")
+            cut.parmTuple("origin").set(origin)
+            cut.parmTuple("dir").set(direction)
+            node = cut
+        if clip["shape"] == "sphere":
+            keep = proxy.createNode("attribwrangle", "clip_sphere")
+            keep.setInput(0, node)
+            keep.parm("class").set("primitive")
+            keep.parm("snippet").set(sphere_keep_vex(clip))
+            node = keep
     measure = node
     faces = [o for o in overlays if o not in ("zebra", "poles")]
     if faces:

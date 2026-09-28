@@ -50,4 +50,16 @@ def build_server(*, name: str, instructions: str, lifespan, version: str):
         return server
 
 
-__all__ = ["Context", "Server", "build_server"]
+def set_instructions(server, text: str) -> None:
+    """Replace the instructions a server hands clients at initialize.
+
+    Neither major has a public setter; the text lives on the low-level
+    server, named ``_lowlevel_server`` in 2.x and ``_mcp_server`` in 1.x.
+    """
+    inner = getattr(server, "_lowlevel_server", None) or getattr(server, "_mcp_server", None)
+    if inner is None:
+        raise AttributeError("cannot find the low-level server to set instructions on")
+    inner.instructions = text
+
+
+__all__ = ["Context", "Server", "build_server", "set_instructions"]

@@ -101,12 +101,22 @@ class TestOverlays:
         assert not hasattr(ex, "zebra_vex")
         assert "zebra" not in ex.vertex_vex(["triangles", "ngons"])
 
-    def test_clip_vex_keeps_a_face_by_any_point_or_its_centroid(self):
-        code = ex.clip_vex({"shape": "box", "bbox": [0, 0, 0, 1, 2, 3]})
-        assert code.count("keep = 1") == 2 and "primpoints" in code and "removeprim" in code
-        assert "q.z <= 3" in code
-        sphere = ex.clip_vex({"shape": "sphere", "center": [1, 0, 0], "radius": 0.5})
-        assert "distance(q, set(1, 0, 0)) <= 0.5" in sphere
+    def test_clip_cuts_with_six_planes_that_face_into_the_box(self):
+        # Clip SOP "above" keeps the side the direction points to (22.0.368).
+        box = ex.clip_box({"shape": "box", "bbox": [0, 0, 0, 1, 2, 3]})
+        planes = ex.clip_planes(box)
+        assert len(planes) == 6
+        inside = [0.5, 1.0, 1.5]
+        for origin, direction in planes:
+            assert sum((p - o) * d for p, o, d in zip(inside, origin, direction, strict=True)) > 0
+        assert ([0.0, 0.0, 3.0], [0.0, 0.0, -1.0]) in planes
+
+    def test_a_sphere_clip_cuts_to_its_cube_then_keeps_faces_reaching_it(self):
+        sphere = {"shape": "sphere", "center": [1, 0, 0], "radius": 0.5}
+        assert ex.clip_box(sphere) == [0.5, -0.5, -0.5, 1.5, 0.5, 0.5]
+        code = ex.sphere_keep_vex(sphere)
+        # The face's closest point, not its points or centroid.
+        assert "xyzdist(0, itoa(@primnum), c) > 0.5" in code and "removeprim" in code
 
 
 class TestOrbitAndAngles:
@@ -308,6 +318,85 @@ class TestShotList:
         (tmp_path / "other.json").write_text("{}", encoding="utf-8")
         with pytest.raises(ValueError, match="not a capture_viewport shot list"):
             ex.read_shot_list(str(tmp_path / "other.json"))
+
+
+class TestShotListMerge:
+    _SETTINGS = {
+        "compare": None,
+        "overlays": [],
+        "zebra": {"direction": [0, 1, 0], "stripes": 16},
+        "shading": None,
+        "lighting": "headlight",
+        "isolate": True,
+    }
+
+    def _write(self, tmp_path, names, **settings):
+        camera = {
+            "axes": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            "pivot": [0, 0, 0],
+            "t": [0, 0, 5],
+            "ortho": False,
+            "ortho_width": 1.0,
+            "focal": 50.0,
+            "aperture": 41.4,
+        }
+        record = {
+            "kind": "fxhoudinimcp.capture_viewport.shots",
+            "version": 1,
+            **{**self._SETTINGS, **settings},
+            "shots": [{"name": n, "camera": camera, "pixels": [8, 6]} for n in names],
+        }
+        return ex.write_shot_list(str(tmp_path / "v_shots.json"), record)
+
+    def test_a_second_call_adds_its_views_and_replaces_same_names(self, tmp_path):
+        # CHASSIS04: one more view under the same prefix left a list of one.
+        path = self._write(tmp_path, ["front", "left"])
+        new = [{"name": "left"}, {"name": "after"}]
+        shots, note = vc._merge_shot_list(path, new, dict(self._SETTINGS))
+        assert [s["name"] for s in shots] == ["front", "left", "after"]
+        assert shots[1] is new[0]
+        assert note == {"kept": ["front"]}
+
+    def test_other_settings_replace_the_list_and_name_what_it_loses(self, tmp_path):
+        path = self._write(tmp_path, ["front"], compare="/obj/a/SRC")
+        shots, note = vc._merge_shot_list(path, [{"name": "left"}], dict(self._SETTINGS))
+        assert [s["name"] for s in shots] == ["left"]
+        assert note == {"dropped": ["front"], "settings_differ": ["compare"]}
+
+    def test_no_earlier_list(self, tmp_path):
+        shots = [{"name": "a"}]
+        assert vc._merge_shot_list(str(tmp_path / "none.json"), shots, {}) == (shots, {})
+
+
+@needs_numpy
+class TestCloseUpBoxes:
+    def test_the_densest_cells_come_first_as_tight_boxes(self):
+        import numpy as np
+
+        rng = np.random.default_rng(0)
+        # A sparse 1.5 m panel and two small dense latches, as on DETAIL12.
+        panel = rng.uniform([0, 0, 0], [1.5, 1.0, 0.0], (200, 3))
+        latch = rng.uniform([0.30, 0.40, 0.0], [0.33, 0.42, 0.01], (500, 3))
+        hinge = rng.uniform([1.20, 0.10, 0.0], [1.22, 0.15, 0.01], (300, 3))
+        boxes = ex.close_up_boxes(np.vstack([panel, latch, hinge]), cell=0.1, limit=2)
+        assert [b["points"] >= 300 for b in boxes] == [True, True]
+        first = boxes[0]["bbox"]
+        assert first[0] <= 0.30 and first[3] >= 0.33 and first[3] - first[0] < 0.1
+        second = boxes[1]["bbox"]
+        assert second[0] <= 1.20 and second[4] >= 0.15
+
+    def test_a_lone_vertex_in_the_window_does_not_pull_the_box(self):
+        import numpy as np
+
+        rng = np.random.default_rng(1)
+        latch = rng.uniform([0.30, 0.40, 0.0], [0.33, 0.42, 0.01], (500, 3))
+        corner = np.array([[0.37, 0.41, 0.0]])  # a panel vertex, same window
+        box = ex.close_up_boxes(np.vstack([latch, corner]), cell=0.1, limit=1)[0]
+        assert box["bbox"][3] < 0.35 and box["points"] == 500
+
+    def test_nothing_to_bin(self):
+        assert ex.close_up_boxes([], cell=0.1) == []
+        assert ex.close_up_boxes([[0, 0, 0]], cell=0.0) == []
 
 
 class TestHandlerRefusals:

@@ -1,10 +1,13 @@
 """MCP tool modules for FXHoudini-MCP.
 
-Importing this package registers all MCP tools with the FastMCP server.
+Importing this package registers the MCP tools the active toolset allows
+(FXHOUDINIMCP_TOOLSET, see toolsets.py) with the server.
 Each submodule uses the `@mcp.tool()` decorator at import time.
 """
 
 from __future__ import annotations
+
+from fxhoudinimcp.server import apply_instructions
 
 # Internal. Importing a tool module registers its tools on mcp.
 from fxhoudinimcp.tools import (
@@ -35,3 +38,6 @@ from fxhoudinimcp.tools import (
     viewport_capture,  # noqa: F401
     workflows,  # noqa: F401
 )
+
+# The instruction header counts what was just registered.
+apply_instructions()

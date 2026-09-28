@@ -80,8 +80,16 @@ if _failed:
 # then the rest: a module that did `from x import f` keeps the old f unless
 # x was reloaded before it. The dispatcher is never reloaded, since it holds
 # the registry the reloaded modules register into.
-_HELPER_MODULES = ["errors", "serialize", "config", "ui", "outputs"]
-_IMPORTED_FROM = ["node_handlers", "parameter_handlers", "viewport_handlers"]
+_HELPER_MODULES = ["errors", "serialize", "config", "ui", "outputs", "geometry_math"]
+# Helpers that are not handler modules come first: a reload that skipped them
+# answered success with their old code still running.
+_IMPORTED_FROM = [
+    "state_receipt_helpers",
+    "viewport_capture_extras",
+    "node_handlers",
+    "parameter_handlers",
+    "viewport_handlers",
+]
 
 
 def reload_plugin(**_):

@@ -26,6 +26,7 @@ from __future__ import annotations
 # Built-in
 import contextlib
 import hashlib
+import json
 import math
 import os
 import tempfile
@@ -763,11 +764,15 @@ def _pixel_facts(path: str, rect: list[float] | None) -> dict[str, Any]:
     """Size of the written image, how much of *rect* is drawn on, and where.
 
     The flipbook writes the background transparent (measured on 22.0.368),
-    so a pixel with any alpha is drawn. An image without transparency falls
-    back to colour: the background is the median of the side edges (the HUD
-    sits in the corners, and a framed target leaves the margin clear) and a
-    pixel counts as drawn when it differs from it by more than
-    _DRAWN_THRESHOLD. Without a rect the whole image is checked.
+    so a pixel with any alpha is drawn, and an image whose alpha is 255
+    everywhere is one the target covers edge to edge (a close-up on a large
+    face). That used to be read as an image without transparency and judged
+    by colour against its own edges, which were the face: "nothing is drawn".
+    Only an image with no alpha channel falls back to colour: the background
+    is the median of the side edges (the HUD sits in the corners, and a
+    framed target leaves the margin clear) and a pixel counts as drawn when it
+    differs from it by more than _DRAWN_THRESHOLD. Without a rect the whole
+    image is checked.
     content_rect is the box of the drawn pixels inside the rect (the sheet
     crops to it).
     """
@@ -783,6 +788,7 @@ def _pixel_facts(path: str, rect: list[float] | None) -> dict[str, Any]:
     image = QtGui.QImage(path)
     if image.isNull():
         return {"readable": False}
+    has_alpha = image.hasAlphaChannel()
     image = image.convertToFormat(QtGui.QImage.Format_ARGB32)
     w, h = image.width(), image.height()
     raw = np.frombuffer(image.constBits(), dtype=np.uint8, count=image.sizeInBytes())
@@ -796,7 +802,7 @@ def _pixel_facts(path: str, rect: list[float] | None) -> dict[str, Any]:
         x1 = min(max(int(math.ceil(rect[2])), x0 + 1), w)
         y1 = min(max(int(math.ceil(rect[3])), y0 + 1), h)
     alpha = channels[:, :, 3]
-    if (alpha < 255).any():
+    if has_alpha:
         drawn = alpha[y0:y1, x0:x1] > 0
     else:
         pixels = channels[:, :, :3].astype(np.int16)
@@ -1377,13 +1383,19 @@ def capture_viewport(
         raise ValueError(f"zebra_direction must be a non-zero [x, y, z], not {zebra_direction!r}")
 
     record = None
+    replay_targets = None
     if replay is not None:
         if views is not None or orbit or bbox is not None or region is not None:
             raise ValueError(
                 "replay takes the views from the shot list; drop views/orbit/bbox/region"
             )
         record = extras.read_shot_list(replay)
-        targets = record.get("targets")
+        # Given targets replace the recorded ones in every shot, cameras kept:
+        # that is how a source is shot to match. The record used to win, and
+        # a replay meant for the source wrote the result again (DETAIL01).
+        replay_targets = "recorded" if targets is None else "given"
+        if targets is None:
+            targets = record.get("targets")
         compare = record.get("compare") if compare is None else compare
         overlays = record.get("overlays") if overlays is None else overlays
         zebra = record.get("zebra") or zebra
@@ -1414,7 +1426,7 @@ def capture_viewport(
                     "azimuth": shot.get("azimuth"),
                     "elevation": shot.get("elevation"),
                     "projection": None,
-                    "targets": shot.get("targets"),
+                    "targets": shot.get("targets") if replay_targets == "recorded" else targets,
                     "bbox": None,
                     "region": None,
                     "clip": None,
@@ -1662,30 +1674,44 @@ def capture_viewport(
 
     if shot_list:
         shots_path = os.path.join(output_dir, f"{stem}_shots.json").replace("\\", "/")
+        settings = {
+            "compare": compare,
+            "overlays": overlays,
+            "zebra": zebra,
+            "shading": shading,
+            "lighting": lighting,
+            "isolate": isolate,
+        }
+        shots_out, earlier = _merge_shot_list(shots_path, shot_list, settings)
         extras.write_shot_list(
             shots_path,
             {
                 "kind": "fxhoudinimcp.capture_viewport.shots",
                 "version": 1,
-                "targets": targets if record is None else record.get("targets"),
-                "compare": compare,
-                "overlays": overlays,
-                "zebra": zebra,
-                "shading": shading,
-                "lighting": lighting,
-                "isolate": isolate,
+                "targets": targets,
+                **settings,
                 "margin": margin,
-                "shots": shot_list,
+                "shots": shots_out,
             },
         )
         result["shots_file"] = shots_path
+        if earlier.get("kept"):
+            result["shots_kept"] = earlier["kept"]
+        if earlier.get("dropped"):
+            result["warnings"].append(
+                f"{shots_path} held views {earlier['dropped']} from an earlier call shot with "
+                f"other {earlier['settings_differ']}; the shot list now has only this call's "
+                f"views, their images are still on disk. Use another prefix to keep both."
+            )
     if record is not None:
         result["replayed"] = replay
+        result["replay_targets"] = replay_targets
 
     _make_sheet(
         result, output_dir, stem, sheet, sheet_columns, sheet_max, compare, overlays, min_edge_px
     )
     _readability(result, min_edge_px)
+    _close_up_hints(result, shot_list, min_edge_px)
 
     for shot in result["views"]:
         if not shot.get("file_exists"):
@@ -1849,6 +1875,106 @@ def _make_sheet(
     result["sheet"] = {k: composed[k] for k in ("path", "pixels", "columns", "rows")}
 
 
+# Settings a replay applies to every shot of a list. Shots from two calls can
+# share one list only when these match.
+_SHOT_SETTINGS = ("compare", "overlays", "zebra", "shading", "lighting", "isolate")
+
+
+def _merge_shot_list(path: str, shots: list, settings: dict[str, Any]) -> tuple[list, dict]:
+    """This call's shots plus an earlier call's under the same prefix.
+
+    A view of the same name is replaced (its image was overwritten too); the
+    others are kept, because their images are still on disk and a replay
+    needs their cameras. A second call that added one view used to leave a
+    list holding that view only (CHASSIS04). When the earlier list was shot
+    with other settings, one replay cannot honour both, so it is replaced and
+    the views it loses are named.
+    """
+    if not os.path.isfile(path):
+        return shots, {}
+    try:
+        earlier = extras.read_shot_list(path)
+    except (ValueError, OSError) as exc:
+        return shots, {"dropped": ["<unreadable>"], "settings_differ": [str(exc)]}
+    names = {shot["name"] for shot in shots}
+    older = [shot for shot in earlier["shots"] if shot.get("name") not in names]
+    if not older:
+        return shots, {}
+    # Through JSON, so a tuple here and a list there compare equal.
+    now = json.loads(json.dumps(settings))
+    differ = [key for key in _SHOT_SETTINGS if earlier.get(key) != now.get(key)]
+    if differ:
+        return shots, {"dropped": [shot.get("name") for shot in older], "settings_differ": differ}
+    return older + shots, {"kept": [shot["name"] for shot in older]}
+
+
+# Points read for close_up_hints, at most.
+_HINT_POINTS = 200_000
+
+
+def _drawn_points(described: list[str]):
+    """World positions of the targets' points, evenly thinned to _HINT_POINTS."""
+    import numpy as np
+
+    arrays = []
+    for path in described:
+        node = hou.node(path)
+        if node is None:
+            continue
+        with contextlib.suppress(Exception):
+            geometry, transform = _geometry_of(node)
+            if geometry is None:
+                continue
+            pts = np.asarray(geometry.pointFloatAttribValues("P"), float).reshape(-1, 3)
+            if transform is not None:
+                m = np.asarray(transform.asTuple(), float).reshape(4, 4)
+                pts = pts @ m[:3, :3] + m[3, :3]
+            arrays.append(pts)
+    if not arrays:
+        return None
+    pts = np.concatenate(arrays)
+    return pts[:: max(1, len(pts) // _HINT_POINTS)]
+
+
+def _close_up_hints(result, shot_list, min_edge_px):
+    """Boxes to shoot close-ups of, when a view's edges are too short to read.
+
+    From the view with the shortest median edge in its own image: the zoom it
+    needs to reach min_edge_px sets the size of a close-up box, and the
+    densest places of the drawn targets at that size are proposed, ready to
+    pass back as bbox with the same targets. A hint, not extra shots: which
+    detail matters is the reviewer's call, and an overview should stay one
+    image per view.
+    """
+    worst = None
+    for shot in result["views"]:
+        median = (shot.get("edge_px") or {}).get("median")
+        if median is not None and median < min_edge_px and (worst is None or median < worst[1]):
+            worst = (shot, median)
+    if worst is None or not worst[0].get("frame_bbox"):
+        return
+    shot, median = worst
+    box = shot["frame_bbox"]
+    extent = max(box[3] - box[0], box[4] - box[1], box[5] - box[2])
+    zoom = min_edge_px / max(median, 1e-3)
+    cell = extent / zoom / 1.25
+    described = next((s["targets"] for s in shot_list if s["name"] == shot["name"]), [])
+    points = _drawn_points(described) if described else None
+    if points is None:
+        return
+    boxes = extras.close_up_boxes(points, cell)
+    if boxes:
+        result["close_up_hints"] = {
+            "why": (
+                f"{shot['name']}: median edge {median:g}px in its image (< {min_edge_px:g}); "
+                f"a box about {cell:.3g} across frames it at roughly {min_edge_px:g}px"
+            ),
+            "targets": described,
+            "boxes": boxes,
+            "use": "capture_viewport(targets=<targets>, bbox=<box>) per box; densest first",
+        }
+
+
 def _readability(result, min_edge_px):
     """Warn where edges are too short on screen to read the wiring.
 
@@ -1866,7 +1992,7 @@ def _readability(result, min_edge_px):
             result["warnings"].append(
                 f"{shot['name']}: median edge {value:g}px in the {where} (< {min_edge_px:g}); "
                 f"the wiring cannot be read -- split the views or shoot a close-up "
-                f"(az {shot['azimuth']:g}, el {shot['elevation']:g})"
+                f"(az {shot['azimuth']:g}, el {shot['elevation']:g}; see close_up_hints)"
             )
 
 
