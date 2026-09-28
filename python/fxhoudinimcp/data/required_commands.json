@@ -22,6 +22,7 @@
     "code.execute_python",
     "code.get_env_variable",
     "code.get_file_references",
+    "code.reload_plugin",
     "code.set_update_mode",
     "context.compare_snapshots",
     "context.explain_node",

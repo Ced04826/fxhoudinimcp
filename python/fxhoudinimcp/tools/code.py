@@ -92,6 +92,18 @@ async def execute_python(
 
 
 @mcp.tool()
+async def reload_plugin(ctx: Context) -> dict:
+    """Re-import the plugin's Houdini-side code without restarting Houdini.
+
+    For developing this server: after editing its handlers, this picks the
+    edit up in the running session. The MCP server's own tool definitions are
+    not reloaded; the client has to reconnect for those.
+    """
+    bridge = _get_bridge(ctx)
+    return await bridge.execute("code.reload_plugin", {})
+
+
+@mcp.tool()
 async def execute_hscript(ctx: Context, command: str) -> dict:
     """Execute an HScript command in Houdini.
 

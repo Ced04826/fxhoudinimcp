@@ -103,6 +103,9 @@ class FakeParm:
     def name(self):
         return self._name
 
+    def description(self):
+        return self._name
+
     def path(self):
         return f"/obj/fake/{self._name}"
 
@@ -1684,7 +1687,7 @@ class TestExactInputEnforcement:
         assert result["exact_inputs_verified"] is True
         assert result["enforced_inputs"][0]["index"] == 0
         assert network.node("solo").inputs == {}
-        solo = next(n for n in result["created"] if n["name"] == "solo")
+        solo = next(n for n in result["created"] if n["path"].endswith("/solo"))
         assert solo["inputs"] == []
 
     def _steal(self, network, *, refuse=False, ignore=False):
@@ -1807,7 +1810,7 @@ class TestExactInputEnforcement:
         )
         assert result["success"] is True
         assert "exact_inputs_verified" not in result
-        solo = next(n for n in result["created"] if n["name"] == "solo")
+        solo = next(n for n in result["created"] if n["path"].endswith("/solo"))
         assert [c["index"] for c in solo["inputs"]] == [0], "preserve still reports the truth"
 
 
@@ -2100,7 +2103,8 @@ class TestReplacePreflight:
 
     Upstream clears the expression and then writes, with no type pre-flight:
     the refusal is reported in `errors`, and the expression is already gone.
-    These pin that order so a change to it is noticed.
+    A dict is the exception: it is read as an expression spec and refused
+    before anything is cleared. These pin that order so a change is noticed.
     """
 
     def test_a_dictionary_value_is_reported_as_an_error(self, hou_stub, monkeypatch):
@@ -2111,7 +2115,7 @@ class TestReplacePreflight:
         )
         assert result["set"] == []
         assert "dict" in result["errors"][0]["error"]
-        assert parm.deleted == 1
+        assert parm.deleted == 0
 
     def test_a_null_value_is_reported_as_an_error(self, hou_stub, monkeypatch):
         parm = FakeParm("px", 5.0, expression="$CEX")

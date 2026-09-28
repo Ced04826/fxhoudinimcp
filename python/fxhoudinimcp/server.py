@@ -8,6 +8,10 @@ that knows.
 from __future__ import annotations
 
 # Built-in
+import contextlib
+import functools
+import inspect
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -185,3 +189,59 @@ mcp = build_server(
     lifespan=lifespan,
     version=__version__,
 )
+
+
+def _trim(value):
+    """Floats cut to 7 significant digits, the precision of Houdini's float32 geometry.
+
+    HOM hands back doubles, so a bbox corner arrives as -10.388985633850098:
+    eighteen characters, nine of them noise the geometry never stored.
+    """
+    if isinstance(value, float):
+        return float(f"{value:.7g}")
+    if isinstance(value, dict):
+        return {key: _trim(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_trim(item) for item in value]
+    return value
+
+
+def compact_json(result: dict) -> str:
+    """A tool result as the model reads it: no indentation, trimmed floats.
+
+    The SDK serialises a dict with indent=2, which on a verify_network or a
+    node card is about a third whitespace, paid on every call.
+    """
+    return json.dumps(_trim(result), separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+_sdk_tool = mcp.tool
+
+
+def _compact_tool(*args, **kwargs):
+    """mcp.tool(), registering a copy that answers in compact JSON.
+
+    The module-level function stays the original, returning its dict, so code
+    and tests that call a tool directly see no difference.
+    """
+    register = _sdk_tool(*args, **kwargs)
+
+    def decorator(function):
+        @functools.wraps(function)
+        async def compact(*call_args, **call_kwargs):
+            result = await function(*call_args, **call_kwargs)
+            return compact_json(result) if isinstance(result, dict) else result
+
+        # Resolved against the tool's own module: inspect.signature follows
+        # __wrapped__ to string annotations ("Context"), and mcp 1.14 then
+        # evaluated them in this module, where Context is not defined. A
+        # __signature__ stops the unwrapping.
+        with contextlib.suppress(Exception):
+            compact.__signature__ = inspect.signature(function, eval_str=True)
+        register(compact)
+        return function
+
+    return decorator
+
+
+mcp.tool = _compact_tool

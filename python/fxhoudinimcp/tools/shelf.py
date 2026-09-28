@@ -65,11 +65,12 @@ async def run_shelf_tool(
 ) -> dict:
     """Run a shelf tool and report the nodes it created.
 
-    Tools that wait for a viewport selection or a dialog (the FLIP ocean
-    layer, collide-with, most "select the object then..." tools) are refused
-    up front: through the bridge they would block Houdini until someone
-    clicks. Read the recipe with get_shelf_tool_script and build the nodes
-    with build_network instead. Tools that only create nodes run fine.
+    A tool that asks for a viewport selection or a dialog is retried once as
+    a Ctrl+click, Houdini's "place immediately" (`ran_as_ctrl_click`): the
+    Crowds Simulate tool then builds its whole default crowd. A tool that
+    still asks (the FLIP ocean layer, collide-with) is refused, since through
+    the bridge it would block Houdini until someone clicks: read the recipe
+    with get_shelf_tool_script and build the nodes with build_network.
 
     Args:
         tool_name: Internal tool name, from list_shelf_tools.

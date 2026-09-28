@@ -29,7 +29,9 @@ async def setup_pyro_sim(
 ) -> dict:
     """Build a Pyro smoke/fire simulation network from source geometry.
 
-    Preferred over manual DOP wiring — builds the entire pyro network in one call.
+    Preferred over manual DOP wiring — builds the entire pyro network in one call:
+    Pyro Source (density, temperature, burn), Volume Rasterize Attributes, Pyro
+    Solver and a File Cache.
     For custom setups beyond what this provides, use create_node with DOP nodes
     (pyrosolver, smokeobject, volumesource, etc.).
 
@@ -95,8 +97,9 @@ async def setup_flip_sim(
 ) -> dict:
     """Build a FLIP fluid simulation network from source geometry.
 
-    Preferred over manual DOP wiring — builds the entire FLIP network in one call.
-    Use FLIP Source SOP or Volume Source DOP for custom sourcing.
+    Preferred over manual wiring — builds SideFX's SOP FLIP chain in one call:
+    FLIP Container sized around the source, FLIP Boundary emitting from it,
+    FLIP Solver with a ground plane at y=0, and a File Cache on the particles.
 
     Args:
         source_geo: Source SOP path.
@@ -123,10 +126,13 @@ async def setup_vellum_sim(
     sim_type: str = "cloth",
     substeps: int = 5,
     name: str = "vellum_sim",
+    ground: bool = True,
 ) -> dict:
     """Build a Vellum simulation network with configure node and solver.
 
-    Preferred over manual DOP wiring — builds the entire Vellum network in one call.
+    Preferred over manual DOP wiring — builds the entire Vellum network in one call:
+    the shelf's Configure recipe for the type, the Vellum Solver, and a Vellum I/O
+    cache that keeps constraints and collisions with the geometry.
     Use Vellum Drape SOP to let cloth settle before the main simulation.
 
     Args:
@@ -134,6 +140,7 @@ async def setup_vellum_sim(
         sim_type: Simulation type ("cloth", "hair", "grain", "softbody").
         substeps: Solver substeps.
         name: Top-level geo node name.
+        ground: Turn on the solver's ground plane at y=0.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
@@ -143,6 +150,7 @@ async def setup_vellum_sim(
             "sim_type": sim_type,
             "substeps": substeps,
             "name": name,
+            "ground": ground,
         },
     )
 

@@ -21,7 +21,7 @@ from fxhoudinimcp.server import _get_bridge, mcp
 
 @mcp.tool()
 async def get_houdini_connection_status(ctx: Context) -> dict:
-    """Check the Codex-to-Houdini bridge without raising on disconnect.
+    """Check the MCP-to-Houdini bridge without raising on disconnect.
 
     Returns structured connection diagnostics, including the configured bridge
     URL and Houdini health payload when reachable. Use this before live viewport

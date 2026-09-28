@@ -338,33 +338,27 @@ def set_render_settings(node_path: str, settings: dict) -> dict:
         settings: Dict of parameter_name -> value pairs to set.
     """
     node, _, _ = _renderable(node_path)
+    from fxhoudinimcp_server.handlers.parameter_handlers import _set_parameters
 
-    applied = {}
-    errors = {}
-
-    for parm_name, value in settings.items():
-        try:
-            parm = node.parm(parm_name)
-            if parm is None:
-                # Try as a parm tuple
-                pt = node.parmTuple(parm_name)
-                if pt is not None:
-                    pt.set(value)
-                    applied[parm_name] = value
-                else:
-                    errors[parm_name] = f"Parameter not found: {parm_name}"
-            else:
-                parm.set(value)
-                applied[parm_name] = value
-        except Exception as e:
-            errors[parm_name] = str(e)
-
-    return {
-        "success": len(errors) == 0,
+    # A frame range on a ROP is $FSTART/$FEND keyframes: a raw set() kept
+    # them, the range did not change, and this still listed it as applied.
+    for name in ("f1", "f2", "f3"):
+        parm = node.parm(name)
+        if name in settings and parm is not None and parm.keyframes():
+            parm.deleteAllKeyframes()
+    # The same writer as set_parameters, which reads back and names any
+    # expression that kept a value from taking.
+    reply = _set_parameters(node_path=node.path(), params=settings)
+    errors = {entry["parm_name"]: entry["error"] for entry in reply["errors"]}
+    result = {
+        "success": not errors and not reply.get("expressions_kept"),
         "node_path": node.path(),
-        "applied": applied,
-        "errors": errors if errors else None,
+        "applied": {entry["parm_name"]: entry.get("new_value") for entry in reply["set"]},
+        "errors": errors or None,
     }
+    if reply.get("warning"):
+        result["warning"] = reply["warning"]
+    return result
 
 
 ###### rendering.create_render_node
@@ -461,6 +455,11 @@ def _apply_frame_range_parms(node: hou.Node, frame_range: list) -> None:
     for name, value in zip(_RANGE_PARMS, values, strict=False):
         parm = node.parm(name)
         if parm is not None:
+            # A File Cache's f1/f2 are $FSTART/$FEND keyframes, and set() under
+            # an expression keeps the expression: [10, 20] rendered the whole
+            # playbar range. Same fix as cache_handlers._set_frame_parm.
+            if parm.keyframes():
+                parm.deleteAllKeyframes()
             parm.set(value)
 
 
@@ -508,6 +507,17 @@ if hasattr(node, "render"):
     else:
         node.render(verbose=True, output_progress=True)
 else:
+    # A button-pressed node (File Cache) takes its range from trange/f1..f3,
+    # which this branch never set: the whole playbar range was written.
+    if has_range == "1":
+        if node.parm("trange") is not None:
+            node.parm("trange").set(1)
+        for name, value in zip(("f1", "f2", "f3"), (start, end, inc)):
+            parm = node.parm(name)
+            if parm is not None:
+                if parm.keyframes():
+                    parm.deleteAllKeyframes()
+                parm.set(float(value))
     node.parm("execute").pressButton()
 errors = list(node.errors())
 if errors:

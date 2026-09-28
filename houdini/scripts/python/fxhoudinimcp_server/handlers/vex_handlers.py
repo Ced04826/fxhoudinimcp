@@ -33,7 +33,7 @@ def _get_node(node_path: str) -> hou.Node:
 def _validate_vex_quick(node: hou.Node) -> dict:
     """Cook a wrangle node and return any VEX errors/warnings."""
     with contextlib.suppress(hou.OperationFailed):
-        node.cook(force=True)
+        node.cook(force=False)  # the new code already dirtied it; force only redid the work
 
     errors = []
     warnings = []
@@ -276,38 +276,61 @@ def create_vex_expression(
     parm_name: str,
     vex_code: str,
 ) -> dict:
-    """Set a VEX expression on a parameter.
+    """Set a parameter expression, refusing VEX that cannot run there.
 
-    This sets the parameter's expression language to VEX and assigns
-    the given expression code.
+    HOM parameter expressions are HScript or Python; there is no VEX language
+    for them. This used to store the code as HScript regardless, falling back
+    to Python, and said success for `@P.y*2` that then failed at every
+    evaluation. VEX belongs in a wrangle.
 
     Args:
         node_path: Path to the node.
         parm_name: Name of the parameter.
-        vex_code: The VEX expression code.
+        vex_code: The expression code (HScript syntax).
     """
+    import re
+
     node = _get_node(node_path)
 
     parm = node.parm(parm_name)
     if parm is None:
         raise ValueError(f"Parameter '{parm_name}' not found on node {node_path}.")
-
+    if re.search(r"(^|[^\w$])[fvisp]?\[?\]?@\w|;\s*$", vex_code):
+        raise ValueError(
+            "That is VEX (attribute @ syntax or a trailing ';'), which a parameter "
+            "expression cannot run: parameters take HScript or Python. Put VEX in a "
+            "wrangle with create_wrangle, or write the HScript equivalent (point(), ch())."
+        )
+    # Validated before it is set. setExpression does not parse, eval() of an
+    # unknown function answers 0 without raising, and the node error that a
+    # cook leaves behind outlives a later valid expression (all measured on
+    # 22.0.368). hscriptExpression with the node as pwd raises on an unknown
+    # function or a bracing error and resolves relative references.
+    previous = hou.pwd()
     try:
-        parm.setExpression(vex_code, language=hou.exprLanguage.Hscript)
-    except Exception:
-        # If Hscript doesn't work, try setting as a Python expression
-        try:
-            parm.setExpression(vex_code, language=hou.exprLanguage.Python)
-        except Exception as e:
-            raise ValueError(
-                f"Failed to set expression on {node_path}/{parm_name}: {readable_message(e)}"
-            ) from e
+        hou.setPwd(node)
+        hou.hscriptExpression(vex_code)
+    except hou.OperationFailed as e:
+        detail = str(e).replace("The attempted operation failed.", "").strip()
+        raise ValueError(
+            f"The expression does not evaluate on {node_path}/{parm_name}, so it was "
+            f"not set: {detail or readable_message(e)}"
+        ) from e
+    finally:
+        hou.setPwd(previous)
+    from fxhoudinimcp_server.handlers.parameter_handlers import set_whole_expression
+
+    replaced = set_whole_expression(parm, vex_code, hou.exprLanguage.Hscript)
+    value = parm.eval()
 
     return {
         "success": True,
         "node_path": node.path(),
         "parm_name": parm_name,
-        "vex_code": vex_code,
+        "expression": vex_code,
+        "language": "hscript",
+        "value": value if isinstance(value, (int, float, str)) else str(value),
+        **({"replaced_keyframes": replaced} if replaced else {}),
     }
 
 
@@ -331,7 +354,7 @@ def validate_vex(node_path: str) -> dict:
     # Force cook the node to trigger VEX compilation. A failure here is the
     # expected path for broken VEX; the errors are read off the node below.
     with contextlib.suppress(hou.OperationFailed):
-        node.cook(force=True)
+        node.cook(force=False)  # the new code already dirtied it; force only redid the work
 
     # Gather errors and warnings
     errors = []

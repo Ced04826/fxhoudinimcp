@@ -98,12 +98,15 @@ async def create_vex_expression(
     parm_name: str,
     vex_code: str,
 ) -> dict:
-    """Set a VEX expression on a parameter.
+    """Set an HScript expression on a parameter, evaluated before it is kept.
+
+    Parameters cannot run VEX: attribute @ syntax is refused with a pointer to
+    create_wrangle. An expression that does not evaluate is not kept.
 
     Args:
         node_path: Path to the node.
         parm_name: Parameter name.
-        vex_code: VEX expression code.
+        vex_code: Expression code, in HScript syntax.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(

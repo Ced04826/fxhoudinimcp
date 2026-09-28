@@ -234,16 +234,23 @@ async def capture_network_editor(
 async def set_current_network(
     ctx: Context,
     network_path: str,
+    other_objects: str | None = "hide",
 ) -> dict:
-    """Navigate the network editor to a specific network path.
+    """Navigate the network editor to a network; the viewer follows it in.
+
+    Call it on the network you build in. By default the viewer then hides
+    every other object (the viewport's Y hotkey, no display flag touched), so
+    the work is seen on its own and the rest of the scene does not cook.
 
     Args:
         network_path: Network path to navigate to.
+        other_objects: "hide" (default), "ghost", "show", or null to leave
+            the viewer as it is.
     """
     bridge = _get_bridge(ctx)
     return await bridge.execute(
         "viewport.set_current_network",
-        {"network_path": network_path},
+        {"network_path": network_path, "other_objects": other_objects},
     )
 
 

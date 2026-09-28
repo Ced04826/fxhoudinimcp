@@ -1,4 +1,4 @@
-"""Verify the node names advertised in server_instructions.md exist.
+"""Verify the node names advertised in discipline.md exist.
 
 The instructions tell assistants to trust specific built-in node names
 (the COMMONLY MISSED NODE DOMAINS lists). Any name that does not exist
@@ -37,7 +37,7 @@ _MD = (
     / "prompts"
     / "markdown"
     / "instructions"
-    / "server_instructions.md"
+    / "discipline.md"
 )
 
 # Optional packs not shipped with a base install.
@@ -176,7 +176,7 @@ def test_every_advertised_node_type_exists():
     if out_of_range:
         print(f"[info] present despite a narrower annotation, consider widening: {out_of_range}")
     assert not missing, (
-        f"server_instructions.md advertises {len(missing)} node types that "
+        f"discipline.md advertises {len(missing)} node types that "
         f"do not exist in {hou.applicationVersionString()}: {missing}"
     )
 
@@ -205,7 +205,7 @@ def test_version_annotations_are_actually_used():
     """
     annotated = [claim for claim in _claimed_names() if claim[2] is not None]
     assert annotated, (
-        "no version-annotated names parsed from server_instructions.md -- the "
+        "no version-annotated names parsed from discipline.md -- the "
         "'name (21.0+)' syntax or the regex has drifted"
     )
     for _, name, version_range in annotated:

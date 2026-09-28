@@ -4,7 +4,7 @@ Goal: {description}
 
 setup_pyro_sim / setup_rbd_sim / setup_flip_sim / setup_vellum_sim build entire
 networks in one call: prefer them over wiring DOPs by hand. Source geometry is a
-SOP chain, not a wrangle. Solver substeps and other tweakables go on a CTRL null.
+SOP chain, not a wrangle. Solver substeps and other tweakables stay on the solver, or on the enclosing HDA or subnet interface.
 
 ## SOP-level solvers (modern workflow, preferred)
 

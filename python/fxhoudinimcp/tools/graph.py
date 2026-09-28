@@ -70,11 +70,20 @@ async def build_network(
     `expressions_in_the_way`, the build reports `expressions_kept` and a
     `warning`. "override_expression": true on the spec clears them first.
 
+    Display: in a network that was empty, the last node gets the display
+    flag unless a spec sets one. A display flag asked of a node that has
+    none (a usdrender_rop) goes to its nearest input that has one, listed in
+    `display_set_upstream`.
+
     There is no "children" key: build the subnet, then call build_network
     again with the subnet as parent_path.
 
     Args:
-        parent_path: Network to build inside (e.g. "/obj/geo1").
+        parent_path: Network to build inside (e.g. "/obj/geo1"). A missing
+            parent directly under /obj is created, as the container the
+            specs' context needs (geo for SOPs, lopnet for LOPs), and
+            removed again if the build fails; a dry run reports it as
+            `would_create_parent`.
         nodes: Ordered node specs (see above).
         dry_run: Validate the whole spec without creating anything.
         layout: Also lay out the parent network afterwards (default True;
@@ -117,6 +126,10 @@ async def verify_network(ctx: Context, parent_path: str) -> dict:
     Call this after building or modifying a network, the way an artist
     middle-clicks nodes: if `healthy` is false or `error_nodes` is
     non-empty, fix those nodes before telling the user anything is done.
+    Each node lists `errors`, `warnings`, `bypassed` and `display` only when
+    it has them; absent means none. For a LOP network the evidence is the
+    stage (prims, cameras, lights, gprims without a material), for a COP
+    network the image layer (resolution, channel ranges).
 
     Args:
         parent_path: Network to verify (e.g. "/obj/geo1").
@@ -214,8 +227,12 @@ async def cook_frame_range(
     This is how you advance a sequential solver and how you prove a simulation
     is doing something. Frames are cooked in order, so a SOP solver, a DOP
     network or an animated chain all accumulate correctly, and per-frame cook
-    time, errors, counts and attribute aggregates come back in ONE round trip
-    instead of one per frame.
+    time, errors, counts, bounding box and attribute aggregates come back in
+    ONE round trip instead of one per frame. `static: true` means counts and
+    bounds never changed over the range: the node cooks but does nothing.
+    Past 25 frames the rows are 25 evenly spaced frames plus every frame with
+    an error or warning (`frames_shown`); totals, `static` and
+    `slowest_frame` still cover every frame.
 
     Prefer this over set_frame in a loop, and over stepping by hand: a 100-frame
     check is one call rather than 100. The frame is left where the cook ended,

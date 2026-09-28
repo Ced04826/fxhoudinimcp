@@ -16,6 +16,7 @@ import hou
 from fxhoudinimcp_server.config import focus_editor_enabled, layout_if_enabled, place_new_node
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import as_text, readable_message
+from fxhoudinimcp_server.handlers.node_handlers import _component_default, _is_at_default
 
 ###### Helpers
 
@@ -176,23 +177,16 @@ def _list_materials(*, root_path: str = "/mat", **_: Any) -> dict[str, Any]:
         if root is None:
             continue
 
-        for node in root.allSubChildren():
-            type_name = node.type().name()
+        for node in root.allSubChildren(recurse_in_locked_nodes=False):
+            # A material is a VOP whose parent is not itself a VOP: it sits in
+            # /mat, a matnet or a Material Library, not inside a builder. The
+            # old test (any Vop, or "material"/"shader" in the type name)
+            # listed every shader node inside every builder as a material, and
+            # assignmaterial / materiallibrary LOPs as materials too.
             category = node.type().category().name()
-
-            # Match material-like node types
-            if (
-                category == "Vop"
-                or "material" in type_name.lower()
-                or "shader" in type_name.lower()
-                or type_name
-                in (
-                    "principledshader::2.0",
-                    "principledshader",
-                    "mtlxstandard_surface",
-                    "materialbuilder",
-                )
-            ):
+            parent = node.parent()
+            parent_category = parent.type().category().name() if parent else ""
+            if category == "Shop" or (category == "Vop" and parent_category != "Vop"):
                 materials.append(_material_summary(node))
 
     return {
@@ -224,10 +218,9 @@ def _get_material_info(*, node_path: str, **_: Any) -> dict[str, Any]:
     for parm in node.parms():
         try:
             val = parm.eval()
-            default = parm.parmTemplate().defaultValue()
-            if isinstance(default, tuple) and len(default) == 1:
-                default = default[0]
-            if val != default:
+            # Per component, as node_handlers does: the tuple default made
+            # every vector component read as changed.
+            if not _is_at_default(parm, val, _component_default(parm)):
                 params[parm.name()] = val
         except Exception:
             pass
@@ -471,18 +464,19 @@ def _list_material_types(
             ):
                 continue
 
-            results.append(
-                {
-                    "name": type_name,
-                    "label": label,
-                    "category": cat_name,
-                }
-            )
+            results.append({"name": type_name, "label": label, "category": cat_name})
 
+    # Unfiltered this was every VOP and SHOP type, 76 KB. The first 200, and
+    # the count; a filter is the way to the rest.
+    shown = results[:_TYPE_LIST_CAP]
     return {
         "count": len(results),
-        "types": results,
+        "truncated": len(results) > len(shown),
+        "types": shown,
     }
+
+
+_TYPE_LIST_CAP = 200
 
 
 register_handler("materials.list_material_types", _list_material_types)

@@ -17,6 +17,7 @@ import hou
 from fxhoudinimcp_server.config import focus_editor_enabled, layout_if_enabled, place_new_node
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
+from fxhoudinimcp_server.ui import set_other_objects
 
 ###### Helpers
 
@@ -29,12 +30,12 @@ def _get_node(node_path: str) -> hou.Node:
     return node
 
 
-def _focus_network_editor(node: hou.Node) -> None:
-    """Best-effort: layout the parent network, then pan the editor to *node*."""
+def _focus_network_editor(node: hou.Node, place_unpositioned: bool = True) -> None:
+    """Best-effort: lay out, pan the editor to *node*, hide the other objects."""
     try:
         parent = node.parent()
         if parent is not None:
-            layout_if_enabled(parent)
+            layout_if_enabled(parent, place_unpositioned=place_unpositioned)
         if not focus_editor_enabled():
             return  # the switch is off: placement only, the panes stay put
         for pane_tab in hou.ui.paneTabs():
@@ -43,6 +44,9 @@ def _focus_network_editor(node: hou.Node) -> None:
                     pane_tab.cd(parent.path())
                 pane_tab.setCurrentNode(node)
                 pane_tab.homeToSelection()
+                # The viewer follows into the new object; the source object and
+                # the rest of the scene would otherwise draw over the sim.
+                set_other_objects("hide")
                 return
     except Exception:
         pass
@@ -88,6 +92,20 @@ def _set_parm_safe(node: hou.Node, parm_name: str, value: Any) -> bool:
     return False
 
 
+def _set_values(node: hou.Node, values: dict) -> list[str]:
+    """Set parms or whole parm tuples; return the names that did not take."""
+    missed = []
+    for name, value in values.items():
+        try:
+            if isinstance(value, (list, tuple)):
+                node.parmTuple(name).set(value)
+            else:
+                node.parm(name).set(value)
+        except Exception:
+            missed.append(name)
+    return missed
+
+
 def _create_first_available(
     parent: hou.Node, type_names: tuple[str, ...], node_name: str
 ) -> hou.Node:
@@ -105,6 +123,25 @@ def _create_first_available(
     raise hou.OperationFailed(
         f"None of these node types exist in {parent.path()}: {', '.join(type_names)}"
     )
+
+
+def _stream_cache(
+    geo: hou.Node, type_name: str, node_name: str, solver: hou.Node, streams: int
+) -> hou.Node:
+    """A solver's own I/O node, wired output-for-input, displayed and rendered.
+
+    rbdio and vellumio carry every stream of the sim (geometry, constraints,
+    proxy or collision geometry). A filecache on the first output silently
+    drops the rest, which is what every setup_* used to put down. write_cache
+    drives them like a filecache: they share its Save to Disk button.
+    """
+    cache = geo.createNode(type_name, node_name)
+    for index in range(streams):
+        cache.setInput(index, solver, index)
+    place_new_node(cache)
+    cache.setDisplayFlag(True)
+    cache.setRenderFlag(True)
+    return cache
 
 
 def _source_status(objmerge: hou.Node, source_geo: str, what: str) -> dict[str, Any]:
@@ -150,6 +187,7 @@ def _setup_pyro_sim_sop(
     objmerge: hou.Node,
     substeps: int,
     all_nodes: list[str],
+    res_scale: float = 1.0,
 ) -> dict:
     """Build a SOP-level Pyro simulation (Houdini 20+).
 
@@ -166,6 +204,26 @@ def _setup_pyro_sim_sop(
     pyrosource = geo.createNode("pyrosource", "pyro_source1")
     pyrosource.setInput(0, objmerge, 0)
     all_nodes.append(pyrosource.path())
+    # A fresh Pyro Source emits bare points (P, pscale): the solver found no
+    # density, temperature or burn and simulated nothing for as long as it ran.
+    # Each Initialize preset appends its attributes when its callback runs
+    # (set() alone runs nothing): Smoke adds density + temperature, Burn adds
+    # burn, which together are what the Pyro Solver SOP sources by default.
+    initialize = pyrosource.parm("initialize")
+    for preset in ("source", "sourceburn"):
+        initialize.set(preset)
+        initialize.pressButton()
+    names = [
+        pyrosource.parm(f"name{i}").eval()
+        for i in range(1, pyrosource.parm("attributes").eval() + 1)
+    ]
+
+    # -- The solver sources named volumes, not points (nodes/sop/pyrosolver).
+    print("[workflow] Creating Volume Rasterize Attributes SOP")
+    rasterize = geo.createNode("volumerasterizeattributes", "rasterize_source1")
+    rasterize.setInput(0, pyrosource, 0)
+    rasterize.parm("attributes").set(" ".join(dict.fromkeys(names)))
+    all_nodes.append(rasterize.path())
 
     # -- Pyro Solver SOP (SOP-level, Houdini 20+)
     print("[workflow] Creating Pyro Solver SOP")
@@ -173,11 +231,18 @@ def _setup_pyro_sim_sop(
         pyrosolver = geo.createNode("pyrosolver::3.0", "pyro_solver1")
     except hou.OperationFailed:
         pyrosolver = geo.createNode("pyrosolver", "pyro_solver1")
-    pyrosolver.setInput(0, pyrosource, 0)
+    pyrosolver.setInput(0, rasterize, 0)
     all_nodes.append(pyrosolver.path())
 
     # Set substeps
     _set_parm_safe(pyrosolver, "substeps", substeps)
+    # res_scale was accepted and never used. 2.0 means twice the resolution:
+    # half the voxel size.
+    if res_scale <= 0:
+        raise ValueError(f"res_scale must be positive, got {res_scale}")
+    divsize = pyrosolver.parm("divsize")
+    if divsize is not None and res_scale != 1.0:
+        divsize.set(divsize.eval() / res_scale)
 
     # -- File Cache
     print("[workflow] Creating File Cache SOP")
@@ -398,7 +463,7 @@ def _setup_pyro_sim(
     # -- Try modern SOP-level Pyro first, fall back to DOP approach
     try:
         print("[workflow] Attempting SOP-level Pyro workflow (Houdini 20+)")
-        result = _setup_pyro_sim_sop(geo, objmerge, substeps, all_nodes)
+        result = _setup_pyro_sim_sop(geo, objmerge, substeps, all_nodes, res_scale)
         print(f"[workflow] Pyro simulation '{name}' setup complete (SOP approach)")
     except hou.OperationFailed:
         print("[workflow] SOP-level Pyro not available, falling back to DOP approach")
@@ -412,6 +477,10 @@ def _setup_pyro_sim(
                     pass
 
         result = _setup_pyro_sim_dop(geo, objmerge, substeps, all_nodes)
+        if res_scale != 1.0:
+            result["warning"] = (
+                "res_scale is applied only by the SOP-level Pyro Solver; the DOP fallback ignored it."
+            )
         print(f"[workflow] Pyro simulation '{name}' setup complete (DOP approach)")
 
     # Augment the result with source wiring info so the AI client
@@ -449,7 +518,7 @@ def _setup_rbd_sim(
     """Build a complete RBD (rigid body dynamics) simulation network.
 
     Creates a geometry node with a DOP Network, RBD solver, optional
-    voronoi fracture, optional ground plane, and a File Cache output.
+    RBD Material Fracture, optional ground plane, and an RBD I/O cache.
 
     Args:
         geo_path: Path to the source geometry object.
@@ -571,20 +640,19 @@ def _setup_rbd_sim(
         all_nodes.append(dopimport.path())
         last_sop = dopimport
 
-    # -- Step 5: File Cache
-    print("[workflow] Creating File Cache SOP")
-    try:
-        filecache = geo.createNode("filecache", "file_cache1")
-    except hou.OperationFailed:
-        filecache = geo.createNode("filecache::2.0", "file_cache1")
-    filecache.setInput(0, last_sop, 0)
-    all_nodes.append(filecache.path())
-
-    try:
+    # -- Step 5: Cache. RBD I/O behind the Bullet solver, so constraints and
+    # proxy geometry are cached with the pieces; the DOP fallback has one
+    # stream and keeps a File Cache.
+    if solver is not None:
+        print("[workflow] Creating RBD I/O")
+        filecache = _stream_cache(geo, "rbdio", "rbd_io1", solver, 4)
+    else:
+        print("[workflow] Creating File Cache SOP")
+        filecache = _create_first_available(geo, ("filecache", "filecache::2.0"), "file_cache1")
+        filecache.setInput(0, last_sop, 0)
         filecache.setDisplayFlag(True)
         filecache.setRenderFlag(True)
-    except Exception:
-        pass
+    all_nodes.append(filecache.path())
 
     # -- Step 6: Layout
     print("[workflow] Laying out nodes")
@@ -615,8 +683,9 @@ def _setup_flip_sim(
 ) -> dict:
     """Build a complete FLIP fluid simulation network.
 
-    Creates a geometry node with a DOP Network, FLIP solver, FLIP source,
-    FLIP domain/tank, Object Merge for source, and a File Cache.
+    Creates a geometry node with the SOP FLIP chain (FLIP Container, FLIP
+    Boundary sourcing from the Object Merge, FLIP Solver on a ground plane)
+    and a File Cache.
 
     Args:
         source_geo: Path to the source geometry SOP.
@@ -657,93 +726,57 @@ def _setup_flip_sim(
             f"[workflow] Warning: source geometry '{source_geo}' not found -- Object Merge created but path may need updating"
         )
 
-    # -- Step 3: Create DOP Network
-    print("[workflow] Creating DOP Network")
-    dopnet = geo.createNode("dopnet", "dopnet1")
-    all_nodes.append(dopnet.path())
+    # -- Step 3: SOP FLIP, as fluid/sopminimalsetup builds it: FLIP Container,
+    # then FLIP Boundary with the source on its 4th input, then FLIP Solver,
+    # each passing its three streams (particles, container, collisions) on.
+    # The DOP network this replaced was never wired: its source pointed at no
+    # geometry and fed no solver, so every sim it built was empty.
+    print("[workflow] Creating FLIP Container, Boundary and Solver SOPs")
+    container = geo.createNode("flipcontainer", "flip_container1")
+    _set_parm_safe(container, "particlesep", particle_sep)
+    # The container deletes particles that reach its walls, so it is sized
+    # around the source and stands on the ground plane the solver adds at y=0.
+    # ponytail: a source below y=0 still lands on y=0; move ground_posy if needed.
+    bbox = objmerge.geometry().boundingBox() if objmerge.geometry() else None
+    if bbox is not None and bbox.isValid():
+        width = max(4.0, 3.0 * max(bbox.sizevec()[0], bbox.sizevec()[2]))
+        height = max(4.0, bbox.maxvec()[1] + 1.5)
+        center = bbox.center()
+        container.parmTuple("size").set((width, height, width))
+        container.parmTuple("t").set((center[0], height / 2.0 - 0.5, center[2]))
+    all_nodes.append(container.path())
 
-    # -- Step 4: Create FLIP solver
-    print("[workflow] Creating FLIP Solver DOP")
-    try:
-        flipsolver = dopnet.createNode("flipsolver", "flipsolver1")
-    except hou.OperationFailed:
-        flipsolver = dopnet.createNode("flipsolver::2.0", "flipsolver1")
-    all_nodes.append(flipsolver.path())
+    source = geo.createNode("flipboundary", "flip_source1")
+    for index in range(3):
+        source.setInput(index, container, index)
+    source.setInput(3, objmerge, 0)
+    all_nodes.append(source.path())
 
-    # -- Step 5: Create FLIP Object
-    print("[workflow] Creating FLIP Object DOP")
-    try:
-        flipobj = dopnet.createNode("flipobject", "flipobject1")
-        all_nodes.append(flipobj.path())
-        _set_parm_safe(flipobj, "particlesep", particle_sep)
-        flipsolver.setInput(0, flipobj, 0)
-    except hou.OperationFailed:
-        print("[workflow] Warning: flipobject not available")
-        flipobj = None
+    solver = geo.createNode("flipsolver", "flip_solver1")
+    for index in range(3):
+        solver.setInput(index, source, index)
+    _set_parm_safe(solver, "particlesep", particle_sep)
+    _set_parm_safe(solver, "useground", "ground")
+    all_nodes.append(solver.path())
 
-    # -- Step 6: Create FLIP Source
-    print("[workflow] Creating FLIP Source DOP")
-    try:
-        # volumesource ahead of the deprecated, undocumented sourcevolume; SideFX
-        # document volumesource as covering FLIP sources too.
-        flipsource = _create_first_available(
-            dopnet, ("flipsource", "volumesource", "sourcevolume"), "flipsource1"
-        )
-        all_nodes.append(flipsource.path())
-    except hou.OperationFailed:
-        print("[workflow] Warning: no FLIP/volume source node available")
-        flipsource = None
-
-    # -- Step 7: Create FLIP Tank / Domain
-    print("[workflow] Creating FLIP Tank / Domain")
-    try:
-        fliptank = geo.createNode("fluidtank", "flip_tank1")
-        all_nodes.append(fliptank.path())
-    except hou.OperationFailed:
-        print("[workflow] Warning: fluidtank not available, creating box domain")
-        try:
-            fliptank = geo.createNode("box", "flip_domain1")
-            _set_parm_safe(fliptank, "sizex", 4.0)
-            _set_parm_safe(fliptank, "sizey", 4.0)
-            _set_parm_safe(fliptank, "sizez", 4.0)
-            all_nodes.append(fliptank.path())
-        except Exception as e:
-            print(f"[workflow] Warning: could not create domain: {readable_message(e)}")
-            fliptank = None
-
-    # -- Step 8: DOP Import
-    print("[workflow] Creating DOP Import SOP")
-    dopimport = geo.createNode("dopimport", "dop_import1")
-    _set_parm_safe(dopimport, "doppath", dopnet.path())
-    all_nodes.append(dopimport.path())
-
-    # -- Step 9: File Cache
+    # -- Step 4: File Cache on the particles, the stream surfacing reads.
     print("[workflow] Creating File Cache SOP")
-    try:
-        filecache = geo.createNode("filecache", "file_cache1")
-    except hou.OperationFailed:
-        filecache = geo.createNode("filecache::2.0", "file_cache1")
-    filecache.setInput(0, dopimport, 0)
+    filecache = _create_first_available(geo, ("filecache::2.0", "filecache"), "file_cache1")
+    filecache.setInput(0, solver, 0)
+    filecache.setDisplayFlag(True)
+    filecache.setRenderFlag(True)
     all_nodes.append(filecache.path())
 
-    try:
-        filecache.setDisplayFlag(True)
-        filecache.setRenderFlag(True)
-    except Exception:
-        pass
-
-    # -- Step 10: Layout
-    print("[workflow] Laying out nodes")
     layout_if_enabled(geo)
-    layout_if_enabled(dopnet)
     _focus_network_editor(filecache)
-
     print(f"[workflow] FLIP simulation '{name}' setup complete")
 
     return {
         "success": True,
         "geo_path": geo.path(),
-        "dop_path": dopnet.path(),
+        "solver_path": solver.path(),
+        "container_path": container.path(),
+        "source_path": source.path(),
         "cache_path": filecache.path(),
         "all_nodes": all_nodes,
         **_source_status(objmerge, source_geo, "FLIP"),
@@ -758,18 +791,21 @@ def _setup_vellum_sim(
     sim_type: str = "cloth",
     substeps: int = 5,
     name: str = "vellum_sim",
+    ground: bool = True,
     **_: Any,
 ) -> dict:
     """Build a complete Vellum simulation network.
 
     Creates a geometry node with Vellum Configure (cloth/hair/grain/softbody),
-    Vellum Solver, Object Merge source, and a File Cache.
+    Vellum Solver, Object Merge source, and a Vellum I/O cache.
 
     Args:
         geo_path: Path to the source geometry object.
         sim_type: Simulation type -- "cloth", "hair", "grain", or "softbody".
         substeps: Number of solver substeps.
         name: Name for the top-level geometry node.
+        ground: Turn on the solver's ground plane. Without one a draped cloth
+            falls through y=0 forever, as setup_rbd_sim's pieces used not to.
     """
     obj = _ensure_obj_context()
     all_nodes: list[str] = []
@@ -778,15 +814,17 @@ def _setup_vellum_sim(
     if sim_type not in valid_types:
         raise ValueError(f"Invalid sim_type '{sim_type}'. Must be one of: {valid_types}")
 
-    # Map sim_type to Vellum configure node type
-    configure_map = {
-        "cloth": "vellumdrape",
-        "hair": "vellumhair",
-        "grain": "vellumgrain",
-        "softbody": "vellumsoftbody",
+    # What the Vellum shelf's Configure tools put down. vellumhair, vellumgrain
+    # and vellumsoftbody are not node types, so three of the four used to fall
+    # back to a bare vellumconstraints, and "cloth" built a Vellum Drape, which
+    # runs a draping sim of its own. A strut softbody is a cloth shell plus
+    # struts (shelf/vellumsoftbody); grain has its own node.
+    configure_chain = {
+        "cloth": [("vellumconstraints", "cloth")],
+        "hair": [("vellumconstraints", "hair")],
+        "grain": [("vellumconstraints_grain", None)],
+        "softbody": [("vellumconstraints", "cloth"), ("vellumconstraints", "struts")],
     }
-    # Fallback: vellumconstraints works for all types
-    configure_fallback = "vellumconstraints"
 
     # -- Step 1: Create geo container
     print(f"[workflow] Creating geo node '{name}' under /obj")
@@ -808,24 +846,19 @@ def _setup_vellum_sim(
             f"[workflow] Warning: source geometry '{geo_path}' not found -- Object Merge created but path may need updating"
         )
 
-    # -- Step 3: Vellum Configure
+    # -- Step 3: Vellum Configure, chained geometry-to-geometry and
+    # constraints-to-constraints the way the shelf chains them.
     print(f"[workflow] Creating Vellum Configure ({sim_type})")
-    configure_type = configure_map[sim_type]
-    try:
-        vellum_configure = geo.createNode(configure_type, f"vellum_{sim_type}1")
-    except hou.OperationFailed:
-        print(
-            f"[workflow] Warning: {configure_type} not available, falling back to {configure_fallback}"
-        )
-        try:
-            vellum_configure = geo.createNode(configure_fallback, f"vellum_{sim_type}1")
-        except hou.OperationFailed:
-            raise ValueError(
-                f"Could not create Vellum configure node. "
-                f"Tried '{configure_type}' and '{configure_fallback}'."
-            ) from None
-    vellum_configure.setInput(0, objmerge, 0)
-    all_nodes.append(vellum_configure.path())
+    vellum_configure = None
+    for index, (type_name, constraint) in enumerate(configure_chain[sim_type], start=1):
+        node = geo.createNode(type_name, f"vellum_{sim_type}{index}")
+        if constraint is not None:
+            node.parm("constrainttype").set(constraint)
+        node.setInput(0, vellum_configure or objmerge, 0)
+        if vellum_configure is not None:
+            node.setInput(1, vellum_configure, 1)
+        all_nodes.append(node.path())
+        vellum_configure = node
 
     # -- Step 4: Vellum Solver
     print("[workflow] Creating Vellum Solver SOP")
@@ -843,21 +876,14 @@ def _setup_vellum_sim(
 
     # Set substeps
     _set_parm_safe(vellum_solver, "substeps", substeps)
+    _set_parm_safe(vellum_solver, "useground", 1 if ground else 0)
 
-    # -- Step 5: File Cache
-    print("[workflow] Creating File Cache SOP")
-    try:
-        filecache = geo.createNode("filecache", "file_cache1")
-    except hou.OperationFailed:
-        filecache = geo.createNode("filecache::2.0", "file_cache1")
-    filecache.setInput(0, vellum_solver, 0)
+    # -- Step 5: Vellum I/O, not a File Cache: a filecache on the first output
+    # drops the constraints and collisions, and vellumpostprocess downstream
+    # of the cache needs them.
+    print("[workflow] Creating Vellum I/O")
+    filecache = _stream_cache(geo, "vellumio", "vellum_io1", vellum_solver, 3)
     all_nodes.append(filecache.path())
-
-    try:
-        filecache.setDisplayFlag(True)
-        filecache.setRenderFlag(True)
-    except Exception:
-        pass
 
     # -- Step 6: Layout
     print("[workflow] Laying out nodes")
@@ -903,70 +929,42 @@ def _create_material(
         opacity: Opacity (0.0 = transparent, 1.0 = opaque).
     """
     mat = _ensure_mat_context()
+    color = list(base_color[:3]) if base_color is not None and len(base_color) >= 3 else None
 
     if mat_type == "principled":
-        # -- Principled Shader
-        print(f"[workflow] Creating principled shader '{name}' in /mat")
-        try:
-            shader = mat.createNode("principledshader", name)
-        except hou.OperationFailed:
-            shader = mat.createNode("principledshader::2.0", name)
-
-        if base_color is not None and len(base_color) >= 3:
-            print(f"[workflow] Setting base color to {base_color}")
-            _set_parm_safe(shader, "basecolorr", base_color[0])
-            _set_parm_safe(shader, "basecolorg", base_color[1])
-            _set_parm_safe(shader, "basecolorb", base_color[2])
-
-        print(f"[workflow] Setting roughness={roughness}, metallic={metallic}, opacity={opacity}")
-        _set_parm_safe(shader, "rough", roughness)
-        _set_parm_safe(shader, "metallic", metallic)
-        _set_parm_safe(shader, "opac", opacity)
-
-        shader_path = shader.path()
-
+        shader = _create_first_available(mat, ("principledshader::2.0", "principledshader"), name)
+        values = {"rough": roughness, "metallic": metallic, "opac": opacity}
+        if color:
+            values["basecolor"] = color
     elif mat_type == "materialx":
-        # -- MaterialX Standard Surface
-        print(f"[workflow] Creating MaterialX standard surface '{name}' in /mat")
-        try:
-            shader = mat.createNode("mtlxstandard_surface", name)
-        except hou.OperationFailed:
-            try:
-                shader = mat.createNode("mtlxsurface", name)
-            except hou.OperationFailed:
-                # Fallback: create a subnet with materialx nodes
-                shader = mat.createNode("subnet", name)
-                print(
-                    "[workflow] Warning: MaterialX node types not directly available, created subnet"
-                )
-
-        if base_color is not None and len(base_color) >= 3:
-            print(f"[workflow] Setting base color to {base_color}")
-            _set_parm_safe(shader, "base_colorr", base_color[0])
-            _set_parm_safe(shader, "base_colorg", base_color[1])
-            _set_parm_safe(shader, "base_colorb", base_color[2])
-
-        print(f"[workflow] Setting roughness={roughness}, metallic={metallic}, opacity={opacity}")
-        _set_parm_safe(shader, "specular_roughness", roughness)
-        _set_parm_safe(shader, "metalness", metallic)
-        _set_parm_safe(shader, "opacity", opacity)
-
-        shader_path = shader.path()
-
+        # The bare-subnet fallback this used to take returned an empty network
+        # as type "materialx" with success; a missing MaterialX is an error.
+        shader = _create_first_available(mat, ("mtlxstandard_surface", "mtlxsurface"), name)
+        # opacity is a colour on MaterialX (opacityr/g/b): a scalar "opacity"
+        # parm does not exist, and 0.5 used to be dropped without a word.
+        values = {"specular_roughness": roughness, "metalness": metallic, "opacity": [opacity] * 3}
+        if color:
+            values["base_color"] = color
     else:
         raise ValueError(f"Unknown mat_type '{mat_type}'. Must be 'principled' or 'materialx'.")
+    skipped = _set_values(shader, values)
+    shader_path = shader.path()
 
-    layout_if_enabled(mat)
-    _focus_network_editor(shader)
+    layout_if_enabled(mat, place_unpositioned=True)
+    # The shader was just created (through _create_first_available): place it.
+    _focus_network_editor(shader, place_unpositioned=True)
 
     print(f"[workflow] Material '{name}' created at {shader_path}")
 
-    return {
-        "success": True,
+    result = {
+        "success": not skipped,
         "material_path": shader_path,
         "shader_node_path": shader_path,
         "type": mat_type,
     }
+    if skipped:
+        result["not_set"] = skipped
+    return result
 
 
 ###### workflow.assign_material
@@ -989,6 +987,10 @@ def _assign_material(
     print(f"[workflow] Assigning material '{material_path}' to '{geo_path}'")
 
     geo = _get_node(geo_path)
+    # A typo in material_path used to be written into the Material SOP and
+    # answered with success; the object then rendered unshaded.
+    if hou.node(material_path) is None:
+        raise ValueError(f"Material not found: {material_path}")
 
     # Determine the SOP-level parent -- if geo_path points to an Object-level
     # node we work inside it; if it already points to a SOP network, use it.
@@ -1000,10 +1002,10 @@ def _assign_material(
     else:
         sop_parent = geo
 
-    # Find the last displayed SOP
-    print("[workflow] Finding last displayed SOP")
-    last_displayed = None
-    for child in sop_parent.children():
+    # A SOP named explicitly is where the material goes; only an object gets
+    # the Material SOP after its displayed node.
+    last_displayed = geo if category == "Sop" else None
+    for child in () if last_displayed is not None else sop_parent.children():
         try:
             if child.isDisplayFlagSet():
                 last_displayed = child
@@ -1070,76 +1072,36 @@ def _build_sop_chain(
     """
     if steps is None or len(steps) == 0:
         raise ValueError("steps list is required and must not be empty")
+    _get_node(parent_path)
+    from fxhoudinimcp_server.handlers.graph_handlers import build_network
 
-    parent = _get_node(parent_path)
-    created_nodes: list[dict] = []
-    prev_node = None
-
-    for i, step in enumerate(steps):
-        node_type = step.get("type")
-        if node_type is None:
-            raise ValueError(f"Step {i} is missing required 'type' key")
-
-        node_name = step.get("name")
-        params = step.get("params", {})
-
-        print(
-            f"[workflow] Step {i + 1}/{len(steps)}: Creating '{node_type}'"
-            + (f" (name='{node_name}')" if node_name else "")
-        )
-
-        try:
-            node = parent.createNode(node_type, node_name=node_name)
-        except hou.OperationFailed as e:
-            raise ValueError(
-                f"Failed to create node of type '{node_type}' at step {i + 1}: {readable_message(e)}"
-            ) from e
-
-        # Wire to previous node
-        if prev_node is not None:
-            try:
-                node.setInput(0, prev_node, 0)
-            except Exception as e:
-                print(
-                    f"[workflow] Warning: could not wire step {i + 1} to previous node: {readable_message(e)}"
-                )
-
-        # Set parameters
-        if params:
-            print(f"[workflow] Setting {len(params)} parameter(s) on {node.path()}")
-            for parm_name, parm_value in params.items():
-                _set_parm_safe(node, parm_name, parm_value)
-
-        created_nodes.append(
-            {
-                "path": node.path(),
-                "type": node.type().name(),
-                "name": node.name(),
-            }
-        )
-        prev_node = node
-
-    # Set display flag on last node
-    if prev_node is not None:
-        try:
-            prev_node.setDisplayFlag(True)
-            prev_node.setRenderFlag(True)
-            print(f"[workflow] Display flag set on {prev_node.path()}")
-        except Exception:
-            pass
-
-    # Layout
-    print("[workflow] Laying out nodes")
-    layout_if_enabled(parent)
-    if prev_node is not None:
-        _focus_network_editor(prev_node)
-
-    print(f"[workflow] SOP chain built: {len(created_nodes)} node(s)")
-
+    # A linear build_network: every type and parameter is validated before
+    # anything is created, tuples ("rad", "t", "size") are set whole, and a
+    # failure builds nothing. The hand-rolled loop this replaces skipped a
+    # misspelt or tuple-only parameter and a failed wire with success: True.
+    specs = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict) or not step.get("type"):
+            raise ValueError(f"Step {index} is missing required 'type' key")
+        name = step.get("name") or f"{step['type'].split('::')[0].split(':')[-1]}_step{index + 1}"
+        spec = {"type": step["type"], "name": name, "parms": step.get("params") or {}}
+        if specs:
+            spec["inputs"] = [specs[-1]["name"]]
+        specs.append(spec)
+    specs[-1]["flags"] = {"display": True, "render": True}
+    result = build_network(parent_path=parent_path, nodes=specs)
+    if not result.get("success"):
+        return result
+    last = result["created"][-1]["path"] if result.get("created") else None
+    if last:
+        # build_network placed what it created; nothing else may move.
+        _focus_network_editor(hou.node(last), place_unpositioned=False)
     return {
         "success": True,
-        "nodes": created_nodes,
-        "displayed": prev_node.path() if prev_node else None,
+        "nodes": result["created"],
+        "displayed": last,
+        "geometry": result.get("geometry"),
+        "error_nodes": result.get("error_nodes", []),
     }
 
 
@@ -1174,6 +1136,9 @@ def _setup_render(
     obj = _ensure_obj_context()
     out = _ensure_out_context()
     all_nodes: list[str] = []
+    # What did not take goes here and into the reply; it used to be printed
+    # to Houdini's console, where the caller never saw it.
+    warnings: list[str] = []
 
     # -- Step 1: Camera
     if camera is None:
@@ -1192,9 +1157,7 @@ def _setup_render(
     else:
         print(f"[workflow] Using existing camera: {camera}")
         if hou.node(camera) is None:
-            print(
-                f"[workflow] Warning: camera '{camera}' not found -- ROP will reference it anyway"
-            )
+            warnings.append(f"camera '{camera}' does not exist; the ROP references it anyway")
 
     # -- Step 2: ROP node
     if renderer == "karma":
@@ -1218,35 +1181,46 @@ def _setup_render(
 
     all_nodes.append(rop.path())
 
-    # -- Step 3: Configure output path
-    print(f"[workflow] Setting output path: {output_path}")
-    # Try common parameter names for different ROP types
-    output_set = False
+    # -- Step 3: Output path
+    applied: dict[str, Any] = {}
     for parm_name in ("picture", "vm_picture", "outputimage", "ar_picture"):
         if _set_parm_safe(rop, parm_name, output_path):
-            output_set = True
+            applied["output"] = parm_name
             break
-    if not output_set:
-        print("[workflow] Warning: could not find output path parameter on ROP")
+    else:
+        warnings.append("no output image parameter found on the ROP; output_path not set")
 
-    # -- Step 4: Configure resolution
-    print(f"[workflow] Setting resolution: {resolution[0]}x{resolution[1]}")
-    # Resolution can be on the ROP or on the camera
-    _set_parm_safe(rop, "resx", resolution[0])
-    _set_parm_safe(rop, "resy", resolution[1])
-    _set_parm_safe(rop, "res_overridex", resolution[0])
-    _set_parm_safe(rop, "res_overridey", resolution[1])
+    # -- Step 4: Resolution. res_override* only counts with override_camerares
+    # on, and both Karma and Mantra ship it off: the render used the camera's
+    # resolution while the reply echoed the one asked for.
+    if _set_parm_safe(rop, "override_camerares", 1):
+        _set_parm_safe(rop, "res_overridex", resolution[0])
+        _set_parm_safe(rop, "res_overridey", resolution[1])
+        applied["resolution"] = "override_camerares + res_override"
+    elif _set_parm_safe(rop, "resolutionx", resolution[0]):
+        _set_parm_safe(rop, "resolutiony", resolution[1])
+        applied["resolution"] = "resolutionx/y"
+    else:
+        warnings.append("no resolution parameter found on the ROP; resolution not set")
 
-    # -- Step 5: Configure samples
-    print(f"[workflow] Setting samples: {samples}")
-    for parm_name in ("vm_samples", "samples", "samplesperpixel", "vm_samplesx", "karma_samples"):
-        _set_parm_safe(rop, parm_name, samples)
+    # -- Step 5: Samples. Mantra splits them per axis (64 = 8 x 8).
+    if _set_parm_safe(rop, "samplesperpixel", samples):
+        applied["samples"] = "samplesperpixel"
+    elif rop.parm("vm_samplesx") is not None:
+        side = max(1, round(samples**0.5))
+        _set_parm_safe(rop, "vm_samplesx", side)
+        _set_parm_safe(rop, "vm_samplesy", side)
+        applied["samples"] = f"vm_samplesx/y = {side}x{side}"
+    else:
+        warnings.append("no pixel samples parameter found on the ROP; samples not set")
 
-    # -- Step 6: Set camera path
-    print(f"[workflow] Setting camera: {camera}")
+    # -- Step 6: Camera path
     for parm_name in ("camera", "cam", "viewcamera"):
         if _set_parm_safe(rop, parm_name, camera):
+            applied["camera"] = parm_name
             break
+    else:
+        warnings.append("no camera parameter found on the ROP; camera not set")
 
     # Layout
     layout_if_enabled(out)
@@ -1262,7 +1236,9 @@ def _setup_render(
         "renderer": renderer,
         "resolution": resolution,
         "samples": samples,
+        "applied": applied,
         "all_nodes": all_nodes,
+        **({"warnings": warnings} if warnings else {}),
     }
 
 

@@ -7,6 +7,7 @@ Copernicus compositing networks.
 from __future__ import annotations
 
 # Built-in
+import contextlib
 import logging
 
 # Third-party
@@ -277,20 +278,51 @@ def get_cop_layer(node_path: str, output_index: int = 0) -> dict:
         result["x_resolution"] = None
         result["y_resolution"] = None
 
-    # Try Copernicus-style layer() method
+    # Copernicus: the layer itself. This used to answer only "available: true",
+    # with no resolution and no values, so a COP chain could not be checked
+    # without a screenshot of a visualizer that is not the data.
     try:
         layer_data = node.layer(output_index)
-        if layer_data is not None:
-            result["copernicus_layer"] = {
-                "type": str(type(layer_data).__name__),
-                "available": True,
-            }
-        else:
-            result["copernicus_layer"] = {"available": False}
-    except (AttributeError, Exception):
-        result["copernicus_layer"] = {"available": False}
-
+    except Exception:
+        layer_data = None
+    result["copernicus_layer"] = (
+        _layer_summary(layer_data) if layer_data is not None else {"available": False}
+    )
+    if layer_data is not None and result.get("x_resolution") is None:
+        resolution = result["copernicus_layer"].get("resolution") or [None, None]
+        result["x_resolution"], result["y_resolution"] = resolution[:2]
     return result
+
+
+def _layer_summary(layer) -> dict:
+    """Resolution, channels and per-channel value range of a Copernicus layer.
+
+    computeMin/Max/Average run in Houdini, so no pixel crosses into Python.
+    """
+    summary: dict = {"available": True}
+    with contextlib.suppress(Exception):
+        summary["resolution"] = list(layer.bufferResolution())
+    with contextlib.suppress(Exception):
+        summary["storage"] = str(layer.storageType()).rsplit(".", 1)[-1]
+    with contextlib.suppress(Exception):
+        summary["is_constant"] = bool(layer.isConstant())
+    channels = 0
+    with contextlib.suppress(Exception):
+        channels = int(layer.channelCount())
+    summary["channels"] = channels
+    ranges = []
+    for channel in range(min(channels, 4)):
+        with contextlib.suppress(Exception):
+            ranges.append(
+                {
+                    "min": layer.computeMin(channel),
+                    "max": layer.computeMax(channel),
+                    "mean": layer.computeAverage(channel),
+                }
+            )
+    if ranges:
+        summary["channel_ranges"] = ranges
+    return summary
 
 
 ###### cops.create_cop_node
@@ -358,8 +390,11 @@ def set_cop_flags(
             flags_set["display_error"] = str(e)
 
     if export_flag is not None:
+        # Copernicus COPs have setExportFlag, not setRenderFlag (COP2's name),
+        # so this always failed while the call still said success.
+        setter = "setExportFlag" if hasattr(node, "setExportFlag") else "setRenderFlag"
         try:
-            node.setRenderFlag(export_flag)
+            getattr(node, setter)(export_flag)
             flags_set["export_flag"] = export_flag
         except Exception as e:
             flags_set["export_flag_error"] = str(e)
@@ -372,7 +407,7 @@ def set_cop_flags(
             flags_set["compress_error"] = str(e)
 
     return {
-        "success": True,
+        "success": not any(key.endswith("_error") for key in flags_set),
         "node_path": node.path(),
         "flags_set": flags_set,
     }
@@ -401,11 +436,6 @@ def list_cop_node_types(filter: str = None) -> dict:
                 "label": node_type.description(),
             }
             try:
-                type_info["icon"] = node_type.icon()
-            except (hou.OperationFailed, AttributeError) as e:
-                logger.debug("Could not read icon for COP type '%s': %s", type_name, e)
-                type_info["icon"] = None
-            try:
                 type_info["min_inputs"] = node_type.minNumInputs()
                 type_info["max_inputs"] = node_type.maxNumInputs()
             except (hou.OperationFailed, AttributeError) as e:
@@ -419,9 +449,12 @@ def list_cop_node_types(filter: str = None) -> dict:
     # Sort by name
     cop_types.sort(key=lambda x: x["name"])
 
+    # Capped with a count, like list_node_types; the icon path each row used
+    # to carry is dropped (get_node_info drops it too).
     return {
         "cop_type_count": len(cop_types),
-        "cop_types": cop_types,
+        "truncated": len(cop_types) > 200,
+        "cop_types": cop_types[:200],
         "filter_applied": filter,
     }
 

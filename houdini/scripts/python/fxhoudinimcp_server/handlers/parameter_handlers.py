@@ -41,17 +41,75 @@ def _available_parm_names(node: hou.Node) -> list[str]:
     return sorted(p.name() for p in node.parms())
 
 
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def suggest_parms(wanted: str, labels: dict[str, str], n: int = 3) -> list[str]:
+    """Parm names a mistyped *wanted* most likely meant; *labels* maps name -> label.
+
+    Name spelling alone misses the usual mistake, which is guessing a name
+    from the label: "minvalue" for attribrandomize's `min` ("Min Value")
+    scores closer to `valuea` than to `min`. So label matches come first.
+    """
+    by_label: dict[str, list[str]] = {}
+    for name, label in labels.items():
+        by_label.setdefault(_squash(label), []).append(name)
+    found = [
+        name
+        for label in get_close_matches(_squash(wanted), list(by_label), n=n, cutoff=0.8)
+        for name in by_label[label]
+    ]
+    found += get_close_matches(wanted, sorted(labels), n=n, cutoff=0.5)
+    return list(dict.fromkeys(found))[: n + 1]
+
+
+def set_whole_expression(parm: hou.Parm, expression: str, language: Any = None) -> int:
+    """Make *expression* drive *parm* on every frame; returns keys replaced.
+
+    On an animated parm setExpression only rewrites the segment at the
+    current frame: a chop() export onto keys at 1/50/100 read the channel on
+    frame 1 and still 90 on frame 50 (measured on 22.0.368). The keys go
+    first, and the count is reported so the caller can say what was replaced.
+    """
+    replaced = len(parm.keyframes())
+    if replaced > 1:
+        parm.deleteAllKeyframes()
+    if language is None:
+        parm.setExpression(expression)
+    else:
+        parm.setExpression(expression, language)
+    return replaced if replaced > 1 else 0
+
+
+def parm_labels(node: hou.Node) -> dict[str, str]:
+    """Name -> label for every parm on a live node, multiparm instances included."""
+    return {p.name(): p.description() for p in node.parms()}
+
+
+def template_labels(templates) -> dict[str, str]:
+    """Name -> label for a node type's parm templates, folders walked."""
+    labels: dict[str, str] = {}
+    for template in templates:
+        if template.type() == hou.parmTemplateType.Folder:
+            labels.update(template_labels(template.parmTemplates()))
+        elif template.type() != hou.parmTemplateType.FolderSet:
+            labels[template.name()] = template.label()
+    return labels
+
+
 def _resolve_parm(node_path: str, parm_name: str) -> hou.Parm:
     """Return the hou.Parm on *node_path* named *parm_name* or raise."""
     node = _resolve_node(node_path)
     parm = node.parm(parm_name)
     if parm is None:
-        available = _available_parm_names(node)
-        close = get_close_matches(parm_name, available, n=3, cutoff=0.4)
+        # No full name list: on a Pyro Solver it was 14.5 KB, sent on every
+        # guessed name, the most common mistake there is.
+        close = suggest_parms(parm_name, parm_labels(node))
         hint = f" Did you mean: {close}?" if close else ""
         raise ValueError(
             f"Parameter '{parm_name}' not found on node '{node_path}'.{hint} "
-            f"Available parameters: {available}"
+            f"get_node_card(node_type, parm_filter=...) lists the real names."
         )
     return parm
 
@@ -327,7 +385,8 @@ def _write_parm(parm: hou.Parm, value: Any, override_expression: bool = False) -
     new_value = _serialize_value(parm.eval())
     info: dict[str, Any] = {"new_value": new_value}
     raw = _raw_string(parm)
-    if raw is not None:
+    # Only when it differs: "$HIP/geo" is worth seeing, "/geo/ball" twice is not.
+    if raw is not None and raw != new_value:
         info["raw_value"] = raw
     matches = _values_match(value, new_value)
     if after is not None and through is not None and matches:
@@ -413,7 +472,7 @@ def _set_tuple(
         kept.append(entry)
     report: dict[str, Any] = {}
     raw = [_raw_string(p) for p in components]
-    if any(r is not None for r in raw):
+    if any(r is not None and r != v for r, v in zip(raw, new_value, strict=False)):
         report["raw_value"] = raw
     if kept:
         same = all(entry.get("same_as_evaluated") for entry in kept)
@@ -615,9 +674,33 @@ def _set_parameters(
 
     results: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
-
-    available = _available_parm_names(node)
     for name, value in params.items():
+        # {"expr": ..., "language": ...} is build_network's spelling for an
+        # expression. Here it used to fall through to a literal write that
+        # stored 0 and reported success, so the expression silently vanished.
+        if isinstance(value, dict):
+            parm = node.parm(name)
+            if "expr" not in value or parm is None:
+                problem = "no such parameter" if parm is None else 'a dict value needs "expr"'
+                errors.append({"parm_name": name, "error": f"{problem}: {value!r}"})
+                continue
+            language = str(value.get("language", "hscript")).lower()
+            try:
+                replaced = set_whole_expression(
+                    parm,
+                    str(value["expr"]),
+                    hou.exprLanguage.Python if language == "python" else hou.exprLanguage.Hscript,
+                )
+            except Exception as exc:
+                errors.append({"parm_name": name, "error": str(exc)})
+                continue
+            entry = {"parm_name": name, "expression": str(value["expr"])}
+            if replaced:
+                entry["replaced_keyframes"] = replaced
+            if broken := broken_references(parm):
+                entry["warning"] = "; ".join(broken)
+            results.append(entry)
+            continue
         # A list on a vector name sets the whole tuple, exactly as the single
         # setter does. The batch path used to know only per-component names,
         # which made "prefer set_parameters" and "set a light colour" collide.
@@ -634,7 +717,7 @@ def _set_parameters(
                 continue
         parm = node.parm(name)
         if parm is None:
-            close = get_close_matches(name, available, n=3, cutoff=0.4)
+            close = suggest_parms(name, parm_labels(node))
             hint = f" Did you mean: {close}?" if close else ""
             errors.append({"parm_name": name, "error": f"Parameter '{name}' not found.{hint}"})
             continue
@@ -704,7 +787,7 @@ def _get_parameter_schema(
             return {
                 "node_path": node_path,
                 "error": f"Parameter '{parm_name}' not found",
-                "available_parameters": _available_parm_names(node),
+                "did_you_mean": suggest_parms(parm_name, parm_labels(node)),
             }
         return {
             "node_path": node_path,
@@ -728,11 +811,21 @@ def _get_parameter_schema(
         f = filter.lower()
         parm_infos = [p for p in parm_infos if f in p["name"].lower() or f in p["label"].lower()]
 
-    return {
+    # Unfiltered this was every visible template with up to 50 menu items each:
+    # 70 KB on a Pyro Solver. The first 60 in full, the rest by name.
+    shown = parm_infos if filter else parm_infos[:_SCHEMA_CAP]
+    result = {
         "node_path": node_path,
         "parameter_count": len(parm_infos),
-        "parameters": parm_infos,
+        "parameters": shown,
     }
+    if len(shown) < len(parm_infos):
+        result["not_shown"] = [p["name"] for p in parm_infos[len(shown) :]]
+        result["note"] = "Pass filter=... (or parm_name) for the full entries of the rest."
+    return result
+
+
+_SCHEMA_CAP = 60
 
 
 register_handler("parameters.get_parameter_schema", _get_parameter_schema)
@@ -753,14 +846,34 @@ def _set_expression(
 
     lang = hou.exprLanguage.Python if language.lower() == "python" else hou.exprLanguage.Hscript
 
-    parm.setExpression(expression, lang)
+    replaced = set_whole_expression(parm, expression, lang)
 
-    return {
+    result = {
         "node_path": node_path,
         "parm_name": parm_name,
         "expression": expression,
         "language": language,
     }
+    if replaced:
+        result["replaced_keyframes"] = replaced
+    problems = broken_references(parm)
+    if lang == hou.exprLanguage.Hscript:
+        # An unknown function or a bracing error evaluates to 0 without
+        # raising, so the expression looks set and quietly reads zero.
+        previous = hou.pwd()
+        try:
+            hou.setPwd(parm.node())
+            hou.hscriptExpression(expression)
+        except hou.OperationFailed as exc:
+            detail = str(exc).replace("The attempted operation failed.", "").strip()
+            problems.append(f"{parm_name}: the expression does not evaluate ({detail})")
+        except Exception:
+            pass
+        finally:
+            hou.setPwd(previous)
+    if problems:
+        result["warning"] = "; ".join(problems)
+    return result
 
 
 register_handler("parameters.set_expression", _set_expression)
@@ -798,14 +911,22 @@ def _revert_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any
     """Revert a parameter to its default value."""
     parm = _resolve_parm(node_path, parm_name)
 
+    # revertToDefaults() alone leaves an expression and keyframes in place
+    # (measured on 22.0.368: $F*2 and two keys survived it), while this
+    # reported reverted: True. Deleting the keyframes first clears both, and
+    # a factory default expression ($FSTART on a ROP's f1) still comes back.
+    parm.deleteAllKeyframes()
     parm.revertToDefaults()
 
-    return {
+    result = {
         "node_path": node_path,
         "parm_name": parm_name,
         "reverted": True,
         "value": _serialize_value(parm.eval()),
     }
+    if (expression := _expression_of(parm)) is not None:
+        result["default_expression"] = expression
+    return result
 
 
 register_handler("parameters.revert_parameter", _revert_parameter)
@@ -898,7 +1019,7 @@ def _link_parameters(
     function = _channel_function(dst)
     channel_path = _relative_channel_path(dst, src)
     ref_expr = f'{function}("{channel_path}")'
-    dst.setExpression(ref_expr, hou.exprLanguage.Hscript)
+    set_whole_expression(dst, ref_expr, hou.exprLanguage.Hscript)
 
     reply: dict[str, Any] = {
         "source": src.path(),
@@ -1425,6 +1546,33 @@ def _outgoing_reference(parm: hou.Parm) -> dict[str, Any] | None:
     return entry
 
 
+def broken_references(parm: hou.Parm) -> list[str]:
+    """Channel references in *parm* that point at a node or parameter that is not there.
+
+    Houdini evaluates such a reference to 0 or "" and reports nothing: no error,
+    no warning, and the node cooks clean. A terrain whose height reads a missing
+    ../CTRL null goes flat while every check says healthy, so this looks. Paths
+    built at runtime ($OS) are skipped rather than guessed at.
+    """
+    # Cheap gate first: this runs over every parm of every node in a verify,
+    # and _outgoing_reference raises and swallows on each plain value.
+    try:
+        if not parm.keyframes() and (
+            parm.parmTemplate().type() != hou.parmTemplateType.String
+            or "`" not in parm.unexpandedString()
+        ):
+            return []
+    except Exception:
+        return []
+    entry = _outgoing_reference(parm)
+    return [
+        f"{parm.name()}: reference '{token}' does not resolve, so it silently "
+        f"evaluates to 0 or an empty string"
+        for token in (entry or {}).get("unresolved", [])
+        if "$" not in token
+    ]
+
+
 def _capped_paths(nodes: Any, exclude: str, limit: int) -> tuple[list[str], int]:
     paths = sorted({n.path() for n in nodes} - {exclude})
     return paths[:limit], len(paths)
@@ -1638,7 +1786,8 @@ def _get_parm_template_tree(
     type_name: str | None = None,
     context: str = "Sop",
     folder: Any = None,
-    max_entries: int = 400,
+    max_entries: int = 150,
+    include_tags: bool = False,
     **_: Any,
 ) -> dict[str, Any]:
     """The whole parameter interface as a tree -- folders, conditionals, menu
@@ -1670,6 +1819,10 @@ def _get_parm_template_tree(
     else:
         entries = [_template_tree_entry(entry) for entry in group.entries()]
 
+    if not include_tags:
+        # Tags were 34 of the 141 KB a Pyro Solver tree came back as; they
+        # matter when editing an interface, so they stay one flag away.
+        _drop_key(entries, "tags")
     total = _count_tree(entries)
     truncated = total > int(max_entries)
     if truncated:
@@ -1690,6 +1843,12 @@ def _get_parm_template_tree(
             f"folder=<label> or raise max_entries."
         )
     return result
+
+
+def _drop_key(entries: list, key: str) -> None:
+    for entry in entries:
+        entry.pop(key, None)
+        _drop_key(entry.get("children") or [], key)
 
 
 register_handler("parameters.get_parm_template_tree", _get_parm_template_tree)

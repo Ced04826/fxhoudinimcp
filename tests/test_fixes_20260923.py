@@ -661,7 +661,7 @@ class TestQueriedGeometryIsNotRepeated:
         assert result["success"] is True, result
         assert result["queried_node"] == "/obj/geo1/a"
         assert result["geometry"] == {"points": 1, "of": "a"}
-        rows = {row["name"]: row for row in result["inspected"]}
+        rows = {row["path"].rsplit("/", 1)[-1]: row for row in result["inspected"]}
         assert rows["a"]["geometry"] == "see top-level geometry"
         # Every other inspected node keeps its own figures.
         assert rows["bb"]["geometry"] == {"points": 2, "of": "bb"}
@@ -756,7 +756,7 @@ class TestNodeCardStartOffset:
         folder.tags.side_effect = RuntimeError("no tags")
         assert graph._multiparm_start(folder) == 1
 
-    def test_the_card_carries_start_offset(self, add_net, monkeypatch):
+    def test_the_card_carries_first_index(self, add_net, monkeypatch):
         net = add_net("0")
         monkeypatch.setattr(
             graph.hou, "nodeTypeCategories", lambda: {"Sop": net.category}, raising=False
@@ -775,7 +775,7 @@ class TestNodeCardStartOffset:
                 "count_parm": "points",
                 "label": "points",
                 "folder_type": "MultiparmBlock",
-                "start_offset": 0,
                 "instance_parms": ["usept#", "weight#"],
+                "first_index": 0,
             }
         ]

@@ -114,7 +114,9 @@ async def set_parameters(
 
     Args:
         node_path: Node path.
-        params: Mapping of parameter names to values.
+        params: Mapping of parameter names to values. A value written
+            {"expr": "...", "language": "hscript" | "python"} is set as an
+            expression, as in build_network.
         override_expression: Remove expressions standing in the way.
         expression_policy: Alias of override_expression: "replace" is
             override_expression=True, "preserve" is the default report-only
@@ -219,7 +221,8 @@ async def get_parm_template_tree(
     type_name: str | None = None,
     context: str = "Sop",
     folder: str | list[str] | None = None,
-    max_entries: int = 400,
+    max_entries: int = 150,
+    include_tags: bool = False,
 ) -> dict:
     """The whole parameter interface as a tree, the way Type Properties shows
     it: folders (with folder_type — tabs, collapsible, multiparm), every
@@ -239,9 +242,15 @@ async def get_parm_template_tree(
         context: Category of type_name — "Sop", "Object", "Lop", ...
         folder: Narrow to one folder by label, or a list of nested labels.
         max_entries: Cap on entries (depth-first); the reply says when it cut.
+        include_tags: Also return each template's tags (needed to preserve
+            them when editing an interface; about a quarter of the size).
     """
     bridge = _get_bridge(ctx)
-    payload: dict[str, Any] = {"context": context, "max_entries": max_entries}
+    payload: dict[str, Any] = {
+        "context": context,
+        "max_entries": max_entries,
+        "include_tags": include_tags,
+    }
     if node_path is not None:
         payload["node_path"] = node_path
     if type_name is not None:

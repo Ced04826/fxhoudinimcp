@@ -258,12 +258,13 @@ def _prim_to_dict(
     summarised unless *full* is set, and `children` lists the prims under
     an instanceable prim's prototype when *instance_proxies* is set.
     """
-    info: dict[str, Any] = {
-        "path": str(prim.GetPath()),
-        "type": str(prim.GetTypeName()),
-        "is_active": prim.IsActive(),
-        "has_payload": prim.HasPayload(),
-    }
+    # is_active / has_payload only when they are not the default: true and
+    # false on nearly every row of a listing, about a third of each row.
+    info: dict[str, Any] = {"path": str(prim.GetPath()), "type": str(prim.GetTypeName())}
+    if not prim.IsActive():
+        info["is_active"] = False
+    if prim.HasPayload():
+        info["has_payload"] = True
     # An empty `children` on an instanceable prim is not an empty prim: its
     # contents live on the prototype, and only an instance-proxy walk sees
     # them. Say so, with a count, instead of letting [] read as "nothing".
@@ -481,6 +482,7 @@ def _list_usd_prims(
         raise hou.OperationFailed(f"Root prim not found at '{root_path}' on stage from {node_path}")
 
     results: list[dict[str, Any]] = []
+    truncated = False
     root_sdf_path = root.GetPath()
     root_depth = root_sdf_path.pathElementCount
 
@@ -489,7 +491,8 @@ def _list_usd_prims(
     # "/materials/BLD_probes" too; Sdf.Path.HasPrefix compares path
     # elements, and Usd.PrimRange(root) never leaves the subtree at all.
     proxies = bool(traverse_instance_proxies)
-    prims = _traverse(stage, None if root_path == "/" else root, proxies)
+    prims = iter(_traverse(stage, None if root_path == "/" else root, proxies))
+    prune = getattr(prims, "PruneChildren", None)  # a Usd.PrimRange iterator has it
 
     for prim in prims:
         prim_path = prim.GetPath()
@@ -498,9 +501,15 @@ def _list_usd_prims(
         if root_path != "/" and not prim_path.HasPrefix(root_sdf_path):
             continue
 
-        # Depth filter, counted in path elements below root
-        if depth is not None and prim_path.pathElementCount - root_depth > depth:
-            continue
+        # Depth filter, counted in path elements below root. The walk stops
+        # descending at the limit instead of visiting and discarding the whole
+        # stage below it.
+        if depth is not None:
+            below = prim_path.pathElementCount - root_depth
+            if below >= depth and prune is not None:
+                prune()
+            if below > depth:
+                continue
 
         # Type filter
         if prim_type is not None and str(prim.GetTypeName()) != prim_type:
@@ -513,11 +522,11 @@ def _list_usd_prims(
             if prim_kind != kind:
                 continue
 
-        results.append(_prim_to_dict(prim))
-
-        # Safety cap
-        if len(results) >= 5000:
+        # Capped lower than the old 5000 (about 450 KB), and said when it cuts.
+        if len(results) >= _PRIM_LIST_CAP:
+            truncated = True
             break
+        results.append(_prim_to_dict(prim))
 
     return {
         "node_path": node_path,
@@ -529,8 +538,12 @@ def _list_usd_prims(
         },
         "instance_proxies_included": proxies,
         "count": len(results),
+        "truncated": truncated,
         "prims": results,
     }
+
+
+_PRIM_LIST_CAP = 1000
 
 
 register_handler("lops.list_usd_prims", _list_usd_prims)
@@ -799,11 +812,15 @@ def _create_lop_node(
 
     node = parent.createNode(lop_type, node_name=name)
 
-    # Set prim_path parameter if the node type has one
+    # Set prim_path parameter if the node type has one. The reply used to echo
+    # prim_path back even for types with neither parm (assignmaterial,
+    # materiallibrary), as if it had been applied.
+    prim_path_applied = None
     if prim_path is not None:
         parm = node.parm("primpath")
         if parm is None:
             parm = node.parm("primpattern")
+        prim_path_applied = parm is not None
         if parm is not None:
             parm.set(prim_path)
 
@@ -815,6 +832,14 @@ def _create_lop_node(
         "type": node.type().name(),
         "name": node.name(),
         "prim_path": prim_path,
+        **(
+            {}
+            if prim_path_applied is not False
+            else {
+                "prim_path_applied": False,
+                "warning": f"{node.type().name()} has no primpath or primpattern parm; prim_path was not set.",
+            }
+        ),
     }
 
 
@@ -822,6 +847,70 @@ register_handler("lops.create_lop_node", _create_lop_node)
 
 
 ###### lops.set_usd_attribute
+
+
+def _edit_attributes_after(node: hou.Node, node_name: str, prim_path: str, values: dict) -> dict:
+    """Set USD attributes with a Python LOP spliced in after *node*.
+
+    The LOP used to hang off *node* with nothing reading it: the downstream
+    wiring and the display flag stayed on *node*, so the viewport and every ROP
+    kept the old stage while the call said success. A missing prim or
+    attribute, or a Set() that returns False, only skipped a line.
+
+    Returns python_node, errors (from the cook) and the values read back.
+    """
+    lines = [
+        "node = hou.pwd()",
+        "stage = node.editableStage()",
+        f"prim = stage.GetPrimAtPath({prim_path!r})",
+        "if not prim or not prim.IsValid():",
+        f"    raise RuntimeError('Prim not found: ' + {prim_path!r})",
+    ]
+    for attr_name, value in values.items():
+        lines += [
+            f"attr = prim.GetAttribute({attr_name!r})",
+            "if not attr or not attr.IsValid():",
+            f"    raise RuntimeError('No attribute ' + {attr_name!r} + ' on ' + {prim_path!r})",
+            f"if not attr.Set({value!r}):",
+            f"    raise RuntimeError('USD refused the value for ' + {attr_name!r})",
+        ]
+    python_node = node.parent().createNode("pythonscript", node_name=node_name)
+    python_node.parm("python").set("\n".join(lines))
+    # Splice: whatever read node now reads the edit, and so does the viewer.
+    readers = [(c.outputNode(), c.inputIndex()) for c in node.outputConnections()]
+    for reader, index in readers:
+        reader.setInput(index, python_node)
+    python_node.setInput(0, node)
+    moved_flags = []
+    for flag, setter in (
+        ("isDisplayFlagSet", "setDisplayFlag"),
+        ("isRenderFlagSet", "setRenderFlag"),
+    ):
+        with contextlib.suppress(Exception):
+            if getattr(node, flag)():
+                getattr(python_node, setter)(True)
+                moved_flags.append(setter)
+    place_new_node(python_node)
+    with contextlib.suppress(hou.OperationFailed):
+        python_node.cook(force=True)
+    errors = [e.strip() for e in python_node.errors()]
+    if errors:
+        # A failed edit left spliced in would break every node downstream of
+        # it: put the wiring and the flags back and remove it.
+        for reader, index in readers:
+            reader.setInput(index, node)
+        for setter in moved_flags:
+            with contextlib.suppress(Exception):
+                getattr(node, setter)(True)
+        python_node.destroy()
+        return {"python_node": None, "errors": errors, "read_back": {}}
+    _focus_network_editor(python_node)
+    read_back: dict = {}
+    with contextlib.suppress(Exception):
+        prim = python_node.stage().GetPrimAtPath(prim_path)
+        for attr_name in values:
+            read_back[attr_name] = _usd_value_to_python(prim.GetAttribute(attr_name).Get())
+    return {"python_node": python_node.path(), "errors": errors, "read_back": read_back}
 
 
 def _set_usd_attribute(
@@ -841,44 +930,20 @@ def _set_usd_attribute(
     if node is None:
         raise hou.OperationFailed(f"Node not found: {node_path}")
 
-    parent = node.parent()
-
-    # Create a Python LOP to set the attribute ("pythonscript" is the
-    # LOP type name; "python" does not exist in the Lop category)
-    python_node = parent.createNode("pythonscript", node_name="set_usd_attr_auto")
-    python_node.setInput(0, node)
-
-    # Build the Python snippet
-    val_repr = repr(value)
-    snippet = f"""
-import hou
-node = hou.pwd()
-stage = node.editableStage()
-prim = stage.GetPrimAtPath("{prim_path}")
-if prim.IsValid():
-    attr = prim.GetAttribute("{attr_name}")
-    if attr.IsValid():
-        attr.Set({val_repr})
-    else:
-        raise RuntimeError("Attribute '{attr_name}' not found on prim '{prim_path}'")
-else:
-    raise RuntimeError("Prim not found: {prim_path}")
-"""
-    python_node.parm("python").set(snippet.strip())
-    place_new_node(python_node)
-    _focus_network_editor(python_node)
-
-    # Cook to apply
-    python_node.cook(force=True)
-
-    return {
+    edit = _edit_attributes_after(node, "set_usd_attr_auto", prim_path, {attr_name: value})
+    result = {
         "node_path": node_path,
-        "python_node": python_node.path(),
+        "python_node": edit["python_node"],
         "prim_path": prim_path,
         "attr_name": attr_name,
-        "value": _usd_value_to_python(value) if HAS_PXR else value,
-        "success": True,
+        "success": not edit["errors"],
     }
+    if edit["errors"]:
+        result["errors"] = edit["errors"]
+        result["rolled_back"] = True
+    else:
+        result["value"] = edit["read_back"].get(attr_name)
+    return result
 
 
 register_handler("lops.set_usd_attribute", _set_usd_attribute)
@@ -903,9 +968,22 @@ def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
 
     materials: list[dict[str, Any]] = []
     bindings_map: dict[str, list[str]] = {}
+    # Direct bindings are matched against the materials after the walk, since
+    # a binding can precede its material in traversal order.
+    direct: list[tuple[str, str]] = []
+    gprims = []
 
-    # Find all materials
+    # One walk collects materials, direct bindings and gprims.
     for prim in stage.Traverse():
+        with contextlib.suppress(Exception):
+            bound = UsdShade.MaterialBindingAPI(prim).GetDirectBinding()
+            bound_path = str(bound.GetMaterialPath())
+            if bound_path:
+                direct.append((bound_path, str(prim.GetPath())))
+        with contextlib.suppress(Exception):
+            if prim.IsA(UsdGeom.Gprim):
+                gprims.append(prim)
+                continue
         if prim.IsA(UsdShade.Material):
             mat_path = str(prim.GetPath())
             mat = UsdShade.Material(prim)
@@ -941,20 +1019,9 @@ def _get_usd_materials(*, node_path: str) -> dict[str, Any]:
             materials.append(mat_info)
             bindings_map[mat_path] = []
 
-    # Find bindings
-    gprims = []
-    for prim in stage.Traverse():
-        binding = UsdShade.MaterialBindingAPI(prim)
-        try:
-            bound = binding.GetDirectBinding()
-            mat_path = str(bound.GetMaterialPath())
-            if mat_path and mat_path in bindings_map:
-                bindings_map[mat_path].append(str(prim.GetPath()))
-        except Exception:
-            pass
-        with contextlib.suppress(Exception):
-            if prim.IsA(UsdGeom.Gprim):
-                gprims.append(prim)
+    for mat_path, prim_path in direct:
+        if mat_path in bindings_map:
+            bindings_map[mat_path].append(prim_path)
 
     # What each material is rendered on. bound_to only names the prims a
     # binding is authored on, so geometry bound through a parent or a
@@ -1078,8 +1145,17 @@ def _get_usd_bound_material(
                     # Bound, to a material prim that is not on the stage.
                     row["missing_material"] = _binding_targets(rel)
             with contextlib.suppress(Exception):
-                direct = UsdShade.MaterialBindingAPI(prim).GetDirectBinding(token)
-                row["direct_binding"] = str(direct.GetMaterialPath()) or None
+                # Purpose-specific first, then all-purpose, the renderer's own
+                # fallback. assignmaterial authors the all-purpose relationship,
+                # so asking only for "full" answered null for a prim whose
+                # source said kind: direct.
+                api = UsdShade.MaterialBindingAPI(prim)
+                row["direct_binding"] = None
+                for which in dict.fromkeys((token, UsdShade.Tokens.allPurpose)):
+                    path = str(api.GetDirectBinding(which).GetMaterialPath())
+                    if path:
+                        row["direct_binding"] = path
+                        break
 
     return {
         "node_path": node_path,
@@ -1115,18 +1191,21 @@ def _find_usd_prims(
 
     proxies = bool(traverse_instance_proxies)
     results: list[dict[str, Any]] = []
+    truncated = False
     for prim in _traverse(stage, None, proxies):
         prim_path = str(prim.GetPath())
         if fnmatch.fnmatch(prim_path, pattern) or pattern in prim_path:
-            results.append(_prim_to_dict(prim))
-            if len(results) >= 5000:
+            if len(results) >= _PRIM_LIST_CAP:
+                truncated = True
                 break
+            results.append(_prim_to_dict(prim))
 
     return {
         "node_path": node_path,
         "pattern": pattern,
         "instance_proxies_included": proxies,
         "count": len(results),
+        "truncated": truncated,
         "prims": results,
     }
 
@@ -1509,8 +1588,6 @@ def _set_light_properties(
     if node is None:
         raise hou.OperationFailed(f"Node not found: {node_path}")
 
-    parent = node.parent()
-
     # Map friendly property names to USD attribute names
     attr_name_map = {
         "intensity": "inputs:intensity",
@@ -1523,48 +1600,27 @@ def _set_light_properties(
         "enable_temperature": "inputs:enableColorTemperature",
     }
 
-    # Build Python snippet to set attributes
-    set_lines: list[str] = []
-    updated_properties: list[str] = []
-
-    for prop_name, prop_value in properties.items():
-        usd_attr = attr_name_map.get(prop_name, prop_name)
-        val_repr = repr(prop_value)
-        set_lines.append(
-            f'    attr = prim.GetAttribute("{usd_attr}")\n'
-            f"    if attr and attr.IsValid():\n"
-            f"        attr.Set({val_repr})"
-        )
-        updated_properties.append(prop_name)
-
-    if not set_lines:
-        return {
-            "prim_path": prim_path,
-            "updated_properties": [],
-            "note": "No properties to set",
-        }
-
-    snippet = (
-        "import hou\n"
-        "node = hou.pwd()\n"
-        "stage = node.editableStage()\n"
-        f'prim = stage.GetPrimAtPath("{prim_path}")\n'
-        "if prim.IsValid():\n" + "\n".join(set_lines)
+    if not properties:
+        return {"prim_path": prim_path, "updated_properties": [], "note": "No properties to set"}
+    usd_names = {name: attr_name_map.get(name, name) for name in properties}
+    edit = _edit_attributes_after(
+        node,
+        "set_light_props_auto",
+        prim_path,
+        {usd_names[name]: value for name, value in properties.items()},
     )
-
-    # "pythonscript" is the LOP type name; "python" does not exist here.
-    python_node = parent.createNode("pythonscript", node_name="set_light_props_auto")
-    python_node.setInput(0, node)
-    python_node.parm("python").set(snippet)
-    place_new_node(python_node)
-    _focus_network_editor(python_node)
-    python_node.cook(force=True)
-
-    return {
+    result = {
         "prim_path": prim_path,
-        "python_node": python_node.path(),
-        "updated_properties": updated_properties,
+        "python_node": edit["python_node"],
+        "success": not edit["errors"],
+        "updated_properties": [] if edit["errors"] else list(properties),
     }
+    if edit["errors"]:
+        result["errors"] = edit["errors"]
+        result["rolled_back"] = True
+    else:
+        result["values"] = {name: edit["read_back"].get(usd_names[name]) for name in properties}
+    return result
 
 
 register_handler("lops.set_light_properties", _set_light_properties)

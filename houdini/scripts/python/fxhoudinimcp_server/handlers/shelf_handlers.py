@@ -310,17 +310,32 @@ def run_shelf_tool(
         call_kwargs.update(kwargs)
 
     before = {child.path() for node in watched for child in node.children()}
-    namespace: dict[str, Any] = {"kwargs": call_kwargs, "hou": hou}
+    # A tool that asks for a click is retried once as a Ctrl+click, Houdini's
+    # "place immediately": the Crowds Simulate tool then builds its whole
+    # default setup (agents, source, DOP states) instead of asking for an
+    # object. Only when the caller chose no modifier themselves.
+    modifiers = ("ctrlclick", "cmdclick", "shiftclick", "altclick")
+    retry_as_ctrl_click = not any((kwargs or {}).get(key) for key in modifiers)
+    ran_as_ctrl_click = False
+    refused: InteractivePrompt | None = None
     try:
-        with _no_prompts(tool_name):
-            exec(script, namespace)  # noqa: S102 - running SideFX's own tool script
-    except InteractivePrompt as exc:
-        # Whatever the tool created before asking is half a setup; remove it.
-        made = {child.path() for n in watched for child in n.children()} - before
-        for path in made:
-            with contextlib.suppress(Exception):
-                hou.node(path).destroy()
-        raise _refusal(tool_name, f"{exc}()") from exc
+        while True:
+            namespace: dict[str, Any] = {"kwargs": call_kwargs, "hou": hou}
+            try:
+                with _no_prompts(tool_name):
+                    exec(script, namespace)  # noqa: S102 - running SideFX's own tool script
+                break
+            except InteractivePrompt as exc:
+                # Whatever the tool created before asking is half a setup; remove it.
+                made = {child.path() for n in watched for child in n.children()} - before
+                for path in made:
+                    with contextlib.suppress(Exception):
+                        hou.node(path).destroy()
+                if not retry_as_ctrl_click or ran_as_ctrl_click:
+                    refused = exc
+                    break
+                call_kwargs = {**call_kwargs, "ctrlclick": True}
+                ran_as_ctrl_click = True
     except AttributeError as exc:
         if "'hou' has no attribute 'ui'" in str(exc):
             raise hou.OperationFailed(
@@ -335,6 +350,9 @@ def run_shelf_tool(
             f"Shelf tool '{tool_name}' failed: {type(exc).__name__}: {str(exc)[:200]}"
         ) from exc
 
+    if refused is not None:
+        raise _refusal(tool_name, f"{refused}()") from refused
+
     after = {child.path(): child for node in watched for child in node.children()}
     created = sorted(set(after) - before)
     return {
@@ -347,6 +365,15 @@ def run_shelf_tool(
         "created_count": len(created),
         "truncated": len(created) > _LIST_CAP,
         "kwargs_used": sorted(call_kwargs),
+        **(
+            {
+                "ran_as_ctrl_click": True,
+                "note": "The tool asked for a selection, so it ran as a Ctrl+click "
+                "(place immediately) and built its default setup.",
+            }
+            if ran_as_ctrl_click
+            else {}
+        ),
     }
 
 

@@ -72,3 +72,47 @@ print(
 
 if _failed:
     print(f"[fxhoudinimcp] Failed modules: {', '.join(_failed)}")
+
+
+###### code.reload_plugin
+
+# Shared helpers first, then the handler modules others import names from,
+# then the rest: a module that did `from x import f` keeps the old f unless
+# x was reloaded before it. The dispatcher is never reloaded, since it holds
+# the registry the reloaded modules register into.
+_HELPER_MODULES = ["errors", "serialize", "config", "ui", "outputs"]
+_IMPORTED_FROM = ["node_handlers", "parameter_handlers", "viewport_handlers"]
+
+
+def reload_plugin(**_):
+    """Re-import the plugin's Houdini-side code without restarting Houdini."""
+    import sys
+
+    reloaded, failed = [], {}
+    order = [f"fxhoudinimcp_server.{name}" for name in _HELPER_MODULES]
+    order += [f"{__package__}.{name}" for name in _IMPORTED_FROM]
+    order += [f"{__package__}.{n}" for n in _HANDLER_MODULES if n not in _IMPORTED_FROM]
+    for name in order:
+        module = sys.modules.get(name)
+        if module is None:
+            continue
+        try:
+            importlib.reload(module)
+            reloaded.append(name.rsplit(".", 1)[-1])
+        except Exception as exc:
+            failed[name.rsplit(".", 1)[-1]] = f"{type(exc).__name__}: {exc}"
+    return {
+        "success": not failed,
+        "reloaded": reloaded,
+        "failed": failed,
+        "commands_registered": len(list_commands()),
+        "note": (
+            "Houdini-side code only. The MCP server's own tool definitions load "
+            "when its process starts: reconnect the client (/mcp) for those."
+        ),
+    }
+
+
+from fxhoudinimcp_server.dispatcher import register_handler  # noqa: E402
+
+register_handler("code.reload_plugin", reload_plugin)

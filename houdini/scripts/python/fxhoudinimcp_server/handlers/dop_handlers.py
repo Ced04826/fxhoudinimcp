@@ -348,21 +348,24 @@ def _step_simulation(node_path: str, steps: int = 1) -> dict:
 
 def _reset_simulation(node_path: str) -> dict:
     """Reset the simulation to its initial state."""
-    _get_dop_node(node_path)
-    sim = _get_simulation(node_path)
+    node = _get_dop_node(node_path)
+    # hou.DopSimulation has no clear(): the AttributeError went to a debug log
+    # and this reported simulation_reset after only moving the frame. The
+    # reset is the network's own Reset Simulation button ("resimulate", also
+    # the name on the SOP-level solvers).
+    owner = node
+    while owner is not None and owner.parm("resimulate") is None:
+        owner = owner.parent()
+    if owner is None:
+        raise ValueError(f"No Reset Simulation button on {node_path} or any of its parents.")
+    owner.parm("resimulate").pressButton()
 
-    # Attempt to clear the simulation cache
-    try:
-        sim.clear()
-    except (hou.OperationFailed, AttributeError) as e:
-        logger.debug("Could not clear simulation cache: %s", e)
-
-    # Also reset the frame to the start of the global frame range
     start_frame, _ = hou.playbar.frameRange()
     hou.setFrame(start_frame)
 
     return {
         "node_path": node_path,
+        "reset_node": owner.path(),
         "reset_to_frame": start_frame,
         "status": "simulation_reset",
     }

@@ -171,7 +171,7 @@ async def get_top_scheduler_info(ctx: Context, node_path: str) -> dict:
 
 
 @mcp.tool()
-async def get_failed_work_items(ctx: Context, node_path: str, limit: int = 50) -> dict:
+async def get_failed_work_items(ctx: Context, node_path: str, limit: int = 10) -> dict:
     """List the work items that failed on a TOP node, with the tail of each log.
 
     Args:

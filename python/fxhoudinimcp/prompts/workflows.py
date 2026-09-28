@@ -12,8 +12,11 @@ convention and are deliberately unchanged, because clients call them.
 
 from __future__ import annotations
 
+# Built-in
+import string
+
 # Internal
-from fxhoudinimcp._loader import _MD_DIR, load_markdown, markdown_exists
+from fxhoudinimcp._loader import _MD_DIR, _read, load_markdown, markdown_exists
 from fxhoudinimcp.server import mcp
 
 # What the user calls a sim versus the corpus that documents it. SideFX files
@@ -185,6 +188,10 @@ def heightfield_terrain(
     )
 
 
+# The named prompts' defaults for placeholders that are not a description.
+_PLACEHOLDER_DEFAULTS = {"output_context": "/obj", "context": "Sop"}
+
+
 def workflow_guide_text(topic: str, description: str = "") -> str:
     """The guide for `topic`, shared by the prompt and the tool.
 
@@ -207,12 +214,18 @@ def workflow_guide_text(topic: str, description: str = "") -> str:
             f"No workflow guide for '{topic}'. Available topics: {available}. "
             "search_help(query) covers subjects with no guide."
         )
-    return load_markdown(
-        candidate,
-        topic=topic,
-        sim_type=topic,
-        description=description or f"Work on {topic}",
-    )
+    # Every placeholder the file has gets a value. The named prompts spell theirs
+    # (scene_description, task_description, ...), and passing only
+    # `description` made get_workflow_guide raise KeyError for solaris, tops,
+    # assets, model and troubleshooting: five guides the tool could not serve.
+    framed = description or f"Work on {topic}"
+    values = {
+        name: _PLACEHOLDER_DEFAULTS.get(name, framed)
+        for _, name, _, _ in string.Formatter().parse(_read(candidate))
+        if name and name not in ("layout_guidance", "network_housekeeping")
+    }
+    values.update(topic=topic, sim_type=topic)
+    return load_markdown(candidate, **values)
 
 
 @mcp.prompt()

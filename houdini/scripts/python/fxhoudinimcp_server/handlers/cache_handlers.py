@@ -53,15 +53,11 @@ def _get_node(node_path: str) -> hou.Node:
 
 
 def _is_cache_node(node: hou.Node) -> bool:
-    """Check if a node is a cache-type node (filecache or rop_geometry)."""
-    type_name = node.type().name()
-    return type_name in (
-        "filecache",
-        "filecache::2.0",
-        "rop_geometry",
-        "rop_alembic",
-        "file",
-    )
+    """Check if a node is a cache-type node (filecache, the sim I/O nodes, ROPs)."""
+    # Versions stripped: rbdio and vellumio are ::2.0 in 22.0, and the RBD and
+    # Vellum setups cache with them rather than a filecache.
+    base = node.type().name().split("::")[0]
+    return base in ("filecache", "rbdio", "vellumio", "rop_geometry", "rop_alembic", "file")
 
 
 # The write path first. On File Cache 2.0 `sopoutput` is where frames go and
@@ -158,7 +154,9 @@ def _list_caches(*, root_path: str = "/", **_: Any) -> dict[str, Any]:
         root_path: Root path to search from (default: "/").
     """
     root = _get_node(root_path)
-    all_nodes = root.allSubChildren()
+    # Not inside locked assets: a File Cache's own render ROP and file SOP
+    # matched too, listing one cache two or three times with a disk scan each.
+    all_nodes = root.allSubChildren(recurse_in_locked_nodes=False)
 
     caches: list[dict[str, Any]] = []
     for node in all_nodes:
@@ -347,19 +345,24 @@ def _clear_cache(
 
     deleted_count = 0
     freed_bytes = 0
+    failed: list[str] = []
+    no_frame: list[str] = []
 
     for filepath in existing_files:
         should_delete = True
 
-        # If frame_range is specified, only delete matching frames
+        # If frame_range is specified, only delete matching frames. The last
+        # digit run before the extension is the frame, so name_0001.bgeo.sc
+        # counts as well as name.0001.bgeo.sc.
         if frame_range is not None and len(frame_range) >= 2:
-            match = re.search(r"\.(\d+)\.", os.path.basename(filepath))
-            if match:
-                frame_num = int(match.group(1))
+            runs = re.findall(r"(\d+)(?=\.)", os.path.basename(filepath))
+            if runs:
+                frame_num = int(runs[-1])
                 if frame_num < frame_range[0] or frame_num > frame_range[1]:
                     should_delete = False
             else:
                 should_delete = False
+                no_frame.append(filepath)
 
         if should_delete:
             try:
@@ -367,16 +370,24 @@ def _clear_cache(
                 os.remove(filepath)
                 deleted_count += 1
                 freed_bytes += file_size
-            except OSError:
-                pass
+            except OSError as exc:
+                # A file locked by Houdini or OneDrive used to vanish from the
+                # count with nothing said.
+                failed.append(f"{filepath}: {exc.strerror or exc}")
 
     freed_mb = round(freed_bytes / (1024 * 1024), 2)
 
-    return {
+    result = {
         "node_path": node_path,
+        "success": not failed,
         "deleted_count": deleted_count,
         "freed_mb": freed_mb,
     }
+    if failed:
+        result["failed"] = failed[:20]
+    if no_frame:
+        result["skipped_no_frame_number"] = no_frame[:20]
+    return result
 
 
 register_handler("cache.clear_cache", _clear_cache)

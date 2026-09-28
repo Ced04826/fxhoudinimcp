@@ -18,15 +18,20 @@ from fxhoudinimcp.server import _get_bridge, mcp
 async def list_installed_hdas(
     ctx: Context,
     filter: str | None = None,
+    limit: int = 100,
 ) -> dict:
-    """List all installed HDA files and their definitions.
+    """List installed HDA definitions, grouped by library file.
+
+    A stock install loads thousands; pass a filter (namespace, name or path
+    fragment). `truncated` says when `limit` cut the list.
 
     Args:
         ctx: MCP context.
         filter: Substring filter for type names or file paths.
+        limit: Maximum definitions returned.
     """
     bridge = _get_bridge(ctx)
-    params: dict = {}
+    params: dict = {"limit": limit}
     if filter is not None:
         params["filter"] = filter
     return await bridge.execute("hda.list_installed_hdas", params)

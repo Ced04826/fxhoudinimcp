@@ -56,7 +56,14 @@ def _has_errors(node: hou.Node) -> bool:
 
 
 def _non_default_parms(node: hou.Node) -> dict[str, Any]:
-    """Return a dict of parameter names to values for non-default parameters."""
+    """Return a dict of parameter names to values for non-default parameters.
+
+    Each component is compared with its own default: comparing ty with the
+    tuple default (0, 0, 0) reported 30 of 49 parms as changed on a fresh
+    xform, in explain_node and compare_snapshots alike.
+    """
+    from fxhoudinimcp_server.handlers.node_handlers import _component_default, _is_at_default
+
     result: dict[str, Any] = {}
     for parm in node.parms():
         try:
@@ -64,16 +71,10 @@ def _non_default_parms(node: hou.Node) -> dict[str, Any]:
         except Exception:
             continue
         try:
-            tmpl = parm.parmTemplate()
-            defaults = tmpl.defaultValue()
-            if isinstance(defaults, tuple):
-                default = defaults[0] if len(defaults) == 1 else defaults
-            else:
-                default = defaults
+            default = _component_default(parm)
         except Exception:
             default = None
-        # Compare current value to default
-        if val != default:
+        if not _is_at_default(parm, val, default):
             if isinstance(val, (hou.Vector2, hou.Vector3, hou.Vector4)):
                 val = list(val)
             result[parm.name()] = val

@@ -24,7 +24,12 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.config import layout_if_enabled, place_new_nodes, update_mode_warning
+from fxhoudinimcp_server.config import (
+    layout_if_enabled,
+    place_new_node,
+    place_new_nodes,
+    update_mode_warning,
+)
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
 from fxhoudinimcp_server.handlers.node_handlers import (
@@ -32,6 +37,11 @@ from fxhoudinimcp_server.handlers.node_handlers import (
     _indirect_input_item,
     _input_table,
     _resolve_input_index,
+)
+from fxhoudinimcp_server.handlers.parameter_handlers import (
+    broken_references,
+    suggest_parms,
+    template_labels,
 )
 from fxhoudinimcp_server.handlers.state_receipt_helpers import (
     check_parm_value,
@@ -296,6 +306,48 @@ def _probe_connectors(scratch: hou.Node, node_type, parms: dict | None = None) -
                 probe.destroy()
 
 
+def _instance_menu_errors(scratch: hou.Node, node_type, parms: dict, patterns: list) -> list[str]:
+    """Menu errors on multiparm instance parms (a wedge's type1), found by probing.
+
+    A fresh probe has no instances, so these menus went unchecked: a dry run
+    passed "type1": "int" and the build then rolled back on "Invalid menu
+    item". The probe gets the spec's other parms first, which creates the
+    instances, then each instance value is checked against its real menu.
+    """
+    wanted = {
+        name: value
+        for name, value in parms.items()
+        if _is_instance_parm(name, patterns)
+        and isinstance(value, (str, int))
+        and not isinstance(value, bool)
+    }
+    if node_type is None or not wanted:
+        return []
+    problems = []
+    with hou.undos.disabler():
+        probe = scratch.createNode(node_type.name())
+        try:
+            for name, value in parms.items():
+                if name not in wanted and _expression_value(value) is None:
+                    with contextlib.suppress(Exception):
+                        _apply_parm(probe, name, value)
+            for name, value in wanted.items():
+                parm = probe.parm(name)
+                if parm is None or not _is_strict_menu(parm.parmTemplate()):
+                    continue
+                with contextlib.suppress(Exception):
+                    items = list(parm.menuItems())
+                    if problem := _menu_error(name, value, items):
+                        # These tokens are often bare numbers ('0'..'5'); the
+                        # labels are what says which one means "Integer".
+                        labels = dict(zip(items, parm.menuLabels(), strict=False))
+                        problems.append(f"{problem} Labels: {labels}")
+        finally:
+            with contextlib.suppress(Exception):
+                probe.destroy()
+    return problems
+
+
 # OBJ-level container to probe each category's types in, where more than one
 # exists (geo and sopnet both hold SOPs). Any other category is found through
 # hou.NodeType.childTypeCategory(), so Cop2, Shop, VopNet and whatever SideFX
@@ -460,10 +512,12 @@ class _TypeKnowledge(tuple):
         connectors,
         shapes,
         expressions=None,
+        scene_menus=False,
     ):
         self = super().__new__(cls, (parm_names, tuple_names, menus, instance_patterns, connectors))
         self.shapes = shapes
         self.expressions = expressions if expressions is not None else {}
+        self.scene_menus = scene_menus
         return self
 
 
@@ -491,7 +545,12 @@ def _parm_names_for_type(scratch: hou.Node, node_type) -> _TypeKnowledge:
     `.expressions` maps each parm and parm tuple name whose components ship
     with an expression to {component: expression}, so a dry run can name the
     literals that will not take.
+
+    `.scene_menus` is True when a strict menu's items come from a script:
+    those can follow the scene (the filecache `take` menu lists its takes), so
+    _type_knowledge does not cache such a type.
     """
+    scene_menus = False
     probe = scratch.createNode(node_type.name())
     try:
         connectors = _connectors_of(probe)
@@ -518,6 +577,7 @@ def _parm_names_for_type(scratch: hou.Node, node_type) -> _TypeKnowledge:
                 items = list(parm.menuItems())
                 if items and _is_strict_menu(template):
                     menus[parm.name()] = items
+                    scene_menus = scene_menus or bool(template.itemGeneratorScript())
         shapes: dict[str, dict] = {}
         for parm_tuple in probe.parmTuples():
             with contextlib.suppress(Exception):
@@ -542,15 +602,17 @@ def _parm_names_for_type(scratch: hou.Node, node_type) -> _TypeKnowledge:
     patterns: list[re.Pattern] = []
     with contextlib.suppress(Exception):
         patterns = _instance_patterns(node_type)
-    return _TypeKnowledge(parm_names, tuple_names, menus, patterns, connectors, shapes, expressions)
+    return _TypeKnowledge(
+        parm_names, tuple_names, menus, patterns, connectors, shapes, expressions, scene_menus
+    )
 
 
 # Learning a type's parameters means instantiating it, and instantiating it in
 # the user's network runs its creation scripts and disturbs flags and
 # selection. Doing that once per type per session instead of once per call is
-# the difference between a quiet validation and one that churns the scene.
-# Keyed on the type's definition timestamp as well, so re-saving an HDA does
-# not leave a stale answer behind.
+# the difference between a quiet validation and one that churns the scene
+# (probing was 90% of a dry run's time). Keyed on the type's definition
+# timestamp as well, so re-saving an HDA does not leave a stale answer behind.
 _TYPE_KNOWLEDGE: dict[tuple, _TypeKnowledge] = {}
 
 
@@ -563,9 +625,17 @@ def _type_cache_key(category: hou.NodeTypeCategory, node_type) -> tuple:
     return (category.name(), node_type.name(), stamp)
 
 
-def _type_knowledge(scratch: hou.Node, node_type) -> _TypeKnowledge:
-    """What one probe of *node_type* teaches, for the validation pass."""
-    return _parm_names_for_type(scratch, node_type)
+def _type_knowledge(scratch: hou.Node, node_type, category: hou.NodeTypeCategory) -> _TypeKnowledge:
+    """What one probe of *node_type* teaches, for the validation pass; cached
+    unless a strict menu is script-filled (see _parm_names_for_type)."""
+    key = _type_cache_key(category, node_type)
+    cached = _TYPE_KNOWLEDGE.get(key)
+    if cached is not None:
+        return cached
+    knowledge = _parm_names_for_type(scratch, node_type)
+    if not getattr(knowledge, "scene_menus", False):
+        _TYPE_KNOWLEDGE[key] = knowledge
+    return knowledge
 
 
 def _menu_error(parm_name: str, value: Any, tokens: list[str]) -> str | None:
@@ -637,6 +707,9 @@ _INPUT_KEYS = frozenset({"index", "input_name", "source", "source_output", "indi
 _NUMERIC_TEMPLATES = frozenset({"Int", "Float", "Toggle"})
 
 _EXPRESSION_LANGUAGES = {"hscript": "Hscript", "python": "Python"}
+
+
+_FLAG_KEYS = frozenset({"display", "render", "bypass", "template"})
 
 
 def _unknown_key_error(label: str, kind: str, key: str, known: frozenset) -> str:
@@ -852,29 +925,182 @@ def _bounded_messages(messages: list) -> tuple:
     return shown, len(messages)
 
 
+# Attributes Houdini reads with a fixed number of components. attribrandomize
+# and attribcreate default to 3, so a "pscale" built with them is a vector that
+# copytopoints applies as a non-uniform scale, and nothing warns.
+_ATTRIB_SIZES = {"pscale": 1, "width": 1, "Alpha": 1, "N": 3, "v": 3, "Cd": 3, "up": 3}
+_ATTRIB_SIZES.update(scale=3, orient=4, rot=4)
+
+
+def _misshapen_attribs(node: hou.Node) -> dict[tuple[str, str], int]:
+    """{("point", "pscale"): 3} for standard attributes with the wrong size.
+
+    Reads only geometry that is already cooked: never forces a cook, so an
+    undisplayed heavy branch costs nothing here.
+    """
+    try:
+        if not hasattr(node, "geometry") or node.needsToCook():
+            return {}
+        geo = node.geometry()
+    except Exception:
+        return {}
+    if geo is None:
+        return {}
+    found = {}
+    for kind, attribs in (("point", geo.pointAttribs()), ("prim", geo.primAttribs())):
+        for attrib in attribs:
+            want = _ATTRIB_SIZES.get(attrib.name())
+            if want is not None and attrib.size() != want:
+                found[(kind, attrib.name())] = attrib.size()
+    return found
+
+
+def _attrib_size_warnings(node: hou.Node) -> list[str]:
+    """Misshapen attributes this node introduced, not ones it inherited."""
+    found = _misshapen_attribs(node)
+    if not found:
+        return []
+    with contextlib.suppress(Exception):
+        upstream = node.inputs()[0] if node.inputs() else None
+        if upstream is not None:
+            for key in _misshapen_attribs(upstream):
+                found.pop(key, None)
+    return [
+        f"{kind} attribute '{name}' has {size} components where Houdini's standard "
+        f"is {_ATTRIB_SIZES[name]}; set the creating node's size to match"
+        for (kind, name), size in found.items()
+    ]
+
+
+_MESSAGE_LINES = 12
+
+
+def _condensed(message: str) -> str:
+    """A node message with repeated lines dropped and the rest capped.
+
+    An HDA solver reports each failing inner node once per field it merges:
+    a FLIP solver missing pscale came back as ~40 lines, the one that named
+    the cause buried among copies of "Error cooking SOP: .../FLIP_DATA".
+    """
+    lines = list(dict.fromkeys(line.strip() for line in message.splitlines() if line.strip()))
+    if len(lines) > _MESSAGE_LINES:
+        lines = lines[:_MESSAGE_LINES] + [f"... {len(lines) - _MESSAGE_LINES} more distinct lines"]
+    return "\n".join(lines)
+
+
 def _node_report(node: hou.Node, inputs: bool = False) -> dict[str, Any]:
-    errors, error_count = _bounded_messages(list(node.errors()))
-    warnings, warning_count = _bounded_messages(list(node.warnings()))
-    report: dict[str, Any] = {
-        "name": node.name(),
-        "path": node.path(),
-        "type": node.type().name(),
-        "errors": errors,
-        "warnings": warnings,
-    }
+    """Path and type, plus errors / warnings / bypassed only when there are any.
+
+    A clean node used to carry errors: [], warnings: [] and bypassed: false,
+    which on a 40-node verify was most of the answer. Absent means none.
+    Messages are condensed, then bounded per message and per node with the
+    total kept in error_count / warning_count.
+    """
+    report: dict[str, Any] = {"path": node.path(), "type": node.type().name()}
+    # A dangling channel reference cooks clean in Houdini, so it is reported
+    # as an error here: otherwise a build reads healthy while it is broken.
+    # ponytail: scans every parm of every node; cache per verify if large networks get slow.
+    errors, error_count = _bounded_messages(
+        [_condensed(e) for e in node.errors()]
+        + [e for p in node.parms() for e in broken_references(p)]
+    )
+    warnings, warning_count = _bounded_messages(
+        [_condensed(w) for w in node.warnings()] + _attrib_size_warnings(node)
+    )
+    if errors:
+        report["errors"] = errors
+    if warnings:
+        report["warnings"] = warnings
     if error_count > len(errors):
         report["error_count"] = error_count
     if warning_count > len(warnings):
         report["warning_count"] = warning_count
     with contextlib.suppress(Exception):
-        report["bypassed"] = node.isBypassed()
+        if node.isBypassed():
+            report["bypassed"] = True
     if inputs:
         report["inputs"] = _actual_inputs(node)
     return report
 
 
+# Stages bigger than this are summarised from the first prims only.
+_STAGE_PRIM_CAP = 20000
+
+
+def _stage_summary(node: hou.Node) -> dict[str, Any] | None:
+    """Compact stage evidence for a LOP node: what a render of it would contain.
+
+    A Solaris build used to answer geometry: null, so "is there a camera, are
+    the lights in, does every gprim have a material" took three more calls.
+    """
+    try:
+        from pxr import UsdGeom, UsdShade
+
+        stage = node.stage()
+    except Exception:
+        return None
+    if stage is None:
+        return None
+    counts: dict[str, int] = {}
+    meshes = []
+    for index, prim in enumerate(stage.Traverse()):
+        if index >= _STAGE_PRIM_CAP:
+            counts["(truncated)"] = 1
+            break
+        type_name = str(prim.GetTypeName()) or "(untyped)"
+        counts[type_name] = counts.get(type_name, 0) + 1
+        # Gprim, not Mesh: a Sphere or Cube LOP renders grey without a
+        # material just the same.
+        if prim.IsA(UsdGeom.Gprim):
+            meshes.append(prim)
+    summary: dict[str, Any] = {"prims_by_type": counts}
+    lights = sum(n for t, n in counts.items() if "Light" in t)
+    summary["cameras"] = counts.get("Camera", 0)
+    summary["lights"] = lights
+    if meshes:
+        with contextlib.suppress(Exception):
+            materials, _ = UsdShade.MaterialBindingAPI.ComputeBoundMaterials(
+                meshes, UsdShade.Tokens.full
+            )
+            unbound = [
+                str(m.GetPath()) for m, mat in zip(meshes, materials, strict=False) if not mat
+            ]
+            summary["gprims_without_material"] = len(unbound)
+            if unbound:
+                summary["unbound_examples"] = unbound[:5]
+    return summary
+
+
+_VOLUME_SUMMARY_KEYS = ("name", "resolution", "min_value", "max_value")
+
+
 def _geometry_summary(node: hou.Node) -> dict[str, Any] | None:
-    """Compact cooked-geometry evidence for a SOP node."""
+    """Compact cooked evidence: geometry for a SOP, the stage for a LOP, the
+    image layer for a Copernicus COP (whose geometry() is one quad)."""
+    if hasattr(node, "stage") and not hasattr(node, "geometry"):
+        return _stage_summary(node)
+    is_cop = False
+    with contextlib.suppress(Exception):
+        is_cop = node.type().category().name() == "Cop"
+    if is_cop:
+        with contextlib.suppress(Exception):
+            from fxhoudinimcp_server.handlers.cop_handlers import _layer_summary
+
+            layer = node.layer()
+            if layer is not None:
+                return {"layer": _layer_summary(layer)}
+    if hasattr(node, "tracks") and not hasattr(node, "geometry"):
+        # A CHOP's evidence is its channels: that they exist, under the names
+        # an export will look for, and that they move.
+        with contextlib.suppress(Exception):
+            from fxhoudinimcp_server.handlers.chop_handlers import _track_entry
+
+            tracks = node.tracks()
+            summary = {"channels": [_track_entry(track) for track in tracks[:12]]}
+            if len(tracks) > 12:
+                summary["channels_total"] = len(tracks)
+            return summary
+        return None
     if not hasattr(node, "geometry"):
         return None
     try:
@@ -891,6 +1117,26 @@ def _geometry_summary(node: hou.Node) -> dict[str, Any] | None:
         "bbox_max": list(bbox.maxvec()),
         "point_attribs": [a.name() for a in geo.pointAttribs()][:30],
     }
+    with contextlib.suppress(Exception):
+        from fxhoudinimcp_server.handlers.geometry_handlers import prim_type_counts
+
+        if types := prim_type_counts(geo):
+            summary["prim_types"] = types
+    # A heightfield or a pyro source is volumes: "7 points, attrib P" said
+    # nothing about which layers exist or whether they hold anything.
+    with contextlib.suppress(Exception):
+        from fxhoudinimcp_server.handlers.geometry_handlers import _volume_entry
+
+        volumes = list(geo.primsOfType(hou.primType.Volume)) + list(
+            geo.primsOfType(hou.primType.VDB)
+        )
+        if volumes:
+            summary["volumes"] = [
+                {k: v for k, v in _volume_entry(prim).items() if k in _VOLUME_SUMMARY_KEYS}
+                for prim in volumes[:12]
+            ]
+            if len(volumes) > 12:
+                summary["volumes_total"] = len(volumes)
     warning = update_mode_warning()
     if warning:
         summary["warning"] = warning
@@ -1079,6 +1325,92 @@ def _input_mismatches(nodes: list, built: list, parsed_inputs: list) -> list:
 # of outputs proved is asking the wrong command.
 _INSPECT_CAP = 8
 
+# Tried in this order when a missing parent's container type is inferred from
+# the specs, so a spec of types every context has (null, merge) lands in SOPs.
+_INFERRED_CATEGORIES = ("Sop", "Lop", "Dop", "Cop", "Chop", "Top", "Driver", "Vop")
+
+
+def _missing_parent_container(parent_path: str, nodes: Any) -> str | None:
+    """The type to create a missing *parent_path* as, or None.
+
+    Building from an empty /obj or /tasks is the usual start, and it used to
+    cost a separate create_node before build_network, whose dry run otherwise
+    stopped at "Parent not found" without checking a single spec. Only a
+    parent directly under an existing OBJ network (any context's container)
+    or TOP manager (a topnet) is created, and only when every spec type
+    resolves in one context.
+    """
+    head, _, name = parent_path.rstrip("/").rpartition("/")
+    above = hou.node(head or "/")
+    if not name or above is None:
+        return None
+    holds = above.childTypeCategory().name() if above.childTypeCategory() else None
+    if holds not in ("Object", "TopNet"):
+        return None
+    types = {spec.get("type") for spec in nodes or [] if isinstance(spec, dict)}
+    if not types or None in types:
+        return None
+    categories = hou.nodeTypeCategories()
+    for category_name in _INFERRED_CATEGORIES:
+        category = categories.get(category_name)
+        if category and all(_resolve_node_type(category, t) is not None for t in types):
+            if holds == "TopNet":
+                return "topnet" if category_name == "Top" else None
+            return _container_for(category_name)
+    return None
+
+
+def _dry_run_in_scratch(
+    above, container: str, name: str, nodes: list, parent_path: str, **options: Any
+) -> dict:
+    """Validate *nodes* inside a throwaway container named like the real one.
+
+    Same name, so every path in the answer is the one the real build will use.
+    *options* are build_network's own (input_policy, inspect_nodes).
+    """
+    with hou.undos.disabler():
+        scratch = above.createNode(container, name)
+        try:
+            result = build_network(scratch.path(), nodes, dry_run=True, **options)
+        finally:
+            scratch.destroy()
+    result["would_create_parent"] = {"path": parent_path, "type": container}
+    return result
+
+
+def _upstream_with(node: hou.Node, method: str, include_self: bool = False) -> hou.Node | None:
+    """*node* (when include_self) or the nearest node up its first inputs having *method*."""
+    current = node if include_self else (node.inputs() or (None,))[0]
+    seen = set()
+    while current is not None and current.path() not in seen:
+        if hasattr(current, method):
+            return current
+        seen.add(current.path())
+        current = (current.inputs() or (None,))[0]
+    return None
+
+
+def _build_in_new_container(
+    parent_path: str, container: str, nodes: list, dry_run: bool, layout: bool, **options: Any
+) -> dict:
+    """build_network into a parent created for the purpose; a failed build removes it."""
+    head, _, name = parent_path.rstrip("/").rpartition("/")
+    above = hou.node(head or "/")
+    if dry_run:
+        return _dry_run_in_scratch(above, container, name, nodes, parent_path, **options)
+    parent = above.createNode(container, name)
+    place_new_node(parent)
+    try:
+        result = build_network(parent.path(), nodes, dry_run=False, layout=layout, **options)
+    except Exception:
+        parent.destroy()
+        raise
+    if result.get("success"):
+        result["created_parent"] = {"path": parent.path(), "type": container}
+    else:
+        parent.destroy()
+    return result
+
 
 def build_network(
     parent_path: str,
@@ -1170,6 +1502,16 @@ def build_network(
             "errors": [str(exc)],
             "message": str(exc),
         }
+    if parent is None and (container := _missing_parent_container(parent_path, nodes)):
+        return _build_in_new_container(
+            parent_path,
+            container,
+            nodes,
+            dry_run,
+            layout,
+            input_policy=input_policy,
+            inspect_nodes=inspect_nodes,
+        )
     if parent is None:
         return {
             "success": False,
@@ -1211,6 +1553,10 @@ def build_network(
         for key in spec:
             if key not in _SPEC_KEYS:
                 errors.append(_unknown_key_error(label, "spec", key, _SPEC_KEYS))
+        # {"lock": true} or {"Display": true} used to vanish without a word.
+        for key in spec.get("flags") or {}:
+            if key not in _FLAG_KEYS:
+                errors.append(_unknown_key_error(label, "flag", key, _FLAG_KEYS))
         # Only dict entries have keys: a plain source string and a null that
         # holds a position stay valid, and an "inputs" that is not a list at
         # all is parse_input_entries' error to report.
@@ -1286,8 +1632,7 @@ def build_network(
         before_probing = _network_flags(parent)
         try:
             for type_name, node_type in unknown_types:
-                knowledge = _type_knowledge(parent, node_type)
-                _TYPE_KNOWLEDGE[_type_cache_key(category, node_type)] = knowledge
+                knowledge = _type_knowledge(parent, node_type, category)
                 parm_knowledge[type_name] = knowledge
             for index in connector_probes:
                 spec = nodes[index]
@@ -1400,12 +1745,10 @@ def build_network(
                     # pattern is all there is to go on.
                     if _is_instance_parm(parm_name, instance_patterns):
                         continue
-                    close = get_close_matches(
-                        parm_name,
-                        sorted(parm_names | tuple_names),
-                        n=3,
-                        cutoff=0.5,
-                    )
+                    labels = dict.fromkeys(parm_names | tuple_names, "")
+                    if resolved := resolved_types.get(spec.get("type")):
+                        labels.update(template_labels(resolved.parmTemplateGroup().entries()))
+                    close = suggest_parms(parm_name, labels)
                     hint = f" Did you mean: {close}?" if close else ""
                     errors.append(
                         f"node {label}: parm '{parm_name}' does not exist "
@@ -1415,6 +1758,15 @@ def build_network(
                 errors += check_parm_value(
                     label, str(spec.get("type")), parm_name, parm_value, info
                 )
+            errors.extend(
+                f"node {label}: {problem}"
+                for problem in _instance_menu_errors(
+                    parent,
+                    resolved_types.get(spec.get("type")),
+                    spec.get("parms") or {},
+                    instance_patterns,
+                )
+            )
         if isinstance(spec.get("parms"), dict) and spec.get("type") in resolved_types:
             errors += _instance_range_errors(label, spec["parms"], multiparms_of(spec["type"]))
         node_type = resolved_types.get(spec.get("type"))
@@ -1490,6 +1842,8 @@ def build_network(
     flags_before = _network_flags(parent)
     # Per node path: what the literals in `parms` did to expressions.
     parm_reports: dict[str, dict[str, dict[str, str]]] = {}
+    flags_not_applied: dict[str, list[str]] = {}
+    display_moved: dict[str, str] = {}
     try:
         for spec in nodes:
             node = parent.createNode(resolved_types[spec["type"]].name(), spec.get("name"))
@@ -1508,8 +1862,12 @@ def build_network(
                 try:
                     written = _apply_parm(node, parm_name, value, override)
                 except Exception as exc:
+                    items = []
+                    with contextlib.suppress(Exception):
+                        items = list(node.parm(parm_name).menuItems())
+                    shown = f" Menu items: {items[:20]}" if items else ""
                     raise RuntimeError(
-                        f"{node.path()} parm '{parm_name}': {readable_message(exc)}"
+                        f"{node.path()} parm '{parm_name}': {readable_message(exc)}.{shown}"
                     ) from exc
                 for kind, found in written.items():
                     parm_reports.setdefault(node.path(), {}).setdefault(kind, {}).update(found)
@@ -1567,8 +1925,21 @@ def build_network(
                 ("bypass", "bypass"),
                 ("template", "setTemplateFlag"),
             ):
-                if flag in flags and hasattr(node, setter):
+                if flag not in flags:
+                    continue
+                if hasattr(node, setter):
                     getattr(node, setter)(bool(flags[flag]))
+                    continue
+                # A ROP or VOP has no display/template flag: say so rather
+                # than skip it as if it had been set.
+                flags_not_applied.setdefault(node.path(), []).append(flag)
+                if flag == "display" and flags[flag]:
+                    # A usdrender_rop at the end of a stage: what the caller
+                    # wants seen is what it renders, its input.
+                    upstream = _upstream_with(node, setter)
+                    if upstream is not None:
+                        upstream.setDisplayFlag(True)
+                        display_moved[node.path()] = upstream.path()
             if spec.get("color"):
                 node.setColor(hou.Color(tuple(spec["color"])))
             if spec.get("comment"):
@@ -1610,6 +1981,19 @@ def build_network(
                 f"rollback could not destroy {len(orphans)} node(s): {orphans}"
             )
         return failure
+
+    # In a network that was empty, Houdini leaves the display flag on the
+    # first node created: a Solaris build displayed (and reported) its lone
+    # sphere instead of the finished stage. Unless a spec chose, the last
+    # node that can carry the flag gets it, as an artist would set it.
+    asked_for_display = any(
+        isinstance(spec, dict) and "display" in (spec.get("flags") or {}) for spec in nodes
+    )
+    if not existing and not asked_for_display and created:
+        with contextlib.suppress(Exception):
+            last = _upstream_with(list(created.values())[-1], "setDisplayFlag", include_self=True)
+            if last is not None:
+                last.setDisplayFlag(True)
 
     # Placement is a floor, not a layout option: whatever `layout` says and
     # whatever the auto-layout flag says, a node THIS call created must not be
@@ -1676,9 +2060,9 @@ def build_network(
     reports = [_node_report(node, inputs=True) for node in built]
     for report in reports:
         report.update(parm_reports.get(report["path"], {}))
-    error_nodes = [r["path"] for r in reports if r["errors"]]
+    error_nodes = [r["path"] for r in reports if r.get("errors")]
     for row in inspected:
-        if row["errors"] and row["path"] not in error_nodes:
+        if row.get("errors") and row["path"] not in error_nodes:
             error_nodes.append(row["path"])
 
     display = parent.displayNode() if hasattr(parent, "displayNode") else None
@@ -1688,6 +2072,11 @@ def build_network(
         # Carried once, at the top level where callers read it; the queried
         # node's own row points there instead of repeating it.
         queried["geometry"] = "see top-level geometry"
+    if queried_geometry is None and hasattr(parent, "stage"):
+        # Shaders built inside a Material Library: the evidence is the stage
+        # the library now authors (its Material prims), not null.
+        with contextlib.suppress(Exception):
+            queried_geometry = {"stage_of": parent.path(), **_stage_summary(parent)}
 
     # How much of the build was actually checked. "cooked": true over an empty
     # target list was the worst kind of answer -- a confident one about
@@ -1774,6 +2163,10 @@ def build_network(
         )
     if omitted:
         result["inspect_truncated"] = omitted
+    if flags_not_applied:
+        result["flags_not_applied"] = flags_not_applied
+    if display_moved:
+        result["display_set_upstream"] = display_moved
     # A literal that did not take is part of the spec this call did not
     # build, so it is said at the top level, not only inside a node report:
     # a bare set() used to leave a Ray SOP's @N.x in place and answer success.
@@ -1821,6 +2214,12 @@ def verify_network(parent_path: str, **_: Any) -> dict:
         raise ValueError(f"Network not found: {parent_path}")
 
     display = parent.displayNode() if hasattr(parent, "displayNode") else None
+    if display is None:
+        # A copnet has no displayNode(): the child with the flag is the answer.
+        display = next(
+            (c for c in parent.children() if getattr(c, "isDisplayFlagSet", lambda: False)()),
+            None,
+        )
     if display is not None:
         with contextlib.suppress(hou.OperationFailed):
             display.cook(force=False)
@@ -1828,11 +2227,12 @@ def verify_network(parent_path: str, **_: Any) -> dict:
     reports = []
     for child in parent.children():
         report = _node_report(child)
-        report["display"] = child.isDisplayFlagSet() if hasattr(child, "isDisplayFlagSet") else None
+        if getattr(child, "isDisplayFlagSet", lambda: False)():
+            report["display"] = True
         reports.append(report)
 
-    error_nodes = [r["path"] for r in reports if r["errors"]]
-    licensing = license_error([e for r in reports for e in r["errors"]])
+    error_nodes = [r["path"] for r in reports if r.get("errors")]
+    licensing = license_error([e for r in reports for e in r.get("errors", ())])
     return {
         "parent_path": parent_path,
         "node_count": len(reports),
@@ -2045,14 +2445,17 @@ def get_node_card(
                             "count_parm": folder.name(),
                             "label": folder.label(),
                             "folder_type": folder.folderType().name(),
-                            # First instance number: pt0 or pt1. From the
-                            # multistartoffset tag; 1 when the tag is absent.
-                            "start_offset": _multiparm_start(folder),
                             "instance_parms": [
                                 child.name()
                                 for child in folder.parmTemplates()
                                 if "#" in child.name()
                             ][:_PARM_CAP],
+                            # Where "#" starts counting: Rig Pose's first
+                            # instance is group0, most nodes' is name1, and
+                            # guessing wrong cost a failed set_parameters.
+                            # None when the multistartoffset tag is not an
+                            # integer: unknown, rather than a guess.
+                            "first_index": _multiparm_start(folder),
                         }
                     )
             with contextlib.suppress(Exception):
@@ -2075,12 +2478,15 @@ def get_node_card(
         "is_generator": resolved.minNumInputs() == 0,
         "parm_count": len(parms),
         "parms_matched": matched,
-        "parms_omitted": omitted,
+        # Capped: 274 names (5.6 KB) on a Pyro Solver card filtered to a few.
+        "parms_omitted": omitted[:50],
+        **({"parms_omitted_count": len(omitted)} if len(omitted) > 50 else {}),
         "parms_truncated": truncated,
         "parms": parms,
         "multiparms": multiparms,
-        "help": help_text,
     }
+    if help_text is not None:
+        card["help"] = help_text
     if connectors is not None:
         card["inputs"] = connectors["inputs"]
         card["outputs"] = connectors["outputs"]
@@ -2207,6 +2613,18 @@ _MAX_FRAMES = 480
 _FRAME_ATTRIB_CAP = 8
 
 
+def _frame_stats(entry: dict[str, Any]) -> dict[str, Any]:
+    """One attribute's aggregates for a frame row, per axis for a vector.
+
+    min/max over all of P's components mixes x, y and z, so "did the liquid
+    land on the ground" could not be read off it; the y range answers that.
+    """
+    row = {k: v for k, v in entry.items() if k in ("min", "max", "mean", "sum")}
+    if entry.get("per_component"):
+        row["per_axis"] = [[c["min"], c["max"]] for c in entry["per_component"]]
+    return row
+
+
 def _frame_measurement(
     node: hou.Node,
     attribs: list[str] | None,
@@ -2218,8 +2636,14 @@ def _frame_measurement(
     if geo is None:
         row["points"] = row["prims"] = 0
         return row
-    row["points"] = len(geo.iterPoints())
-    row["prims"] = len(geo.iterPrims())
+    # Intrinsics, not len(iterPoints()): that builds a Python object per point,
+    # every frame, on exactly the heavy sims this tool is for.
+    row["points"] = geo.intrinsicValue("pointcount")
+    row["prims"] = geo.intrinsicValue("primitivecount")
+    # Counts stay flat while pieces fall or cloth drapes; the bounds are the
+    # cheap proof that anything moved.
+    bbox = geo.boundingBox()
+    row["bbox"] = [list(bbox.minvec()), list(bbox.maxvec())]
 
     if attribs:
         from fxhoudinimcp_server.handlers.geometry_handlers import _get_attrib_stats
@@ -2229,10 +2653,7 @@ def _frame_measurement(
             attribs=attribs[:_FRAME_ATTRIB_CAP],
             attrib_class="point",
         )
-        row["attribs"] = {
-            name: {k: v for k, v in entry.items() if k in ("min", "max", "mean", "sum")}
-            for name, entry in stats["stats"].items()
-        }
+        row["attribs"] = {name: _frame_stats(entry) for name, entry in stats["stats"].items()}
         if stats["missing"]:
             row["missing_attribs"] = stats["missing"]
 
@@ -2249,6 +2670,10 @@ def _frame_measurement(
             for entry in info["volumes"]
         ]
     return row
+
+
+def _shape(row: dict[str, Any]) -> tuple:
+    return row.get("points"), row.get("prims"), json.dumps(row.get("bbox"))
 
 
 def cook_frame_range(
@@ -2323,8 +2748,12 @@ def cook_frame_range(
         if cook_error:
             row["cook_error"] = cook_error
         with contextlib.suppress(hou.OperationFailed):
-            row["errors"] = [e.splitlines()[0][:200] for e in node.errors()]
-            row["warnings"] = [w.splitlines()[0][:200] for w in node.warnings()]
+            # Only when there are any: an empty pair per frame is most of a
+            # 240-frame answer.
+            if errors := [e.splitlines()[0][:200] for e in node.errors()]:
+                row["errors"] = errors
+            if warnings := [w.splitlines()[0][:200] for w in node.warnings()]:
+                row["warnings"] = warnings
         if row.get("errors") and first_error_frame is None:
             first_error_frame = frame
         try:
@@ -2333,7 +2762,8 @@ def cook_frame_range(
             row["measure_error"] = str(exc).splitlines()[0][:200]
         frames.append(row)
 
-    return {
+    shown = _thin_frame_rows(frames)
+    result: dict[str, Any] = {
         "node_path": node_path,
         "start": start,
         "end": end,
@@ -2342,9 +2772,44 @@ def cook_frame_range(
         "total_cook_ms": round(total_ms, 1),
         "mean_cook_ms": round(total_ms / len(frames), 1) if frames else 0.0,
         "first_error_frame": first_error_frame,
+        # True when counts and bounds never changed: the node cooks, but over
+        # this range it does nothing, which is what a sim with no gravity, a
+        # pinned-everything cloth or an unconnected source looks like.
+        "static": len(frames) > 1 and all(_shape(row) == _shape(frames[0]) for row in frames),
         "current_frame": hou.frame(),
-        "frames": frames,
+        "frames": shown,
     }
+    if frames:
+        slowest = max(frames, key=lambda row: row["cook_ms"])
+        result["slowest_frame"] = {"frame": slowest["frame"], "cook_ms": slowest["cook_ms"]}
+    if len(shown) < len(frames):
+        result["frames_shown"] = len(shown)
+        result["frames_note"] = (
+            "Rows are evenly spaced frames plus every frame with an error or "
+            "warning; the totals above cover every frame. Cook a narrower range "
+            "for every row."
+        )
+    return result
+
+
+# Rows returned when a range is long: 48 frames of a crowd were 15 KB of rows
+# that differed in the fourth digit, and 240 would have been 75 KB.
+_FRAME_ROWS_SHOWN = 25
+
+
+def _thin_frame_rows(frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Evenly spaced rows (first and last included) plus every row with a problem."""
+    if len(frames) <= _FRAME_ROWS_SHOWN:
+        return frames
+    last = len(frames) - 1
+    keep = {round(i * last / (_FRAME_ROWS_SHOWN - 1)) for i in range(_FRAME_ROWS_SHOWN)}
+    flagged = [
+        i
+        for i, row in enumerate(frames)
+        if row.get("errors") or row.get("cook_error") or row.get("warnings")
+    ]
+    keep.update(flagged[:_FRAME_ROWS_SHOWN])
+    return [frames[i] for i in sorted(keep)]
 
 
 register_handler("graph.cook_frame_range", cook_frame_range)

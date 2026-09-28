@@ -22,6 +22,16 @@ is state-machine work.
 Get that order right and the sim is tractable; start by tuning forces and you will
 be fighting the wrong layer.
 
+## Start from SideFX's default crowd
+
+`run_shelf_tool("object_crowdsolver")` (Crowds > Simulate, run as a Ctrl+click)
+builds the whole documented setup in one call: `mocapbiped1` rest/stand/walk
+agents in `mocapbiped1_setup`, a `crowdsource` object with 1000 agents, and a
+`crowd_sim` DOP network with stand, walk and ragdoll states and a stand-to-walk
+transition. Verified simulating on 22.0. Adapt it (agent count, states, your own
+character through the Agent SOP) rather than wiring agents, source and solver by
+hand, then check it moves with `cook_frame_range` on `crowd_sim_import`.
+
 ## Judgement
 
 - Build one agent and verify its clips play before there is a crowd at all. A hundred agents playing the wrong clip looks like a solver problem and is an agent-setup problem.

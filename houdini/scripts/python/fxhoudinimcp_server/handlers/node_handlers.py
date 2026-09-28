@@ -1105,10 +1105,15 @@ def reorder_inputs(node_path: str, new_order: list) -> dict:
     if bad:
         raise ValueError(f"new_order refers to inputs {bad}; {node_path} has inputs 0-{count - 1}.")
 
+    # Inputs new_order does not mention follow in their original order. They
+    # used to be cleared and never rewired: [1, 0] on a 3-input merge, the
+    # docstring's own example, silently dropped input 2.
+    order = list(new_order) + [i for i in range(count) if i not in new_order]
+
     # Checked before anything is disconnected, so a refusal leaves the wires.
     for i in wires:
         node.setInput(i, None)
-    for new_idx, old_idx in enumerate(new_order):
+    for new_idx, old_idx in enumerate(order):
         if old_idx in wires:
             item, output_index = wires[old_idx]
             node.setInput(new_idx, item, output_index)
@@ -1116,7 +1121,7 @@ def reorder_inputs(node_path: str, new_order: list) -> dict:
     return {
         "success": True,
         "node_path": node_path,
-        "new_order": new_order,
+        "new_order": order,
     }
 
 
@@ -1142,57 +1147,53 @@ def set_node_flags(
         lock: Set the hard-lock flag.
     """
     node = _get_node(node_path)
-    changed = {}
-
-    if display is not None:
+    requested = {
+        "display": display,
+        "render": render,
+        "bypass": bypass,
+        "template": template,
+        "lock": lock,
+    }
+    changed: dict[str, bool] = {}
+    not_applied: dict[str, str] = {}
+    for flag, wanted in requested.items():
+        if wanted is None:
+            continue
+        setter, getter = _FLAG_ACCESSORS[flag]
         try:
-            node.setDisplayFlag(display)
-            changed["display"] = display
-        except hou.OperationFailed:
-            pass  # Some node types don't support display flag
+            getattr(node, setter)(bool(wanted))
+            actual = bool(getattr(node, getter)())
+        except (AttributeError, hou.OperationFailed) as exc:
+            not_applied[flag] = f"{node.type().name()} has no {flag} flag ({type(exc).__name__})"
+            continue
+        # Read back: Houdini ignores some requests without raising. A SOP's
+        # display flag cannot be turned off (one node always holds it), and
+        # this used to report display: False regardless.
+        if actual == bool(wanted):
+            changed[flag] = actual
+        else:
+            not_applied[flag] = f"asked for {bool(wanted)}, Houdini kept {actual}"
 
-    if render is not None:
-        try:
-            node.setRenderFlag(render)
-            changed["render"] = render
-        except hou.OperationFailed:
-            pass
-
-    if bypass is not None:
-        try:
-            node.bypass(bypass)
-            changed["bypass"] = bypass
-        except hou.OperationFailed:
-            pass
-
-    if template is not None:
-        try:
-            node.setTemplateFlag(template)
-            changed["template"] = template
-        except hou.OperationFailed:
-            pass
-
-    if lock is not None:
-        try:
-            node.setHardLocked(lock)
-            changed["lock"] = lock
-        except hou.OperationFailed:
-            pass
-
-    if not changed:
-        raise ValueError(
-            "No flags were changed. Either no flags were specified or "
-            "the node does not support the requested flags."
-        )
+    if not changed and not not_applied:
+        raise ValueError("No flags were specified.")
 
     if changed.get("display"):
         _focus_network_editor(node, place_unpositioned=False)
 
-    return {
-        "success": True,
-        "node_path": node_path,
-        "changed_flags": changed,
-    }
+    result = {"success": not not_applied, "node_path": node_path, "changed_flags": changed}
+    if not_applied:
+        result["not_applied"] = not_applied
+    return result
+
+
+# flag -> (setter, reader), for set_node_flags' readback.
+_FLAG_ACCESSORS = {
+    "display": ("setDisplayFlag", "isDisplayFlagSet"),
+    "render": ("setRenderFlag", "isRenderFlagSet"),
+    "bypass": ("bypass", "isBypassed"),
+    "template": ("setTemplateFlag", "isTemplateFlagSet"),
+    "lock": ("setHardLocked", "isHardLocked"),
+}
 
 
 ###### nodes.layout_children
@@ -1205,14 +1206,15 @@ def layout_children(parent_path: str, spacing: float = None) -> dict:
         parent_path: Path to the parent network.
         spacing: Optional spacing multiplier between nodes.
     """
+    # Resolve first, so a bad path is named even when layout is disabled.
+    parent = _get_node(parent_path)
+
     if not auto_layout_enabled():
         return {
             "success": False,
             "skipped": True,
             "reason": "Auto-layout is disabled (FXHOUDINIMCP_AUTO_LAYOUT=0).",
         }
-
-    parent = _get_node(parent_path)
 
     if spacing is not None:
         parent.layoutChildren(horizontal_spacing=spacing, vertical_spacing=spacing)

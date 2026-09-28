@@ -18,7 +18,7 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.dispatcher import register_handler
-from fxhoudinimcp_server.ui import require_ui
+from fxhoudinimcp_server.ui import require_ui, set_other_objects
 
 logger = logging.getLogger(__name__)
 
@@ -878,11 +878,17 @@ def _image_spread(path: str) -> dict:
 ###### viewport.set_current_network
 
 
-def set_current_network(network_path: str) -> dict:
+def set_current_network(network_path: str, other_objects: str | None = "hide") -> dict:
     """Navigate the network editor to a specific network path.
+
+    The viewer follows the network editor into the object, and *other_objects*
+    sets what it draws of every other object (the viewport's Y hotkey): "hide"
+    by default, so work in one object is not drawn over, and slowed by, the
+    rest of the scene. No display flag changes.
 
     Args:
         network_path: Path to the network to navigate to (e.g. '/obj/geo1').
+        other_objects: "hide", "ghost", "show", or None to leave the viewer as is.
     """
     node = hou.node(network_path)
     if node is None:
@@ -907,10 +913,14 @@ def set_current_network(network_path: str) -> dict:
         "success": True,
         "network_path": network_path,
         "pane_name": network_editor.name(),
+        "other_objects": set_other_objects(other_objects),
     }
 
 
 ###### viewport.find_error_nodes
+
+
+_ERROR_NODE_CAP = 50
 
 
 def find_error_nodes(root_path: str = "/") -> dict:
@@ -923,8 +933,11 @@ def find_error_nodes(root_path: str = "/") -> dict:
     if root is None:
         raise ValueError(f"Root path not found: {root_path}")
 
+    from fxhoudinimcp_server.handlers.graph_handlers import _condensed
+
     error_nodes = []
     warning_nodes = []
+    counts = {"errors": 0, "warnings": 0}
     # A node whose errors() raises (hou.PermissionError on a locked asset's
     # insides, for one) is neither clean nor erroring: it was not read. It is
     # listed, and the scan carries on, instead of the whole call failing or the
@@ -939,34 +952,31 @@ def find_error_nodes(root_path: str = "/") -> dict:
         unreadable_nodes.append({"path": path, "error": f"{what}: {type(exc).__name__}: {exc}"})
 
     def _check_node(node):
-        """Recursively check nodes for errors and warnings."""
-        try:
-            errors = node.errors()
-            if errors:
-                error_nodes.append(
-                    {
-                        "path": node.path(),
-                        "name": node.name(),
-                        "type": node.type().name(),
-                        "errors": list(errors),
-                    }
-                )
-        except (hou.Error, AttributeError) as e:
-            _unreadable(node, "errors()", e)
+        """Recursively check nodes for errors and warnings.
 
-        try:
-            warnings = node.warnings()
-            if warnings:
-                warning_nodes.append(
-                    {
-                        "path": node.path(),
-                        "name": node.name(),
-                        "type": node.type().name(),
-                        "warnings": list(warnings),
-                    }
-                )
-        except (hou.Error, AttributeError) as e:
-            _unreadable(node, "warnings()", e)
+        Messages are condensed (one upstream error repeats on every node
+        downstream of it) and each list holds the first 50 nodes; the counts
+        stay complete. `name` is gone: it is the tail of `path`.
+        """
+        for kind, reader, bucket in (
+            ("errors", node.errors, error_nodes),
+            ("warnings", node.warnings, warning_nodes),
+        ):
+            try:
+                messages = reader()
+            except (hou.Error, AttributeError) as e:
+                _unreadable(node, f"{kind}()", e)
+                continue
+            if messages:
+                counts[kind] += 1
+                if len(bucket) < _ERROR_NODE_CAP:
+                    bucket.append(
+                        {
+                            "path": node.path(),
+                            "type": node.type().name(),
+                            kind: [_condensed(m) for m in messages],
+                        }
+                    )
 
         # Recurse into children
         try:
@@ -980,9 +990,9 @@ def find_error_nodes(root_path: str = "/") -> dict:
     return {
         "error_nodes": error_nodes,
         "warning_nodes": warning_nodes,
-        "error_count": len(error_nodes),
-        "warning_count": len(warning_nodes),
-        "unreadable_nodes": unreadable_nodes,
+        "error_count": counts["errors"],
+        "warning_count": counts["warnings"],
+        "unreadable_nodes": unreadable_nodes[:_ERROR_NODE_CAP],
         "unreadable_count": len(unreadable_nodes),
         "root_path": root_path,
     }
@@ -1119,7 +1129,9 @@ def set_viewer_context(
     scene_viewer.setPwd(network)
 
     if current_node is not None:
-        node = hou.node(current_node)
+        # "karma" means the node of that name inside the network; hou.node()
+        # alone reads it as relative to /, and the documented usage failed.
+        node = network.node(current_node) or hou.node(current_node)
         if node is None:
             raise ValueError(f"Node not found: {current_node}")
         scene_viewer.setCurrentNode(node)

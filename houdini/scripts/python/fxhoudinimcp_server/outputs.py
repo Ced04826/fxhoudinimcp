@@ -87,6 +87,52 @@ def license_error(errors: list[str]) -> str | None:
     return None
 
 
+def _file_entry(label: str, path: str) -> dict[str, Any]:
+    entry: dict[str, Any] = {"parm": label, "path": path}
+    with contextlib.suppress(Exception):
+        entry["exists"] = os.path.exists(path)
+        if entry["exists"]:
+            entry["size_bytes"] = os.path.getsize(path)
+            entry["mtime"] = os.path.getmtime(path)
+    return entry
+
+
+def _render_product_paths(node: hou.Node) -> list[str]:
+    """The images a usdrender ROP writes when its own Output Image is empty.
+
+    That is the default in Solaris: the path lives on the RenderProduct that
+    Karma Render Settings authors (productName), and husk writes there. Reading
+    only the ROP's parm made every default Karma render report "nothing was
+    written". Evaluated at the current frame, which the caller sets.
+    """
+    try:
+        from pxr import UsdRender
+
+        source = node.inputs()[0] if node.inputs() else None
+        if source is None and node.parm("loppath") is not None:
+            source = node.node(node.parm("loppath").eval())
+        stage = source.stage()
+        settings_path = node.parm("rendersettings").eval() if node.parm("rendersettings") else ""
+        prim = stage.GetPrimAtPath(settings_path) if settings_path else None
+        settings = (
+            UsdRender.Settings(prim) if prim else UsdRender.Settings.GetStageRenderSettings(stage)
+        )
+        if not settings:
+            settings = next(
+                (UsdRender.Settings(p) for p in stage.Traverse() if p.IsA(UsdRender.Settings)), None
+            )
+        paths = []
+        for target in settings.GetProductsRel().GetTargets():
+            name = (
+                UsdRender.Product(stage.GetPrimAtPath(target)).GetProductNameAttr().Get(hou.frame())
+            )
+            if name:
+                paths.append(str(name))
+        return paths
+    except Exception:
+        return []
+
+
 def reported_outputs(node: hou.Node) -> list[dict[str, Any]]:
     """The node's output path(s) and whether anything is on disk there."""
     found: list[dict[str, Any]] = []
@@ -98,6 +144,9 @@ def reported_outputs(node: hou.Node) -> list[dict[str, Any]]:
             path = parm.eval()
         except hou.OperationFailed:
             continue
+        if not path and name == "outputimage" and (products := _render_product_paths(node)):
+            found.extend(_file_entry("render_product", product) for product in products)
+            continue
         if not path:
             # An empty output path is the quiet failure worth naming: the node
             # ran and wrote nothing.
@@ -106,13 +155,7 @@ def reported_outputs(node: hou.Node) -> list[dict[str, Any]]:
         if path in NON_FILE_OUTPUTS:
             found.append({"parm": name, "path": path, "is_file_output": False})
             continue
-        entry: dict[str, Any] = {"parm": name, "path": path}
-        with contextlib.suppress(Exception):
-            entry["exists"] = os.path.exists(path)
-            if entry["exists"]:
-                entry["size_bytes"] = os.path.getsize(path)
-                entry["mtime"] = os.path.getmtime(path)
-        found.append(entry)
+        found.append(_file_entry(name, path))
     return found
 
 
@@ -264,6 +307,9 @@ def write_verdict(
         time.sleep(0.25)
         after = reported_outputs(node)
         wrote = wrote_anything(before, after)
+        # husk's exit error (a missing license) can land on the ROP after
+        # render() returns; the verdict said "no errors" while it was there.
+        errors, warnings = node_messages(node)
     if not errors and not wrote:
         # The node itself is clean and wrote nothing: the failure, if any, is
         # upstream of it.

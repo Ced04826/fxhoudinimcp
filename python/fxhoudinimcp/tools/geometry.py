@@ -35,7 +35,7 @@ async def get_points(
     node_path: str,
     attributes: list[str] | None = None,
     start: int = 0,
-    count: int = 1000,
+    count: int = 200,
     group: str | None = None,
 ) -> dict:
     """Read point positions and attributes with pagination.
@@ -44,7 +44,8 @@ async def get_points(
         node_path: Node path.
         attributes: Attribute names to read.
         start: Start index.
-        count: Max points per page.
+        count: Max points per page (200 by default, about 14 KB; page on with
+            start while has_more is true).
         group: Point group filter.
     """
     bridge = _get_bridge(ctx)
@@ -66,7 +67,7 @@ async def get_prims(
     node_path: str,
     attributes: list[str] | None = None,
     start: int = 0,
-    count: int = 1000,
+    count: int = 200,
     group: str | None = None,
 ) -> dict:
     """Read primitive data and attributes with pagination.
@@ -75,7 +76,8 @@ async def get_prims(
         node_path: Node path.
         attributes: Attribute names to read.
         start: Start index.
-        count: Max prims per page.
+        count: Max prims per page (200 by default; page on with start while
+            has_more is true).
         group: Prim group filter.
     """
     bridge = _get_bridge(ctx)

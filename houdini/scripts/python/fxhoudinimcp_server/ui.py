@@ -57,3 +57,31 @@ def panes():
     """``hou.ui.paneTabs()``, but explaining itself when there is no UI."""
     require_ui("look at Houdini's panes")
     return hou.ui.paneTabs()
+
+
+# vieweroption -a: what the viewer draws of the objects you are not inside.
+# The same switch as the viewport's Y hotkey; display flags are left alone.
+OTHER_OBJECTS = {"hide": 0, "show": 1, "ghost": 2}
+
+
+def set_other_objects(mode: str | None) -> str | None:
+    """Set how every Scene Viewer draws objects other than the current one.
+
+    Returns the mode applied, or None when there was nothing to do: no UI, no
+    viewer, or *mode* None. Best effort by design, since isolating the viewer
+    is a courtesy to the user and never a reason to fail the call it rides on.
+    """
+    if mode is None or not ui_available():
+        return None
+    if mode not in OTHER_OBJECTS:
+        raise ValueError(f"other_objects must be one of {sorted(OTHER_OBJECTS)} or None")
+    applied = None
+    try:
+        desktop = hou.ui.curDesktop().name()
+        for tab in hou.ui.paneTabs():
+            if tab.type() == hou.paneTabType.SceneViewer:
+                hou.hscript(f"vieweroption -a {OTHER_OBJECTS[mode]} {desktop}.{tab.name()}.world")
+                applied = mode
+    except Exception:
+        return applied
+    return applied
