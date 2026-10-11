@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 # Third-party
@@ -105,6 +106,10 @@ class FakeParm:
 
     def description(self):
         return self._name
+
+    def node(self):
+        # Asked by dop_cache_note after a write and by locked_message.
+        return SimpleNamespace(path=lambda: "/obj/fake")
 
     def path(self):
         return f"/obj/fake/{self._name}"
@@ -1364,6 +1369,7 @@ class TestToolWrappers:
             "parm_name": "px",
             "value": 0.0,
             "override_expression": False,
+            "run_callbacks": False,
             "expression_policy": "replace",
             "return_values": "summary",
         }
@@ -1380,6 +1386,7 @@ class TestToolWrappers:
             "node_path": "/obj/geo1/box1",
             "params": {"sizex": 2.0},
             "override_expression": False,
+            "run_callbacks": False,
             "return_values": "full",
         }
 

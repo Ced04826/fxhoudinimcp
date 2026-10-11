@@ -16,8 +16,15 @@ a detail of the search: with no UI at all there are no panes to look through.
 
 from __future__ import annotations
 
+# Built-in
+import contextlib
+from collections.abc import Iterator
+
 # Third-party
 import hou
+
+# Internal
+from fxhoudinimcp_server.config import focus_editor_enabled, layout_if_enabled
 
 
 def ui_available() -> bool:
@@ -85,3 +92,221 @@ def set_other_objects(mode: str | None) -> str | None:
     except Exception:
         return applied
     return applied
+
+
+def _in_lops(viewer) -> bool:
+    """Whether *viewer* shows a LOP network (its cameras are prims) or not (nodes)."""
+    return viewer.pwd().childTypeCategory() == hou.lopNodeTypeCategory()
+
+
+def _restore_cameras(cameras: list) -> None:
+    """Bind each recorded (viewer, view name, camera path) again where it changed.
+
+    Only while the viewer is in the same kind of network as when it was
+    recorded. Houdini keeps a camera per context itself; a USD prim path bound
+    again in an object network matched nothing, and the view drew through it
+    with the wrong aspect (22.0.368).
+    """
+    for tab, name, path, lops in cameras:
+        with contextlib.suppress(Exception):
+            if _in_lops(tab) != lops:
+                continue
+            viewport = next(v for v in tab.viewports() if v.name() == name)
+            current = viewport.camera()
+            now = current.path() if current is not None else viewport.cameraPath()
+            if now != path:
+                viewport.setCamera(hou.node(path) or path)
+
+
+@contextlib.contextmanager
+def keep_viewer_state() -> Iterator[None]:
+    """Keep every view's camera and the node selection across a network editor move.
+
+    The Scene Viewer follows the network editor, and a ``cd`` to another level
+    unbinds each view's camera and selects that network's current node
+    (measured on 22.0.429): set_current_network lost a camera set one call
+    earlier, and set_node_flags left the object selected, so the next viewport
+    capture drew it in the selection colour. Leaving a LOP network unbinds the
+    camera once more on the next UI tick, after the call has returned, so the
+    cameras are bound again then too.
+
+    Best effort: nothing here raises, and a state the move left untouched is
+    not written back.
+    """
+    cameras: list = []
+    selected: list = []
+    with contextlib.suppress(Exception):
+        selected = list(hou.selectedNodes())
+    with contextlib.suppress(Exception):
+        for tab in hou.ui.paneTabs():
+            if tab.type() != hou.paneTabType.SceneViewer:
+                continue
+            for viewport in tab.viewports():
+                path = None
+                with contextlib.suppress(Exception):
+                    camera = viewport.camera()
+                    # A USD camera prim is a path, not a node.
+                    path = camera.path() if camera is not None else viewport.cameraPath()
+                if path:
+                    cameras.append((tab, viewport.name(), path, _in_lops(tab)))
+    try:
+        yield
+    finally:
+        _restore_cameras(cameras)
+        if cameras:
+            with contextlib.suppress(Exception):
+                import hdefereval
+
+                hdefereval.executeDeferred(lambda: _restore_cameras(cameras))
+        with contextlib.suppress(Exception):
+            now = sorted(node.path() for node in hou.selectedNodes())
+            if now != sorted(node.path() for node in selected):
+                # The editor follows a selected node to its network on the next
+                # UI tick (22.0.368): selecting one outside the network the
+                # editor moved to pulled it back, and set_current_network
+                # answered for a network the editor had already left. Only the
+                # nodes in that network are selected again.
+                shown = {
+                    tab.pwd().path()
+                    for tab in hou.ui.paneTabs()
+                    if tab.type() == hou.paneTabType.NetworkEditor
+                }
+                keep = [n for n in selected if not shown or n.parent().path() in shown]
+                if now != sorted(node.path() for node in keep):
+                    hou.clearAllSelected()
+                    for node in keep:
+                        node.setSelected(True, clear_all_selected=False)
+
+
+def _viewers_in_dops() -> set[str]:
+    """Names of the Scene Viewers drawing a DOP network right now."""
+    names: set[str] = set()
+    with contextlib.suppress(Exception):
+        dops = hou.dopNodeTypeCategory()
+        for tab in hou.ui.paneTabs():
+            if tab.type() == hou.paneTabType.SceneViewer and tab.pwd().childTypeCategory() == dops:
+                names.add(tab.name())
+    return names
+
+
+@contextlib.contextmanager
+def viewer_stays_out_of_dops() -> Iterator[None]:
+    """Put the network editor back if the block took a Scene Viewer into a DOP network.
+
+    The Scene Viewer follows the network editor in the same call (measured on
+    22.0.429): an editor sent into a DOP network to show a node created there
+    turned the viewer into a DOP view, which draws a collider as solid
+    geometry and particles as points instead of the object's SOP display, and
+    the next viewport capture was judged on that. The panes are linked, so the
+    viewer cannot stay behind on its own; the editor goes back instead. A
+    viewer that was in a DOP network already is the user's choice and is left
+    there, and set_current_network still goes into one when asked to.
+    """
+    before = _viewers_in_dops()
+    editors: list = []
+    with contextlib.suppress(Exception):
+        editors = [
+            (tab, tab.pwd().path())
+            for tab in hou.ui.paneTabs()
+            if tab.type() == hou.paneTabType.NetworkEditor
+        ]
+    try:
+        yield
+    finally:
+        if _viewers_in_dops() - before:
+            with contextlib.suppress(Exception), keep_viewer_state():
+                for tab, path in editors:
+                    # One editor whose network is gone must not keep the
+                    # others in the DOP network.
+                    with contextlib.suppress(Exception):
+                        tab.cd(path)
+
+
+def viewer_context(scene_viewer) -> dict:
+    """The network *scene_viewer* draws, and a note when that is a DOP network.
+
+    For a viewport capture's reply. In a DOP network the viewer draws the
+    simulation's objects (a collider solid, particles as points), not the
+    object's SOP display, and a session judged particle trails off such a
+    frame: no reply had said what the viewer was showing. Best effort, empty
+    when the viewer cannot say.
+    """
+    context: dict = {}
+    with contextlib.suppress(Exception):
+        network = scene_viewer.pwd()
+        path = network.path()
+        if not isinstance(path, str):
+            return context
+        context["viewer_network"] = path
+        if network.childTypeCategory() == hou.dopNodeTypeCategory():
+            parent = network.parent()
+            context["viewer_note"] = (
+                f"The Scene Viewer is inside the DOP network {path} and draws its "
+                "simulation objects (colliders solid, particles as points), not the "
+                "SOP display. set_current_network to the object's network"
+                + (f" ({parent.path()})" if parent is not None else "")
+                + " to capture the SOP result."
+            )
+    return context
+
+
+def focus_network_editor(
+    node: hou.Node,
+    place_unpositioned: bool = True,
+    other_objects: str | None = None,
+) -> None:
+    """Best-effort: lay out *node*'s network, then pan the network editor to *node*.
+
+    The handlers that create or rewire a node end here. Callers that created
+    nothing pass ``place_unpositioned=False``, so a call that only rewires or
+    flips a flag never relocates a node the user parked at the origin.
+    *other_objects* goes to set_other_objects once the editor has moved. The
+    viewer's cameras and the selection survive the move (keep_viewer_state),
+    and the editor stays where it was rather than take the viewer into a DOP
+    network (viewer_stays_out_of_dops). The panning half only runs with
+    ``FXHOUDINIMCP_FOCUS_EDITOR`` on (see ``focus_editor_enabled``); the layout
+    half always runs.
+    """
+    try:
+        parent = node.parent()
+        if parent is not None:
+            layout_if_enabled(parent, place_unpositioned)
+        if not focus_editor_enabled():
+            return  # the switch is off: placement only, the panes stay put
+        with keep_viewer_state(), viewer_stays_out_of_dops():
+            for pane_tab in hou.ui.paneTabs():
+                if pane_tab.type() == hou.paneTabType.NetworkEditor:
+                    if parent is not None:
+                        pane_tab.cd(parent.path())
+                    pane_tab.setCurrentNode(node)
+                    pane_tab.homeToSelection()
+                    if other_objects is not None:
+                        set_other_objects(other_objects)
+                    return
+    except Exception:
+        pass  # Never let UI helpers break a tool call
+
+
+@contextlib.contextmanager
+def selection_hidden() -> Iterator[None]:
+    """Draw no selection highlight for the block (a viewport capture), then put it back.
+
+    A selected object is drawn with a selection outline, and a capture took it
+    along whoever had selected it. The viewer has no switch for that highlight
+    (neither HOM nor viewdisplay), so the node selection is cleared for the
+    block. What was selected is put back as it was: the editor already shows
+    it (it follows a selected node into its network), so it does not move.
+    """
+    selected: list = []
+    with contextlib.suppress(Exception):
+        # clearAllSelected() also clears boxes, notes, dots and hidden nodes.
+        selected = list(hou.selectedItems(include_hidden=True))
+        if selected:
+            hou.clearAllSelected()
+    try:
+        yield
+    finally:
+        if selected:
+            with contextlib.suppress(Exception):
+                for n in selected:
+                    n.setSelected(True, clear_all_selected=False)

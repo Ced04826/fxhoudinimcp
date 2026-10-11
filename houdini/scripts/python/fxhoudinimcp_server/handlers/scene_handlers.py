@@ -14,9 +14,8 @@ import os
 import hou
 
 # Internal
+from fxhoudinimcp_server.callbacks import press
 from fxhoudinimcp_server.config import (
-    focus_editor_enabled,
-    layout_if_enabled,
     require_inside_project_root,
     update_mode_name,
 )
@@ -27,27 +26,9 @@ from fxhoudinimcp_server.outputs import (
     reported_outputs,
     write_verdict,
 )
+from fxhoudinimcp_server.ui import focus_network_editor as _focus_network_editor
 
 ###### Helpers
-
-
-def _focus_network_editor(node: hou.Node) -> None:
-    """Best-effort: layout the parent network, then pan the editor to *node*."""
-    try:
-        parent = node.parent()
-        if parent is not None:
-            layout_if_enabled(parent)
-        if not focus_editor_enabled():
-            return  # the switch is off: placement only, the panes stay put
-        for pane_tab in hou.ui.paneTabs():
-            if pane_tab.type() == hou.paneTabType.NetworkEditor:
-                if parent is not None:
-                    pane_tab.cd(parent.path())
-                pane_tab.setCurrentNode(node)
-                pane_tab.homeToSelection()
-                return
-    except Exception:
-        pass
 
 
 # Extensions that are really two, so the frame number belongs before both.
@@ -387,7 +368,7 @@ def import_file(
         else:
             container = parent.createNode("alembicarchive", node_name or "alembic_import")
             container.parm("fileName").set(file_path)
-            container.parm("buildHierarchy").pressButton()
+            press(container.parm("buildHierarchy"))  # a Python callback
             created_path = container.path()
     elif ext in (".usd", ".usda", ".usdc", ".usdz"):
         # USD: use a sublayer inside LOP networks, a LOP network elsewhere
@@ -686,6 +667,39 @@ register_handler("scene.redo", redo)
 register_handler("scene.get_scene_info", get_scene_info)
 register_handler("scene.new_scene", new_scene)
 register_handler("scene.save_scene", save_scene)
+
+
+###### scene.write_snapshot
+
+
+def write_snapshot() -> dict:
+    """Write the session as it is now to a temp hip, leaving the session untouched.
+
+    hou.hipFile.save(path) renames the session to path. HScript mwrite -n
+    writes a copy: the session keeps its name and its unsaved-changes flag
+    (checked on 22.0.368), so Houdini still prompts before closing unsaved
+    work. For a separate hython to render the scene as the user sees it.
+    """
+    import tempfile
+    import time
+
+    folder = os.path.join(tempfile.gettempdir(), "fxhoudinimcp")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"snapshot_{time.time_ns() // 1_000_000}.hip").replace("\\", "/")
+    _, error = hou.hscript(f'mwrite -n "{path}"')
+    if error.strip() or not os.path.isfile(path):
+        raise hou.OperationFailed(
+            f"Could not write a snapshot to {path}: {error.strip() or 'no file'}"
+        )
+    return {
+        "snapshot": path,
+        "hip_file": hou.hipFile.path(),
+        "hip_dir": os.path.dirname(hou.hipFile.path()),
+        "houdini_version": hou.applicationVersionString(),
+    }
+
+
+register_handler("scene.write_snapshot", write_snapshot)
 register_handler("scene.load_scene", load_scene)
 register_handler("scene.import_file", import_file)
 register_handler("scene.export_file", export_file)

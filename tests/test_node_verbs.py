@@ -25,6 +25,7 @@ sys.modules.setdefault("hdefereval", MagicMock())
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "houdini", "scripts", "python"))
 
 # Internal
+import fxhoudinimcp_server.callbacks as callbacks  # noqa: E402
 import fxhoudinimcp_server.handlers.graph_handlers as graph  # noqa: E402
 import fxhoudinimcp_server.handlers.node_handlers as nodes  # noqa: E402
 
@@ -213,6 +214,52 @@ class TestPressButton:
         result = nodes.press_button("/obj/geo1/stash1", "stashinput")
         assert "not a Button" in result["note"]
 
+    def _field_with_action(self, monkeypatch, action="import vexpressionmenu"):
+        # A VEXpression field: String, no callback, an action button beside it.
+        node, parm = self._node_with_button(monkeypatch, kind="String")
+        parm.node.return_value = node
+        template = parm.parmTemplate.return_value
+        template.scriptCallback.return_value = ""
+        tags = {"script_action_help": "Create spare parameters"}
+        if action:
+            tags["script_action"] = action
+        template.tags.return_value = tags
+        ran = []
+        monkeypatch.setattr(
+            callbacks, "exec_python_callback", lambda p, script, kwargs: ran.append(script)
+        )
+        return parm, ran
+
+    def test_a_field_without_a_callback_is_refused_and_names_its_action(self, monkeypatch):
+        # pressButton() on it does nothing; this used to answer success.
+        parm, ran = self._field_with_action(monkeypatch)
+        with pytest.raises(ValueError, match=r"does nothing.*Create spare parameters.*action=True"):
+            nodes.press_button("/obj/geo1/stash1", "stashinput")
+        parm.pressButton.assert_not_called()
+        assert ran == []
+
+    def test_a_field_with_no_callback_and_no_action_is_refused(self, monkeypatch):
+        parm, _ = self._field_with_action(monkeypatch, action=None)
+        with pytest.raises(ValueError, match="does nothing. Nothing was run.$"):
+            nodes.press_button("/obj/geo1/stash1", "stashinput")
+        parm.pressButton.assert_not_called()
+
+    def test_action_true_runs_the_script_action(self, monkeypatch):
+        parm, ran = self._field_with_action(monkeypatch)
+        result = nodes.press_button("/obj/geo1/stash1", "stashinput", action=True)
+        assert ran == ["import vexpressionmenu"]
+        parm.pressButton.assert_not_called()
+        assert result["callback_route"] == "action"
+        assert result["action_help"] == "Create spare parameters"
+        assert "note" not in result
+
+    def test_action_true_without_an_action_button_is_refused(self, monkeypatch):
+        parm, ran = self._field_with_action(monkeypatch, action=None)
+        with pytest.raises(ValueError, match="has no action button"):
+            nodes.press_button("/obj/geo1/stash1", "stashinput", action=True)
+        parm.pressButton.assert_not_called()
+        assert ran == []
+
     def test_a_missing_parm_lists_the_buttons(self, monkeypatch):
         self._node_with_button(monkeypatch)
         with pytest.raises(ValueError, match="Buttons on this node: \\['stashinput'\\]"):
@@ -223,3 +270,26 @@ class TestPressButton:
         parm.pressButton.side_effect = RuntimeError("script error")
         with pytest.raises(ValueError, match="Callback of"):
             nodes.press_button("/obj/geo1/stash1", "stashinput")
+
+    def test_the_reply_names_the_route(self, monkeypatch):
+        _, parm = self._node_with_button(monkeypatch)
+        parm.parmTemplate.return_value.scriptCallback.return_value = ""
+        result = nodes.press_button("/obj/geo1/stash1", "stashinput")
+        parm.pressButton.assert_called_once_with()
+        assert result["callback_route"] == "native"
+
+    def test_a_raising_python_callback_is_the_reply_not_a_modal_window(self, monkeypatch):
+        # pressButton() would answer this exception with Houdini's modal "Error
+        # running callback" window and hold the main thread; the bridge runs the
+        # script itself and the exception is this call's error.
+        node, parm = self._node_with_button(monkeypatch)
+        parm.node.return_value = node
+        template = parm.parmTemplate.return_value
+        template.scriptCallback.return_value = "raise RuntimeError('boom')"
+        template.scriptCallbackLanguage.return_value = nodes.hou.scriptLanguage.Python
+        monkeypatch.setattr(nodes.hou, "pwd", lambda: None)
+        monkeypatch.setattr(nodes.hou, "setPwd", lambda _node: None)
+        monkeypatch.setattr(nodes.hou, "undos", MagicMock())
+        with pytest.raises(ValueError, match="stash1/stashinput raised RuntimeError: boom"):
+            nodes.press_button("/obj/geo1/stash1", "stashinput")
+        parm.pressButton.assert_not_called()

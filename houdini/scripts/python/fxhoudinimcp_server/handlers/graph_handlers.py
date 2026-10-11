@@ -32,14 +32,27 @@ from fxhoudinimcp_server.config import (
 )
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
+from fxhoudinimcp_server.handlers.dop_handlers import dop_cache_note
 from fxhoudinimcp_server.handlers.node_handlers import (
     _find_input,
+    _find_output,
     _indirect_input_item,
     _input_table,
+    _output_index,
     _resolve_input_index,
 )
 from fxhoudinimcp_server.handlers.parameter_handlers import (
+    LockedParmError,
+    _clear_expression,
+    _is_locked,
+    _run_callback,
+    _wrapped_expression,
     broken_references,
+    is_ramp_value,
+    locked_message,
+    ramp_from_value,
+    ramp_shape_error,
+    set_whole_expression,
     suggest_parms,
     template_labels,
 )
@@ -274,14 +287,21 @@ def _connectors_of(node: hou.Node) -> dict[str, list[dict[str, Any]]]:
     outputs: list[dict[str, Any]] = []
     names: list[str] = []
     labels: list[str] = []
+    data_types: list[str] = []
     with contextlib.suppress(Exception):
         names = list(node.outputNames())
     with contextlib.suppress(Exception):
         labels = list(node.outputLabels())
+    with contextlib.suppress(Exception):
+        # A VOP's outputs are typed like its inputs: whether a multiply comes
+        # out float or int was answerable for the inputs only.
+        data_types = list(node.outputDataTypes())
     for index, name in enumerate(names):
         entry: dict[str, Any] = {"index": index, "name": name}
         if index < len(labels):
             entry["label"] = labels[index]
+        if index < len(data_types):
+            entry["data_type"] = data_types[index]
         outputs.append(entry)
     return {"inputs": _input_table(node), "outputs": outputs}
 
@@ -348,6 +368,43 @@ def _instance_menu_errors(scratch: hou.Node, node_type, parms: dict, patterns: l
     return problems
 
 
+def _locked_on_build(scratch: hou.Node, node_type, spec: dict) -> dict[str, str]:
+    """Parms of *spec* that will still be locked when the build writes them.
+
+    Replays the spec's parms, in order, on a probe of the type -- callbacks
+    included when the spec asks for run_callbacks -- because the lock is the
+    node's own state: `res_mode` = manual with its callback unlocks
+    resolutiony, the same menu set without it does not. Answers {parm: why};
+    the build is refused before anything is created, instead of rolled back
+    after.
+    """
+    found: dict[str, str] = {}
+    override = bool(spec.get("override_expression"))
+    callbacks = bool(spec.get("run_callbacks"))
+    with hou.undos.disabler():
+        probe = scratch.createNode(node_type.name())
+        try:
+            for name, value in (spec.get("parms") or {}).items():
+                if _expression_value(value) is not None:
+                    continue
+                try:
+                    _apply_parm(probe, name, value, override, callbacks)
+                except LockedParmError as exc:
+                    found[name] = str(exc)
+                except Exception:
+                    pass  # a bad value is reported by the rest of validation
+            for name in _spec_expressions(spec):
+                parm = probe.parm(name)
+                if parm is not None and name not in found:
+                    reason = locked_message(parm)
+                    if reason:
+                        found[name] = reason
+        finally:
+            with contextlib.suppress(Exception):
+                probe.destroy()
+    return found
+
+
 # OBJ-level container to probe each category's types in, where more than one
 # exists (geo and sopnet both hold SOPs). Any other category is found through
 # hou.NodeType.childTypeCategory(), so Cop2, Shop, VopNet and whatever SideFX
@@ -400,11 +457,25 @@ def _definition_stamp(node_type) -> Any:
 
 
 def _is_strict_menu(template) -> bool:
-    """A menu that rejects arbitrary text: an int menu or a "normal" string one."""
-    return template.type() == hou.parmTemplateType.Menu or (
-        template.type() == hou.parmTemplateType.String
-        and template.menuType() == hou.menuType.Normal
-    )
+    """A menu whose value build_network checks against its tokens.
+
+    Houdini itself refuses a value off the menu only on a Menu parm; a String
+    parm with a "normal" menu takes any text on set() (measured on 22.0.429).
+    Such a menu is still checked, because a typo in a token there writes a
+    value nothing reads -- but not on a code field (tag editor = 1), where the
+    menu only inserts snippets and the text is the point: a popforce's
+    VEXpression (localnoiseexpression) was refused as "not a menu item".
+    """
+    if template.type() == hou.parmTemplateType.Menu:
+        return True
+    if template.type() != hou.parmTemplateType.String:
+        return False
+    if template.menuType() != hou.menuType.Normal:
+        return False
+    with contextlib.suppress(Exception):
+        if template.tags().get("editor") == "1":
+            return False
+    return True
 
 
 def _generated_menus_of(node: hou.Node) -> dict[str, dict[str, Any]]:
@@ -445,6 +516,43 @@ def _generated_menus_of(node: hou.Node) -> dict[str, dict[str, Any]]:
     return generated
 
 
+def _radio_folder_sets_of(node: hou.Node) -> dict[str, dict[str, Any]]:
+    """Radio-button folder sets of a live node, as menus of their folders.
+
+    The set's own parameter (`switcher1` on an Add SOP) picks which folder's
+    parameters apply, so it decides the result: an Add with `attrname=id`
+    made 0 primitives under By Pattern and 126 under By Group. The type's
+    template walk skips folders, and the live name is not the template's
+    (`switcher`), so it is read off the probe. Tab folders are left out: they
+    only choose what the parameter pane shows.
+    """
+    sets: dict[str, dict[str, Any]] = {}
+    with contextlib.suppress(Exception):
+        for parm in node.parms():
+            with contextlib.suppress(Exception):
+                template = parm.parmTemplate()
+                if not isinstance(template, hou.FolderSetParmTemplate):
+                    continue
+                if template.folderType() != hou.folderType.RadioButtons:
+                    continue
+                labels = list(template.folderNames())
+                sets[parm.name()] = {
+                    "folder_set": "RadioButtons",
+                    "items": [str(index) for index in range(len(labels))],
+                    "labels": labels,
+                }
+    return sets
+
+
+# Where a probe goes when the category's usual container refuses the type:
+# (OBJ-level container, network inside it). A geometry VOP
+# (`geometryvopglobal::2.0`) fails to match its definition inside a material
+# network ("Error in child VOP 'P'"), and builds inside an Attribute VOP.
+_FALLBACK_PROBE_PARENTS: dict[str, tuple[tuple[str, str], ...]] = {
+    "Vop": (("geo", "attribvop"),),
+}
+
+
 def _connectors_for_type(
     category_name: str,
     node_type,
@@ -460,6 +568,9 @@ def _connectors_for_type(
     undo disabled and without the type's creation scripts (a documentation
     read must not run an asset's OnCreated); it still marks the scene
     modified, as build_network's dry run does, once per type per session.
+    A type the usual container refuses is tried again in the category's
+    fallback parents (_FALLBACK_PROBE_PARENTS); the first failure is the one
+    reported.
     """
     key = (category_name, node_type.name(), _definition_stamp(node_type))
     if key in _CONNECTOR_CACHE:
@@ -473,20 +584,30 @@ def _connectors_for_type(
     root = hou.node("/obj")
     if root is None:
         return None, "/obj does not exist"
-    scratch = None
-    try:
-        with hou.undos.disabler():
-            scratch = root.createNode(container, "fxhoudinimcp_card_probe")
-            probe = scratch.createNode(node_type.name(), run_init_scripts=False)
-            menus = _generated_menus_of(probe)
-            connectors = _connectors_of(probe)
-    except Exception as exc:
-        return None, f"probing {node_type.name()} failed: {readable_message(exc)}"
-    finally:
-        with contextlib.suppress(Exception):
-            if scratch is not None:
-                with hou.undos.disabler():
-                    scratch.destroy()
+    first_error: Exception | None = None
+    for container_type, inner_type in (
+        (container, None),
+        *_FALLBACK_PROBE_PARENTS.get(category_name, ()),
+    ):
+        scratch = None
+        try:
+            with hou.undos.disabler():
+                scratch = root.createNode(container_type, "fxhoudinimcp_card_probe")
+                parent = scratch.createNode(inner_type) if inner_type else scratch
+                probe = parent.createNode(node_type.name(), run_init_scripts=False)
+                menus = _generated_menus_of(probe)
+                menus.update(_radio_folder_sets_of(probe))
+                connectors = _connectors_of(probe)
+            break
+        except Exception as exc:
+            first_error = first_error or exc
+        finally:
+            with contextlib.suppress(Exception):
+                if scratch is not None:
+                    with hou.undos.disabler():
+                        scratch.destroy()
+    else:
+        return None, f"probing {node_type.name()} failed: {readable_message(first_error)}"
     _CONNECTOR_CACHE[key] = (connectors, menus)
     if generated_menus is not None:
         generated_menus.update(menus)
@@ -513,22 +634,23 @@ class _TypeKnowledge(tuple):
         shapes,
         expressions=None,
         scene_menus=False,
+        locked=None,
     ):
         self = super().__new__(cls, (parm_names, tuple_names, menus, instance_patterns, connectors))
         self.shapes = shapes
         self.expressions = expressions if expressions is not None else {}
         self.scene_menus = scene_menus
+        self.locked = locked if locked is not None else {}
         return self
 
 
 def _parm_names_for_type(scratch: hou.Node, node_type) -> _TypeKnowledge:
     """Instantiate a type once to learn its parm names, tuple names, menus,
-    multiparm instance patterns, connectors, per-parameter shapes and factory
-    expressions.
+    multiparm instance patterns, connectors, per-parameter shapes, factory
+    expressions and the parms a fresh node locks.
 
-    The third element maps a strict-menu parm name to its token list. Only
-    menus that reject arbitrary text are recorded (int menus and "normal"
-    string menus); a free-text field with a suggestion menu is not a menu.
+    The third element maps a strict-menu parm name to its token list (see
+    _is_strict_menu); a free-text field with a suggestion menu is not a menu.
     The fourth is what `_instance_patterns` returns, the fifth the probe's
     connectors (the same probe answers both questions, and probing is not
     free). Creation scripts run here on purpose: the build that follows runs
@@ -594,6 +716,16 @@ def _parm_names_for_type(scratch: hou.Node, node_type) -> _TypeKnowledge:
                     parm.name(),
                     {"type": template.type().name(), "components": 1, "is_tuple": False},
                 )
+        # resolutiony on a karmarendersettings: locked until res_mode's
+        # callback unlocks it, so a write to it is refused before the build.
+        locked: dict[str, list[str]] = {}
+        for parm_tuple in probe.parmTuples():
+            with contextlib.suppress(Exception):
+                shut = [p.name() for p in parm_tuple if _is_locked(p)]
+                if shut:
+                    locked[parm_tuple.name()] = shut
+                    for component in shut:
+                        locked[component] = [component]
     finally:
         with contextlib.suppress(Exception):
             probe.destroy()
@@ -603,7 +735,15 @@ def _parm_names_for_type(scratch: hou.Node, node_type) -> _TypeKnowledge:
     with contextlib.suppress(Exception):
         patterns = _instance_patterns(node_type)
     return _TypeKnowledge(
-        parm_names, tuple_names, menus, patterns, connectors, shapes, expressions, scene_menus
+        parm_names,
+        tuple_names,
+        menus,
+        patterns,
+        connectors,
+        shapes,
+        expressions,
+        scene_menus,
+        locked,
     )
 
 
@@ -696,6 +836,7 @@ _SPEC_KEYS = frozenset(
         "color",
         "comment",
         "override_expression",
+        "run_callbacks",
     }
 )
 
@@ -762,7 +903,11 @@ def _spec_expressions(spec: dict) -> dict[str, str]:
 
 
 def _apply_parm(
-    node: hou.Node, name: str, value: Any, override_expression: bool = False
+    node: hou.Node,
+    name: str,
+    value: Any,
+    override_expression: bool = False,
+    run_callbacks: bool = False,
 ) -> dict[str, dict[str, str]]:
     """Set a parm or parm tuple, broadcasting scalars and coercing floats.
 
@@ -773,6 +918,11 @@ def _apply_parm(
     when *override_expression* cleared them first. Nothing is evaluated: an
     eval outside a cook leaves errors on the node that the build's report
     would then pick up.
+
+    A locked component raises LockedParmError before anything is written;
+    *run_callbacks* runs the parm's callback after the write, the way the UI
+    does -- which is what sets and clears such locks. A callback that raised
+    is reported in `callbacks_not_run`.
     """
     parm = node.parm(name)
     parm_tuple = node.parmTuple(name)
@@ -780,14 +930,17 @@ def _apply_parm(
         components = list(parm_tuple) if parm_tuple is not None else []
     else:
         components = [parm]
+    for component in components:
+        reason = locked_message(component)
+        if reason:
+            raise LockedParmError(reason)
     before = {p.name(): e for p in components if (e := _expression_of(p)) is not None}
     report: dict[str, dict[str, str]] = {}
     through: dict[str, str] = {}
     if before and override_expression:
         for component in components:
             if component.name() in before:
-                with contextlib.suppress(Exception):
-                    component.deleteAllKeyframes()
+                _clear_expression(component)
         report["expressions_removed"] = before
     elif before:
         through = {
@@ -795,11 +948,18 @@ def _apply_parm(
             for p in components
             if p.name() in before and (target := _referenced_parm(p)) is not None
         }
-    _set_parm_value(name, parm, parm_tuple, value)
+    wrapped = _set_parm_value(name, parm, parm_tuple, value)
+    callback = _run_callback(components[0]) if run_callbacks and components else None
+    if callback is not None:
+        # Keyed the way the other report kinds are: {parm: detail}.
+        if callback["run"]:
+            report["callbacks_run"] = {name: True}
+        else:
+            report["callbacks_not_run"] = {name: callback.get("error")}
     if before and not override_expression:
         for component in components:
             after = _expression_of(component)
-            if after is None or component.name() not in before:
+            if after is None or component.name() not in before or component.name() in wrapped:
                 continue
             if component.name() in through:
                 report.setdefault("written_through", {})[component.name()] = through[
@@ -810,17 +970,34 @@ def _apply_parm(
     return report
 
 
-def _set_parm_value(name: str, parm, parm_tuple, value: Any) -> None:
-    """The plain write behind _apply_parm."""
+def _set_parm_value(name: str, parm, parm_tuple, value: Any) -> set[str]:
+    """The plain write behind _apply_parm.
+
+    Answers the components given an ``{"expr": ...}`` instead of a literal.
+    """
     if isinstance(value, (list, tuple)):
         if parm_tuple is None:
             raise ValueError(f"'{name}' is not a parm tuple")
         if len(value) != len(parm_tuple):
             raise ValueError(f"'{name}' has {len(parm_tuple)} components, got {len(value)}")
+        wrapped = {i: found for i, v in enumerate(value) if (found := _wrapped_expression(v))}
+        if wrapped:
+            # One component as an expression, the rest literals: ParmTuple.set()
+            # took none of it and answered with its SWIG overload list.
+            for index, component in enumerate(parm_tuple):
+                if index in wrapped:
+                    set_whole_expression(component, *wrapped[index])
+                else:
+                    literal = value[index]
+                    is_number = isinstance(literal, (int, float))
+                    component.set(float(literal) if is_number else literal)
+            return {parm_tuple[index].name() for index in wrapped}
         if all(isinstance(v, (int, float)) for v in value):
             parm_tuple.set([float(v) for v in value])
         else:
             parm_tuple.set(list(value))
+    elif parm is not None and is_ramp_value(value):
+        parm.set(ramp_from_value(parm, value))
     elif parm is not None:
         parm.set(value)
     elif parm_tuple is not None:
@@ -831,6 +1008,23 @@ def _set_parm_value(name: str, parm, parm_tuple, value: Any) -> None:
             parm_tuple.set([value] * len(parm_tuple))
     else:
         raise ValueError(f"parameter '{name}' not found")
+    return set()
+
+
+def _source_output(value: Any) -> int | str:
+    """An output index, or an output name to be resolved against the source.
+
+    A name ("v" on a VOP global, "P") used to die on a bare int() with
+    "invalid literal for int()", in a dry run too.
+    """
+    if isinstance(value, bool):
+        raise ValueError(f"source_output must be an output index or name, got {value!r}")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    text = str(value).strip()
+    return int(text) if text.lstrip("-").isdigit() else text
 
 
 def _indirect_key(number: int) -> str:
@@ -1449,12 +1643,22 @@ def build_network(
             expressions (dict): parm name -> expression, as a whole block
                 (alias: exprs). Names are validated like those in `parms`.
             override_expression (bool): clear the expressions that literals
-                in `parms` land on, so the literals take.
+                in `parms` land on, so the literals take. Parms are written
+                in the order given.
+            run_callbacks (bool): run each parm's callback after its write, as
+                the UI does. A LOCKED parm (karmarendersettings resolutiony
+                under res_mode autoheight) is refused at validation, nothing
+                built, with the lock's controlling menu named in
+                `locked_parms`; its callback is what unlocks it, so
+                {"res_mode": "manual", "resolution": [...]} with
+                run_callbacks: true builds.
             inputs (list): wiring. Entries are either a source string
                 (wired positionally), null (holds the position without
                 connecting anything), or {"index" | "input_name", "source",
                 "source_output"}; "input_name" is a connector name or
-                label, as get_node_card lists them, and wins over "index".
+                label, as get_node_card lists them, and wins over "index";
+                "source_output" is an output index or an output name or
+                label ("v", "P").
                 Sources resolve to spec node names first, then children of
                 parent, then absolute paths. {"indirect_input": n} instead
                 of "source" wires from connector n of the parent subnet
@@ -1614,6 +1818,8 @@ def build_network(
             multiparm_info[type_name] = _multiparm_blocks(resolved_types[type_name])
         return multiparm_info[type_name]
 
+    # Parms a spec would write while they are still locked, per spec label.
+    locked_parms: dict[str, dict[str, str]] = {}
     # Connectors of a spec that names an input and sets parms, probed with
     # those parms applied (see _probe_connectors). Not cached: the parms
     # decide the answer.
@@ -1626,7 +1832,16 @@ def build_network(
         and spec.get("parms")
         and _names_an_input(spec)
     ]
-    if unknown_types or connector_probes:
+
+    def aims_at_locked(spec: Any) -> bool:
+        """Whether *spec* writes a parm a fresh node of its type locks."""
+        knowledge = parm_knowledge.get(spec.get("type")) if isinstance(spec, dict) else None
+        if knowledge is None:
+            return False
+        aimed = set(spec.get("parms") or {}) | set(_spec_expressions(spec))
+        return any(name in knowledge.locked for name in aimed)
+
+    if unknown_types or connector_probes or any(aims_at_locked(spec) for spec in nodes):
         # A probe that stole the display flag or the selection leaves the user
         # looking at something else, and a dry run must leave no trace at all.
         before_probing = _network_flags(parent)
@@ -1641,12 +1856,31 @@ def build_network(
                     resolved_types[spec["type"]],
                     dict(_count_parms_first(spec["parms"], multiparms_of(spec["type"]))),
                 )
+            for index, spec in enumerate(nodes):
+                # A lock is the node's own state, so a spec that writes a parm
+                # a fresh node locks is replayed in order on a probe of its
+                # own -- with its callbacks when it asks for run_callbacks,
+                # since those are what clear the lock. Only such a spec: the
+                # replay runs the spec's real callbacks, dry run included, and
+                # a callback's effects outside the probe cannot be undone.
+                node_type = resolved_types.get(spec.get("type")) if isinstance(spec, dict) else None
+                if node_type is not None and aims_at_locked(spec):
+                    found = _locked_on_build(parent, node_type, spec)
+                    if found:
+                        label = spec.get("name") or spec.get("type") or f"#{index}"
+                        locked_parms[label] = found
         finally:
             _restore_network_flags(before_probing)
 
     # Parsed inputs are kept so the build wires exactly what validation
     # approved, rather than re-deriving it from the spec a second way.
     parsed_inputs: list[list[dict[str, Any]]] = []
+
+    # Refused here, before the build: a locked parm used to fail the build
+    # halfway and roll back every node, the ones before it included.
+    for label, found in locked_parms.items():
+        for parm_name, reason in found.items():
+            errors.append(f"node {label}: parm '{parm_name}': {reason}")
 
     # The parent's input connectors, listed once per build rather than once
     # per entry that uses one.
@@ -1662,6 +1896,18 @@ def build_network(
             listed.append(connectors)
         return listed[0]
 
+    def _source_outputs(source: Any) -> list | None:
+        """Output connectors of an input source, or None when they cannot be known."""
+        for position, other in enumerate(nodes):
+            if isinstance(other, dict) and other.get("name") == source:
+                connectors = spec_connectors.get(position)
+                knowledge = parm_knowledge.get(other.get("type"))
+                if connectors is None and knowledge:
+                    connectors = knowledge[4]
+                return None if connectors is None else connectors.get("outputs", [])
+        node = parent.node(str(source)) or hou.node(str(source))
+        return None if node is None else _connectors_of(node)["outputs"]
+
     # Literals the spec aims at parms whose factory expression will outlive
     # them, named before anything is built.
     in_the_way: dict[str, dict[str, dict[str, str]]] = {}
@@ -1674,6 +1920,8 @@ def build_network(
         if knowledge and not spec.get("override_expression"):
             shipped = knowledge.expressions
             for parm_name, value in (spec.get("parms") or {}).items():
+                if parm_name in locked_parms.get(label, {}):
+                    continue  # refused as locked; an expression note would mislead
                 if _expression_value(value) is None and parm_name in shipped:
                     in_the_way.setdefault(label, {})[parm_name] = shipped[parm_name]
         if knowledge:
@@ -1694,7 +1942,30 @@ def build_network(
                 hint = f" Did you mean: {close}?" if close else ""
                 errors.append(f"node {label}: no parm '{parm_name}' to put an expression on.{hint}")
             for parm_name, parm_value in (spec.get("parms") or {}).items():
-                if isinstance(parm_value, dict):
+                if isinstance(parm_value, (list, tuple)):
+                    for position, component in enumerate(parm_value):
+                        try:
+                            _wrapped_expression(component)
+                        except ValueError as exc:
+                            errors.append(
+                                f"node {label}: parm '{parm_name}' component {position}: {exc}"
+                            )
+                if is_ramp_value(parm_value):
+                    # A whole ramp, written as one value; on any other parm a
+                    # dict is an expression. An unknown name is caught below.
+                    kind = (knowledge.shapes.get(parm_name) or {}).get("type")
+                    if kind is not None and kind != "Ramp":
+                        errors.append(
+                            f"node {label}: parm '{parm_name}' is {kind}, not a ramp; "
+                            f'a dict for it is an expression, {{"expr": ...}}.'
+                        )
+                        continue
+                    if kind == "Ramp":
+                        if problem := ramp_shape_error(parm_value):
+                            errors.append(f"node {label}: parm '{parm_name}': {problem}")
+                        # The shape check below takes scalars and tuples only.
+                        continue
+                elif isinstance(parm_value, dict):
                     # An expression wrapper; its parm name was checked above,
                     # and a shape check would refuse any dict as "not a value".
                     unknown = sorted(set(parm_value) - {"expr", "language"})
@@ -1802,9 +2073,29 @@ def build_network(
                     f"node {label}: input source '{source}' is not a spec "
                     f"node, a child of {parent_path}, or an absolute path"
                 )
+        for entry in parsed:
+            if entry["source"] is None or not isinstance(entry["source_output"], str):
+                continue
+            # An output name is resolved here, on what the source exposes
+            # (a spec node's probed connectors, or a live node's), so a
+            # typo fails the dry run, not the build.
+            outputs = _source_outputs(entry["source"])
+            if outputs is not None:
+                try:
+                    _find_output(outputs, entry["source_output"])
+                except ValueError as exc:
+                    errors.append(f"node {label}: input source '{entry['source']}' {exc}")
 
     if errors:
-        return {"success": False, "valid": False, "errors": errors, "created": []}
+        reply: dict[str, Any] = {
+            "success": False,
+            "valid": False,
+            "errors": errors,
+            "created": [],
+        }
+        if locked_parms:
+            reply["locked_parms"] = locked_parms
+        return reply
     if dry_run:
         result = {
             "success": True,
@@ -1856,11 +2147,12 @@ def build_network(
             ordered = (
                 _count_parms_first(spec_parms, multiparms_of(spec["type"])) if spec_parms else []
             )
+            callbacks = bool(spec.get("run_callbacks"))
             for parm_name, value in ordered:
                 if _expression_value(value) is not None:
                     continue  # an {"expr": ...} value, set with the expressions below
                 try:
-                    written = _apply_parm(node, parm_name, value, override)
+                    written = _apply_parm(node, parm_name, value, override, callbacks)
                 except Exception as exc:
                     items = []
                     with contextlib.suppress(Exception):
@@ -1915,6 +2207,9 @@ def build_network(
                         f"{node.path()} input {entry['index']}: source "
                         f"'{source_name}' no longer exists"
                     )
+                # An output name resolves on the live source, as the dry run
+                # checked it; the read-back compares indices.
+                entry["source_output"] = _output_index(source, entry["source_output"])
                 node.setInput(entry["index"], source, entry["source_output"])
                 # The path, not the name: what the read-back will report.
                 entry["source_path"] = source.path()
@@ -2194,20 +2489,59 @@ def build_network(
             f"into the parameter each one reads, not into itself: {through}. Pass "
             f"override_expression: true on the spec to break the link instead."
         )
+    not_run = {
+        path: found["callbacks_not_run"]
+        for path, found in parm_reports.items()
+        if found.get("callbacks_not_run")
+    }
+    if not_run:
+        result["callbacks_not_run"] = not_run
+        warnings.append(
+            f"Callbacks asked for with run_callbacks did not go through: {not_run}. "
+            f"The values were written; what the callback would have done was not."
+        )
     if warnings:
         result["warning"] = " ".join(warnings)
+    if cache := dop_cache_note(created.values()):
+        result["simulation_cache"] = cache
     return result
 
 
 ###### graph.verify_network
 
 
-def verify_network(parent_path: str, **_: Any) -> dict:
+def _needs_to_cook(node: hou.Node) -> bool:
+    with contextlib.suppress(Exception):
+        return bool(node.needsToCook())
+    return False
+
+
+def _has_errors(node: hou.Node) -> bool:
+    with contextlib.suppress(Exception):
+        return bool(node.errors())
+    return False
+
+
+def verify_network(parent_path: str, force_cook: bool = False, **_: Any) -> dict:
     """Inspect every node in a network: the 'middle-click everything' pass.
 
     Cooks the display node, then reports per-node errors/warnings/flags
     plus cooked-geometry evidence, so claims about a build can be checked
     against reality in one call.
+
+    `node.errors()` is the verdict of the node's last cook. A node off the
+    display chain whose cause of failure was fixed since (a File SOP given
+    a path that now exists) keeps listing the old error until something
+    cooks it. Such a node, one with errors that needs a cook, is marked
+    `stale` and named in `stale_error_nodes`.
+
+    `force_cook=True` cooks the display node with force and recooks every
+    node that has errors before the report is taken, so the verdict is about
+    the network as it is now. Every erroring node, not only the dirty ones:
+    an error left by evaluating a parameter outside a cook does not mark the
+    node dirty, and only a forced cook of that node clears it. The default
+    cooks the display node only, as before, so a heavy scene is not
+    recooked without being asked.
     """
     parent = hou.node(parent_path)
     if parent is None:
@@ -2222,28 +2556,55 @@ def verify_network(parent_path: str, **_: Any) -> dict:
         )
     if display is not None:
         with contextlib.suppress(hou.OperationFailed):
-            display.cook(force=False)
+            display.cook(force=bool(force_cook))
+
+    children = list(parent.children())
+    # Recook before any report is taken: a recook cooks the node's inputs
+    # too, so a report taken earlier in the same loop could be out of date.
+    recooked = set()
+    if force_cook:
+        for child in children:
+            if _has_errors(child):
+                with contextlib.suppress(hou.OperationFailed):
+                    child.cook(force=True)
+                recooked.add(child.path())
 
     reports = []
-    for child in parent.children():
+    stale_nodes = []
+    for child in children:
         report = _node_report(child)
+        if child.path() in recooked:
+            report["recooked"] = True
+        # _has_errors, not report["errors"]: those also list dangling ch()
+        # references, which no recook fixes.
+        elif _has_errors(child) and _needs_to_cook(child):
+            report["stale"] = True
+            stale_nodes.append(child.path())
         if getattr(child, "isDisplayFlagSet", lambda: False)():
             report["display"] = True
         reports.append(report)
 
     error_nodes = [r["path"] for r in reports if r.get("errors")]
     licensing = license_error([e for r in reports for e in r.get("errors", ())])
-    return {
+    result = {
         "parent_path": parent_path,
         "node_count": len(reports),
         "display_node": display.path() if display is not None else None,
         "geometry": _geometry_summary(display) if display is not None else None,
         "error_nodes": error_nodes,
+        "stale_error_nodes": stale_nodes,
         "healthy": not error_nodes,
         # Named apart from the rest because no scene change fixes it.
         "license_error": licensing,
+        "force_cook": bool(force_cook),
         "nodes": reports,
     }
+    if stale_nodes:
+        result["note"] = (
+            "Errors on stale nodes are from a cook that predates their last change; "
+            "call verify_network(force_cook=True) to recook them before judging."
+        )
+    return result
 
 
 ###### graph.get_node_card
@@ -2387,10 +2748,31 @@ def get_node_card(
             entry["multiparm_instance"] = True
         with contextlib.suppress(Exception):
             entry["default"] = list(template.defaultValue())
+        with contextlib.suppress(Exception):
+            # A Time Shift is created with frame = $F; `default: [0.0]` alone
+            # read as "a plain 0", and only a build's expressions_removed
+            # told otherwise.
+            # Toggle and Menu templates return one string, the others a
+            # tuple; the whole tuple is kept so a "" says which component
+            # has no expression. A toggle's "on"/"off" is its value spelt out
+            # (41 "off", 26 "on" across ten SOP types on 22.0), as in
+            # parameter_handlers._default_of.
+            expressions = template.defaultExpression()
+            if isinstance(expressions, str):
+                expressions = ("" if expressions in ("on", "off") else expressions,)
+            if any(expressions):
+                entry["default_expression"] = list(expressions)
         items: list[str] = []
         menu_source = "template"
         with contextlib.suppress(Exception):
             items = list(template.menuItems())
+        with contextlib.suppress(Exception):
+            labels = list(template.menuLabels())
+            # Tokens alone were "0", "1", "2" for pyrosource's Mode, and the
+            # labels (Surface Scatter, Keep Input, Volume Scatter) took a
+            # script to read. Sent only when they say more than the tokens.
+            if items and labels and labels != items:
+                entry["menu_labels"] = labels[:_MENU_CAP]
         generated = generated_menus.get(name)
         if not items and generated:
             # The template has no items because a script computes them
@@ -2425,6 +2807,38 @@ def get_node_card(
                 entry["menu_truncated"] = True
                 entry["menu_count"] = len(items)
         parms.append(entry)
+
+    # Radio folder sets are parameters the template walk does not reach: it
+    # skips folders, and with them the parameter that picks one (an Add SOP's
+    # By Pattern / By Group, `switcher1`).
+    for name, found in generated_menus.items():
+        if found.get("folder_set") is None:
+            continue
+        labels = found.get("labels") or []
+        if (
+            parm_filter
+            and parm_filter.lower() not in name.lower()
+            and not any(parm_filter.lower() in label.lower() for label in labels)
+        ):
+            continue
+        matched += 1
+        if len(parms) >= _PARM_CAP:
+            truncated = True
+            omitted.append(name)
+            continue
+        parms.append(
+            {
+                "name": name,
+                "label": " / ".join(labels),
+                "type": "FolderSet",
+                "size": 1,
+                "default": [0],
+                "menu": found["items"],
+                "menu_labels": labels,
+                "menu_source": "folder_set",
+                "note": "Radio folders: the index picks which folder's parameters apply.",
+            }
+        )
 
     # Multiparm blocks, which are the reason a parameter can be real and yet
     # findable under no name the caller can guess: the folder's own name is the
@@ -2676,6 +3090,14 @@ def _shape(row: dict[str, Any]) -> tuple:
     return row.get("points"), row.get("prims"), json.dumps(row.get("bbox"))
 
 
+def _cook_was_interrupted(node: hou.Node) -> bool:
+    """Whether *node*'s last cook failed because the artist pressed Esc."""
+    try:
+        return any("cooking was interrupted" in e.lower() for e in node.errors())
+    except hou.OperationFailed:
+        return False
+
+
 def cook_frame_range(
     node_path: str,
     start: float | None = None,
@@ -2693,6 +3115,13 @@ def cook_frame_range(
 
     The frame is left at the last one cooked, because that is what stepping a
     solver means; the caller usually wants to screenshot or read it afterwards.
+
+    There is no deadline: the range runs under Houdini's progress bar, and when
+    it is stopped from there the frames cooked so far come back with
+    ``interrupted``. A node that keeps its own cache across frames (Trail, a
+    SOP Solver) starts from what it already holds: press its reset button
+    (press_button, e.g. Trail's ``clear``) or reset_simulation first, then
+    cook from the first frame.
 
     Args:
         node_path: Node to cook. Its output is what gets measured.
@@ -2729,38 +3158,63 @@ def cook_frame_range(
     total_ms = 0.0
     first_error_frame: float | None = None
 
-    for index in range(count):
-        frame = start + index * step
-        hou.setFrame(frame)
-        began = time.time()
-        try:
-            node.cook(force=False)
-            cook_error = None
-        except hou.OperationFailed as exc:
-            # A cook failure is data, not a reason to abandon the range: a solver
-            # that fails on one frame and recovers is exactly what the caller is
-            # trying to see.
-            cook_error = str(exc).splitlines()[0][:200]
-        elapsed_ms = round((time.time() - began) * 1000, 1)
-        total_ms += elapsed_ms
+    interrupted_at: float | None = None
+    # No deadline (dispatcher): a heavy sim takes as long as it takes, so the
+    # range runs under Houdini's progress bar and is stopped from there; the
+    # frames cooked by then are the answer.
+    with hou.InterruptableOperation(
+        "Cooking frames",
+        long_operation_name=f"cook_frame_range {node_path}",
+        open_interrupt_dialog=True,
+    ) as operation:
+        for index in range(count):
+            frame = start + index * step
+            try:
+                operation.updateLongProgress(
+                    index / count, f"Frame {frame:g} ({index + 1}/{count})"
+                )
+            except hou.OperationInterrupted:
+                interrupted_at = frame
+                break
+            hou.setFrame(frame)
+            began = time.time()
+            try:
+                node.cook(force=False)
+                cook_error = None
+            except hou.OperationInterrupted:
+                interrupted_at = frame
+                break
+            except hou.OperationFailed as exc:
+                # Esc during the cook is not OperationInterrupted: measured on
+                # 22.0, cook() raised a bare OperationFailed and the node said
+                # "Cooking was interrupted.", which read as a failed frame.
+                if _cook_was_interrupted(node):
+                    interrupted_at = frame
+                    break
+                # A cook failure is data, not a reason to abandon the range: a solver
+                # that fails on one frame and recovers is exactly what the caller is
+                # trying to see.
+                cook_error = str(exc).splitlines()[0][:200]
+            elapsed_ms = round((time.time() - began) * 1000, 1)
+            total_ms += elapsed_ms
 
-        row: dict[str, Any] = {"frame": frame, "cook_ms": elapsed_ms}
-        if cook_error:
-            row["cook_error"] = cook_error
-        with contextlib.suppress(hou.OperationFailed):
-            # Only when there are any: an empty pair per frame is most of a
-            # 240-frame answer.
-            if errors := [e.splitlines()[0][:200] for e in node.errors()]:
-                row["errors"] = errors
-            if warnings := [w.splitlines()[0][:200] for w in node.warnings()]:
-                row["warnings"] = warnings
-        if row.get("errors") and first_error_frame is None:
-            first_error_frame = frame
-        try:
-            row.update(_frame_measurement(node, attribs, volumes))
-        except hou.OperationFailed as exc:
-            row["measure_error"] = str(exc).splitlines()[0][:200]
-        frames.append(row)
+            row: dict[str, Any] = {"frame": frame, "cook_ms": elapsed_ms}
+            if cook_error:
+                row["cook_error"] = cook_error
+            with contextlib.suppress(hou.OperationFailed):
+                # Only when there are any: an empty pair per frame is most of a
+                # 240-frame answer.
+                if errors := [e.splitlines()[0][:200] for e in node.errors()]:
+                    row["errors"] = errors
+                if warnings := [w.splitlines()[0][:200] for w in node.warnings()]:
+                    row["warnings"] = warnings
+            if row.get("errors") and first_error_frame is None:
+                first_error_frame = frame
+            try:
+                row.update(_frame_measurement(node, attribs, volumes))
+            except hou.OperationFailed as exc:
+                row["measure_error"] = str(exc).splitlines()[0][:200]
+            frames.append(row)
 
     shown = _thin_frame_rows(frames)
     result: dict[str, Any] = {
@@ -2779,6 +3233,13 @@ def cook_frame_range(
         "current_frame": hou.frame(),
         "frames": shown,
     }
+    if interrupted_at is not None:
+        result["interrupted"] = True
+        result["interrupted_at_frame"] = interrupted_at
+        result["interrupted_note"] = (
+            f"Stopped from Houdini's progress bar at frame {interrupted_at:g}; the rows "
+            "above are the frames cooked before that."
+        )
     if frames:
         slowest = max(frames, key=lambda row: row["cook_ms"])
         result["slowest_frame"] = {"frame": slowest["frame"], "cook_ms": slowest["cook_ms"]}

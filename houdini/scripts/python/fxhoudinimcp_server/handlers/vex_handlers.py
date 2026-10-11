@@ -15,9 +15,9 @@ import re
 import hou
 
 # Internal
-from fxhoudinimcp_server.config import focus_editor_enabled, layout_if_enabled
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
+from fxhoudinimcp_server.ui import focus_network_editor as _focus_network_editor
 
 ###### Helpers
 
@@ -90,25 +90,6 @@ def _reverse_class_label(node: hou.Node) -> str | None:
         if (item.isdigit() and int(item) == value) or idx == value:
             return labels[idx] if idx < len(labels) else str(value)
     return str(value)
-
-
-def _focus_network_editor(node: hou.Node) -> None:
-    """Best-effort: layout the parent network, then pan the editor to *node*."""
-    try:
-        parent = node.parent()
-        if parent is not None:
-            layout_if_enabled(parent)
-        if not focus_editor_enabled():
-            return  # the switch is off: placement only, the panes stay put
-        for pane_tab in hou.ui.paneTabs():
-            if pane_tab.type() == hou.paneTabType.NetworkEditor:
-                if parent is not None:
-                    pane_tab.cd(parent.path())
-                pane_tab.setCurrentNode(node)
-                pane_tab.homeToSelection()
-                return
-    except Exception:
-        pass
 
 
 # Regex pattern for detecting absolute channel paths in VEX code

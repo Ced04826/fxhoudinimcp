@@ -90,10 +90,12 @@ NO_FAILURE_INPUT: dict[str, str] = {
     "code.get_file_references": "only an optional filter flag; an empty scene is a valid answer",
     "context.get_scene_summary": "takes nothing; summarises whatever is loaded",
     "context.get_selection": "takes nothing; an empty selection is a valid answer",
+    "code.reload_plugin": "takes nothing; a module that fails to import is reported, not input",
     "cops.list_cop_node_types": "only an optional filter; matching nothing is valid",
     "rendering.list_render_nodes": "takes nothing; an empty /out is a valid answer",
     "scene.get_scene_info": "takes nothing; always describes the current scene",
     "scene.new_scene": "only an optional save flag",
+    "scene.write_snapshot": "takes nothing; an unwritable temp dir is the only failure, not input",
     "takes.get_current_take": "takes nothing; there is always a current take",
     "takes.list_takes": "takes nothing; the main take always exists",
 }

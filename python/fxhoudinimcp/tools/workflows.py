@@ -158,7 +158,7 @@ async def setup_vellum_sim(
 @mcp.tool()
 async def create_material(
     ctx: Context,
-    name: str = "material1",
+    name: str | None = None,
     mat_type: str = "principled",
     base_color: list[float] | None = None,
     roughness: float = 0.5,
@@ -168,7 +168,8 @@ async def create_material(
     """Create a material in /mat with configurable surface properties.
 
     Args:
-        name: Material node name.
+        name: Material node name; refused if taken. Default: material1,
+            numbered up when that exists.
         mat_type: Material type ("principled", "materialx").
         base_color: [R, G, B] base color, 0-1 per channel.
         roughness: Surface roughness, 0-1.
@@ -177,12 +178,13 @@ async def create_material(
     """
     bridge = _get_bridge(ctx)
     params: dict = {
-        "name": name,
         "mat_type": mat_type,
         "roughness": roughness,
         "metallic": metallic,
         "opacity": opacity,
     }
+    if name is not None:
+        params["name"] = name
     if base_color is not None:
         params["base_color"] = base_color
     return await bridge.execute("workflow.create_material", params)

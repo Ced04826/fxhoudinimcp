@@ -101,7 +101,7 @@ class TestDispatch:
 
 
 class TestCommandTimeout:
-    """FXHOUDINIMCP_TIMEOUT_<COMMAND>, then FXHOUDINIMCP_TIMEOUT, then the default."""
+    """FXHOUDINIMCP_TIMEOUT_<COMMAND>, then no deadline, then FXHOUDINIMCP_TIMEOUT, then the default."""
 
     def test_default(self, monkeypatch):
         monkeypatch.delenv("FXHOUDINIMCP_TIMEOUT", raising=False)
@@ -117,6 +117,20 @@ class TestCommandTimeout:
         monkeypatch.setenv("FXHOUDINIMCP_TIMEOUT_TOPS_COOK_TOP_NODE", "900")
         assert _disp.command_timeout("tops.cook_top_node") == 900.0
         assert _disp.command_timeout("nodes.create_node") == 5.0
+
+    @pytest.mark.parametrize(
+        "command", ["cache.write_cache", "rendering.start_render", "nodes.press_button"]
+    )
+    def test_global_does_not_put_a_deadline_back(self, monkeypatch, command):
+        # `fxhoudinimcp install` writes FXHOUDINIMCP_TIMEOUT=120 into the package.
+        monkeypatch.setenv("FXHOUDINIMCP_TIMEOUT", "120")
+        assert _disp.command_timeout(command) is None
+        assert _disp.command_timeout("nodes.create_node") == 120.0
+
+    def test_per_command_still_puts_one_back(self, monkeypatch):
+        monkeypatch.setenv("FXHOUDINIMCP_TIMEOUT", "120")
+        monkeypatch.setenv("FXHOUDINIMCP_TIMEOUT_CACHE_WRITE_CACHE", "900")
+        assert _disp.command_timeout("cache.write_cache") == 900.0
 
     @pytest.mark.parametrize("bad", ["soon", "0", "-3", " "])
     def test_garbage_falls_through(self, monkeypatch, bad):
@@ -144,6 +158,19 @@ class TestCommandTimeout:
         assert result["status"] == "error"
         assert result["error"]["code"] == "TIMEOUT"
         assert "FXHOUDINIMCP_TIMEOUT_SLOW_CMD" in result["error"]["message"]
+
+    def test_a_base_exception_from_the_main_thread_is_named(self, monkeypatch):
+        """A KeyboardInterrupt used to leave the caller a bare KeyError 'result'."""
+        monkeypatch.setattr(_disp, "HAS_HDEFEREVAL", True)
+        fake = MagicMock()
+        fake.executeInMainThreadWithResult.side_effect = KeyboardInterrupt()
+        monkeypatch.setattr(_disp, "hdefereval", fake)
+        _handler_registry.clear()
+        register_handler("any.cmd", lambda: {"ok": True})
+        result = dispatch("any.cmd", {})
+        assert result["status"] == "error"
+        assert result["error"]["code"] == "DISPATCH_ERROR"
+        assert "KeyboardInterrupt" in result["error"]["message"]
 
 
 class TestUndoGroup:

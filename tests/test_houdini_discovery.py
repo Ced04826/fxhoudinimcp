@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
-from run_integration import find_all_hython  # noqa: E402
+from fxhoudinimcp.houdini_discovery import find_all_hython  # noqa: E402
 
 # install directory name -> path of the interpreter inside it
 _LAYOUTS = {
@@ -45,7 +45,9 @@ def _make_install(root: Path, layout: str) -> Path:
 def isolated(monkeypatch, tmp_path):
     """Point discovery at tmp_path only, with no $HFS leaking in."""
     monkeypatch.delenv("HFS", raising=False)
-    monkeypatch.setattr("run_integration._search_patterns", lambda: [f"{tmp_path.as_posix()}/*"])
+    monkeypatch.setattr(
+        "fxhoudinimcp.houdini_discovery._search_patterns", lambda: [f"{tmp_path.as_posix()}/*"]
+    )
     return tmp_path
 
 
@@ -84,7 +86,9 @@ def test_overlapping_patterns_yield_one_entry(monkeypatch, tmp_path):
     monkeypatch.delenv("HFS", raising=False)
     expected = _make_install(tmp_path, "windows")
     pattern = f"{tmp_path.as_posix()}/*"
-    monkeypatch.setattr("run_integration._search_patterns", lambda: [pattern, pattern])
+    monkeypatch.setattr(
+        "fxhoudinimcp.houdini_discovery._search_patterns", lambda: [pattern, pattern]
+    )
 
     assert find_all_hython() == [expected]
 
@@ -97,7 +101,7 @@ def test_hfs_is_searched(monkeypatch, tmp_path):
     hython.write_text("", encoding="utf-8")
 
     monkeypatch.setenv("HFS", str(hython.parent.parent))
-    monkeypatch.setattr("run_integration._search_patterns", lambda: [])
+    monkeypatch.setattr("fxhoudinimcp.houdini_discovery._search_patterns", lambda: [])
 
     assert find_all_hython() == [hython]
 
@@ -105,7 +109,9 @@ def test_hfs_is_searched(monkeypatch, tmp_path):
 def test_hfs_does_not_duplicate_a_pattern_hit(monkeypatch, tmp_path):
     expected = _make_install(tmp_path, "linux")
     monkeypatch.setenv("HFS", str(expected.parent.parent))
-    monkeypatch.setattr("run_integration._search_patterns", lambda: [f"{tmp_path.as_posix()}/*"])
+    monkeypatch.setattr(
+        "fxhoudinimcp.houdini_discovery._search_patterns", lambda: [f"{tmp_path.as_posix()}/*"]
+    )
 
     assert find_all_hython() == [expected]
 
@@ -122,7 +128,7 @@ def test_no_installs_returns_empty(isolated):
 def test_programfiles_is_honoured(monkeypatch, tmp_path):
     """A Windows install on another drive must still be found."""
     monkeypatch.setenv("PROGRAMFILES", str(tmp_path / "D_drive"))
-    from run_integration import _search_patterns
+    from fxhoudinimcp.houdini_discovery import _search_patterns
 
     patterns = _search_patterns()
     assert any(str(tmp_path / "D_drive").replace("\\", "/") in p for p in patterns)
@@ -131,7 +137,7 @@ def test_programfiles_is_honoured(monkeypatch, tmp_path):
 
 
 def test_every_supported_platform_has_a_pattern():
-    from run_integration import _search_patterns
+    from fxhoudinimcp.houdini_discovery import _search_patterns
 
     joined = " ".join(_search_patterns())
     assert "Side Effects Software" in joined, "no Windows pattern"

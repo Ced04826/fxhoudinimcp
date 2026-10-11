@@ -18,7 +18,14 @@ import hou
 
 # Internal
 from fxhoudinimcp_server.dispatcher import register_handler
-from fxhoudinimcp_server.ui import require_ui, set_other_objects
+from fxhoudinimcp_server.ui import (
+    keep_viewer_state,
+    require_ui,
+    selection_hidden,
+    set_other_objects,
+    viewer_context,
+    viewer_stays_out_of_dops,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -359,17 +366,65 @@ def set_viewport_camera(
 ###### viewport.set_viewport_display
 
 
+# color_scheme's spellings, mapped to hou.viewportColorScheme names.
+_COLOR_SCHEMES = {
+    "dark": "Dark",
+    "darkgrey": "DarkGrey",
+    "dark_grey": "DarkGrey",
+    "grey": "Grey",
+    "gray": "Grey",
+    "light": "Light",
+}
+
+
 def set_viewport_display(
-    display_mode: str,
+    display_mode: str = None,
     pane_name: str = None,
+    environment_background: bool = None,
+    reference_plane: bool = None,
+    point_size: float = None,
+    color_scheme: str = None,
 ) -> dict:
-    """Set the viewport display/shading mode.
+    """Set how the viewport draws: shading, background, grid, point size, colours.
 
     Args:
         display_mode: One of 'wireframe', 'shaded', 'smooth', 'smooth_wire',
             'hidden_line', 'flat', 'flat_wire', 'point'.
         pane_name: Optional pane tab name.
+        environment_background: Show (True) or hide (False) an environment
+            light's map behind the scene, on every view of the viewer.
+        reference_plane: Show (True) or hide (False) the reference plane (the
+            grid).
+        point_size: Diameter in pixels of particles drawn as points, on every
+            view of the viewer.
+        color_scheme: 'dark', 'darkgrey', 'grey' or 'light', on every view.
+
+    Each setting is read back rather than echoed: the per-view ones as a
+    ``{view name: value}`` map.
     """
+    asked = (display_mode, environment_background, reference_plane, point_size, color_scheme)
+    if all(value is None for value in asked):
+        raise ValueError(
+            "Pass display_mode, environment_background, reference_plane, point_size "
+            "or color_scheme."
+        )
+    # Refused before anything is touched, so a bad value never half-applies a call.
+    scheme = None
+    if color_scheme is not None:
+        scheme = _COLOR_SCHEMES.get(str(color_scheme).strip().lower().replace(" ", ""))
+        if scheme is None:
+            raise ValueError(
+                f"Unknown color_scheme '{color_scheme}'. Supported: dark, darkgrey, grey, light."
+            )
+    size = None
+    if point_size is not None:
+        try:
+            size = float(point_size)
+        except (TypeError, ValueError):
+            size = 0.0
+        if isinstance(point_size, bool) or not size > 0:
+            raise ValueError(f"point_size must be a positive number of pixels, got {point_size!r}")
+
     mode_map = {
         "wireframe": hou.glShadingType.Wire,
         "wire": hou.glShadingType.Wire,
@@ -383,39 +438,119 @@ def set_viewport_display(
         "matcap_wire": hou.glShadingType.MatCapWire,
     }
 
-    gl_mode = mode_map.get(display_mode.lower())
-    if gl_mode is None:
-        raise ValueError(
-            f"Unknown display mode: '{display_mode}'. Supported modes: {list(mode_map.keys())}"
-        )
+    gl_mode = None
+    if display_mode is not None:
+        gl_mode = mode_map.get(display_mode.lower())
+        if gl_mode is None:
+            raise ValueError(
+                f"Unknown display mode: '{display_mode}'. Supported modes: {list(mode_map.keys())}"
+            )
 
     scene_viewer = _find_scene_viewer(pane_name)
-    viewport = scene_viewer.curViewport()
+    result = {"success": True, "pane_name": scene_viewer.name()}
 
-    settings = viewport.settings()
-    display_set = settings.displaySet(hou.displaySetType.SceneObject)
-    display_set.setShadedMode(gl_mode)
+    if gl_mode is not None:
+        settings = scene_viewer.curViewport().settings()
+        display_set = settings.displaySet(hou.displaySetType.SceneObject)
+        display_set.setShadedMode(gl_mode)
+        result["display_mode"] = display_mode
 
-    return {
-        "success": True,
-        "display_mode": display_mode,
-        "pane_name": scene_viewer.name(),
-    }
+    if environment_background is not None:
+        # The flag is kept per view, not per viewer: a quad layout carries
+        # four, and setting it on curViewport() alone leaves the map behind
+        # the other three. Each view's state is read back, not echoed.
+        shown = {}
+        for view in scene_viewer.viewports():
+            settings = view.settings()
+            settings.setDisplayEnvironmentBackgroundImage(bool(environment_background))
+            shown[view.name()] = settings.displayEnvironmentBackgroundImage()
+        result["environment_background"] = shown
+
+    if reference_plane is not None:
+        # One plane per viewer, not per view.
+        plane = scene_viewer.referencePlane()
+        plane.setIsVisible(bool(reference_plane))
+        result["reference_plane"] = plane.isVisible()
+
+    if size is not None:
+        # GeometryViewportSettings has particlePointSize() and no setter, so a
+        # session looking for one read back 3.0 and gave up. viewdisplay -p on
+        # the viewer sets it on every view. The viewer keeps one set per
+        # context: .world for objects and SOPs, .solaris in a LOP network.
+        # .world from /stage read back 3.0 on every view and changed the size
+        # the object viewer showed later instead (22.0.368).
+        in_lops = scene_viewer.pwd().childTypeCategory() == hou.lopNodeTypeCategory()
+        context = "solaris" if in_lops else "world"
+        viewer_path = f"{hou.ui.curDesktop().name()}.{scene_viewer.name()}.{context}"
+        _, error = hou.hscript(f"viewdisplay -p {size} {viewer_path}")
+        if error.strip():
+            raise RuntimeError(f"viewdisplay -p failed: {error.strip()}")
+        result["point_size"] = {
+            view.name(): view.settings().particlePointSize() for view in scene_viewer.viewports()
+        }
+
+    if scheme is not None:
+        schemes = {}
+        for view in scene_viewer.viewports():
+            settings = view.settings()
+            settings.setColorScheme(getattr(hou.viewportColorScheme, scheme))
+            schemes[view.name()] = str(settings.colorScheme()).rsplit(".", 1)[-1]
+        result["color_scheme"] = schemes
+
+    return result
 
 
 ###### viewport.set_viewport_direction
 
 
+def _vector3(value, name: str) -> tuple:
+    """Three floats from *value*, or a ValueError naming *name*."""
+    try:
+        numbers = tuple(float(v) for v in value)
+    except (TypeError, ValueError):
+        numbers = ()
+    if len(numbers) != 3:
+        raise ValueError(f"{name} must be three numbers, got {value!r}")
+    return numbers
+
+
+def _looked_through(viewport) -> tuple[str | None, bool]:
+    """(camera the viewport looks through, whether it is a USD prim), or (None, False).
+
+    A USD camera prim is no node: camera() is None there and only cameraPath()
+    names it.
+    """
+    bound = viewport.camera()
+    if bound is not None:
+        return bound.path(), False
+    path = viewport.cameraPath() or None
+    return path, path is not None
+
+
 def set_viewport_direction(
-    direction: str,
+    direction: str = None,
     pane_name: str = None,
+    rotation: list = None,
+    pivot: list = None,
+    distance: float = None,
 ) -> dict:
-    """Set the viewport to a standard viewing direction.
+    """Set the viewport to a standard viewing direction, or place the free view.
 
     Args:
         direction: One of 'front', 'back', 'top', 'bottom', 'left', 'right',
             'perspective'.
         pane_name: Optional pane tab name.
+        rotation: [rx, ry, rz] in degrees: the free view's rotation about its
+            pivot.
+        pivot: [x, y, z] the free view orbits.
+        distance: How far the free view sits from its pivot along its view
+            axis (the dolly). A sideways pan is kept and not counted, so with
+            a panned view the eye is farther from the pivot than this.
+
+    rotation, pivot and distance place the viewport's own (non-camera) view,
+    after *direction* if both are given, and the reply reads it back as
+    ``view``. A viewport looking through a camera is refused: what it shows
+    is the camera, so the camera is what to move.
     """
     direction_map = {
         "front": hou.geometryViewportType.Front,
@@ -427,23 +562,87 @@ def set_viewport_direction(
         "perspective": hou.geometryViewportType.Perspective,
     }
 
-    view_type = direction_map.get(direction.lower())
-    if view_type is None:
-        raise ValueError(
-            f"Unknown direction '{direction}'. Supported: {list(direction_map.keys())}"
-        )
+    free_view = rotation is not None or pivot is not None or distance is not None
+    if direction is None and not free_view:
+        raise ValueError("Pass direction, or rotation / pivot / distance for the free view.")
+    view_type = None
+    if direction is not None:
+        view_type = direction_map.get(str(direction).lower())
+        if view_type is None:
+            raise ValueError(
+                f"Unknown direction '{direction}'. Supported: {list(direction_map.keys())}"
+            )
+    # Checked before the viewer is touched, so a bad value never half-applies.
+    angles = _vector3(rotation, "rotation") if rotation is not None else None
+    centre = _vector3(pivot, "pivot") if pivot is not None else None
+    if distance is not None:
+        try:
+            far = float(distance)
+        except (TypeError, ValueError):
+            far = 0.0
+        if isinstance(distance, bool) or not far > 0:
+            raise ValueError(f"distance must be a positive number, got {distance!r}")
 
     scene_viewer = _find_scene_viewer(pane_name)
     viewport = scene_viewer.curViewport()
-    viewport.changeType(view_type)
-    viewport.frameAll()
+    if free_view:
+        # setDefaultCamera() unbound a USD camera prim without a word (22.0.368).
+        looks_through, is_prim = _looked_through(viewport)
+        if looks_through:
+            move = (
+                "its LOP's parameters (set_parameters) or set_usd_attribute on the prim"
+                if is_prim
+                else "set_object_transform on the camera object"
+            )
+            raise ValueError(
+                f"The viewport looks through {looks_through}: rotation/pivot/distance "
+                f"place the viewport's own view. Move the camera instead, with {move}."
+            )
+    if view_type is not None:
+        viewport.changeType(view_type)
+        viewport.frameAll()
 
-    return {
+    result = {
         "success": True,
         "direction": direction,
         "pane_name": scene_viewer.name(),
         "viewport_name": viewport.name(),
     }
+    if not free_view:
+        return result
+
+    # The view's translation is a world position that the rotation turns about
+    # the pivot: the eye is pivot + R * (translation - pivot). Measured on
+    # 22.0.429: moving only the pivot left the eye where it was, looking past
+    # the new pivot. So the eye's offset from the pivot (pan in x/y, distance
+    # in z) is what is kept, and the translation follows the pivot.
+    view = viewport.defaultCamera().stash()
+    old_pivot = list(view.pivot())
+    offset = [t - p for t, p in zip(view.translation(), old_pivot, strict=True)]
+    if angles is not None:
+        # setRotation() takes the transpose of what buildRotate() gives: as is,
+        # the view looked along the inverse turn, (0.5, 0.3, -0.8) where a cam
+        # object with the same r looks along (-0.47, -0.34, -0.81) (22.0.429).
+        rotate = hou.hmath.buildRotate(hou.Vector3(*angles))
+        view.setRotation(rotate.extractRotationMatrix3().transposed())
+    if centre is not None or distance is not None:
+        new_pivot = list(centre) if centre is not None else old_pivot
+        if distance is not None:
+            offset[2] = far
+        view.setPivot(hou.Vector3(*new_pivot))
+        view.setTranslation(hou.Vector3(*(p + o for p, o in zip(new_pivot, offset, strict=True))))
+    viewport.setDefaultCamera(view)
+
+    now = viewport.defaultCamera()
+    now_pivot = list(now.pivot())
+    result["view"] = {
+        "rotation": [
+            round(v, 4) for v in hou.Matrix4(now.rotation().transposed()).extractRotates()
+        ],
+        "pivot": [round(v, 4) for v in now_pivot],
+        "distance": round(now.translation()[2] - now_pivot[2], 4),
+    }
+    return result
 
 
 ###### viewport.set_viewport_renderer
@@ -591,22 +790,111 @@ def frame_selection(pane_name: str = None) -> dict:
 ###### viewport.frame_all
 
 
-def frame_all(pane_name: str = None) -> dict:
-    """Frame all geometry in the viewport (home all).
+def _world_bounds(node: hou.Node) -> list | None:
+    """[xmin, ymin, zmin, xmax, ymax, zmax] of what *node* shows, in world space.
+
+    An object is its display SOP; a SOP's geometry is in its object's space,
+    so it goes through that object's world transform. None without geometry.
+    """
+    owner, target = node, node
+    if isinstance(node, hou.ObjNode):
+        target = node.displayNode()
+    else:
+        while owner is not None and not isinstance(owner, hou.ObjNode):
+            owner = owner.parent()
+    try:
+        box = target.geometry().boundingBox()
+    except Exception:
+        return None
+    if not box.isValid():
+        return None
+    low, high = box.minvec(), box.maxvec()
+    corners = [
+        (x, y, z) for x in (low[0], high[0]) for y in (low[1], high[1]) for z in (low[2], high[2])
+    ]
+    if owner is not None:
+        transform = owner.worldTransform()
+        corners = [tuple(hou.Vector3(*corner) * transform) for corner in corners]
+    return [
+        *(min(corner[i] for corner in corners) for i in range(3)),
+        *(max(corner[i] for corner in corners) for i in range(3)),
+    ]
+
+
+def frame_all(pane_name: str = None, node_paths: list = None, bounds: list = None) -> dict:
+    """Frame all geometry in the viewport (home all), or only some of it.
 
     Args:
         pane_name: Optional pane tab name.
+        node_paths: Frame the world bounds of these objects or SOPs only.
+        bounds: Frame [xmin, ymin, zmin, xmax, ymax, zmax], in world space.
+
+    With *node_paths* or *bounds* (both: the box around all of them), the
+    reply carries ``framed_bounds``, and ``no_geometry`` names any node that
+    had nothing to frame. An object frames what it draws: a null its marker,
+    a camera or a light its icon. A box with no size (a point) is framed as a
+    1-unit cube around it, and ``padded`` says so.
     """
+    box = None
+    empty: list = []
+    if bounds is not None:
+        try:
+            box = [float(v) for v in bounds]
+        except (TypeError, ValueError):
+            box = []
+        if len(box) != 6 or any(box[i] > box[i + 3] for i in range(3)):
+            raise ValueError(f"bounds must be [xmin, ymin, zmin, xmax, ymax, zmax], got {bounds!r}")
+    if node_paths is not None:
+        if isinstance(node_paths, str):
+            node_paths = [node_paths]
+        missing = [path for path in node_paths if hou.node(str(path)) is None]
+        if missing:
+            raise ValueError(f"Node(s) not found: {missing}")
+        for path in node_paths:
+            found = _world_bounds(hou.node(str(path)))
+            if found is None:
+                empty.append(path)
+            elif box is None:
+                box = found
+            else:
+                box = [min(box[i], found[i]) for i in range(3)] + [
+                    max(box[i], found[i]) for i in range(3, 6)
+                ]
+        if box is None:
+            raise ValueError(f"Nothing to frame: no geometry on {empty}")
+
     scene_viewer = _find_scene_viewer(pane_name)
     viewport = scene_viewer.curViewport()
-
-    viewport.homeAll()
-
-    return {
+    result = {
         "success": True,
         "pane_name": scene_viewer.name(),
         "viewport_name": viewport.name(),
     }
+    # Framing moves the viewport's own view, so a camera it looked through is
+    # dropped one UI tick later: both homeAll() and frameBoundingBox() did
+    # that to /obj/refcam on 22.0.368, and the reply said nothing. The camera
+    # itself does not move. Say so rather than refuse: no tool unbinds a
+    # camera, so a refusal would leave framing impossible.
+    looks_through, _ = _looked_through(viewport)
+    if looks_through:
+        result["camera_released"] = looks_through
+        result["note"] = (
+            f"The viewport stopped looking through {looks_through} to frame; the camera "
+            f"did not move. set_viewport_camera looks through it again."
+        )
+    if box is None:
+        viewport.homeAll()
+        return result
+
+    if all(box[i + 3] - box[i] < 1e-6 for i in range(3)):
+        # A point: frameBoundingBox() put the eye 0.019 from it (22.0.368).
+        box = [box[i] - 0.5 for i in range(3)] + [box[i + 3] + 0.5 for i in range(3)]
+        result["padded"] = True
+    viewport.frameBoundingBox(hou.BoundingBox(*box))
+    result["framed_bounds"] = [round(v, 4) for v in box]
+    if empty:
+        result["no_geometry"] = empty
+    return result
 
 
 ###### viewport.capture_screenshot
@@ -633,13 +921,18 @@ def capture_screenshot(
     cur_frame = hou.frame()
 
     # For scene viewers, use flipbook for capture
+    viewer: dict = {}
     if pane_tab.type() == hou.paneTabType.SceneViewer:
+        # Which network the image shows, and a note when it is a DOP view.
+        viewer = viewer_context(pane_tab)
         viewport = pane_tab.curViewport()
         settings = pane_tab.flipbookSettings().stash()
         settings.frameRange((cur_frame, cur_frame))
         settings.output(output_path)
         _no_mplay(settings)
-        pane_tab.flipbook(viewport, settings)
+        # A selected object would be drawn with its selection outline.
+        with selection_hidden():
+            pane_tab.flipbook(viewport, settings)
 
         # Handle frame number that flipbook may insert
         from fxhoudinimcp_server.handlers.rendering_handlers import _find_flipbook_output
@@ -655,10 +948,19 @@ def capture_screenshot(
         "pane_name": pane_tab.name(),
         "output_path": actual_path,
         "file_exists": os.path.isfile(actual_path),
+        **viewer,
     }
 
 
 ###### viewport.capture_network_editor
+
+
+def _bounds_list(bounds) -> list | None:
+    """``hou.BoundingRect`` -> ``[xmin, ymin, xmax, ymax]``, rounded."""
+    try:
+        return [round(v, 3) for v in (*bounds.min(), *bounds.max())]
+    except Exception:
+        return None
 
 
 def capture_network_editor(
@@ -682,6 +984,10 @@ def capture_network_editor(
         bounds: [x0, y0, x1, y1] in network units, inside network_path (or
             the pane's current network).
         margin: Border around the framed items, as a fraction of their size.
+
+    The reply carries ``visible_bounds`` (the network space the image shows)
+    and, with *node_path*, ``node_bounds`` and ``node_in_view``, so what the
+    image holds can be checked without opening it.
     """
     require_ui(
         "capture the network editor",
@@ -760,18 +1066,33 @@ def capture_network_editor(
 
     old_network = pane.pwd()
     old_bounds = pane.visibleBounds()
-    try:
-        if pane.pwd().path() != network.path():
-            pane.cd(network.path())
-        pane.setVisibleBounds(hou.BoundingRect(x0, y0, x1, y1), 0.0)
-        _let_qt_repaint()
-        visible = pane.visibleBounds()
-        _capture_pane_tab_qt(pane, output_path)
-    finally:
-        with contextlib.suppress(Exception):
-            if pane.pwd().path() != old_network.path():
-                pane.cd(old_network.path())
-            pane.setVisibleBounds(old_bounds, 0.0)
+    # The Scene Viewer follows the editor's cd, and a cd unbinds its cameras
+    # and selects that network's current node (keep_viewer_state); a cd into a
+    # DOP network turns it into a DOP view (viewer_stays_out_of_dops).
+    visible = None
+    with viewer_stays_out_of_dops(), keep_viewer_state():
+        try:
+            if pane.pwd().path() != network.path():
+                pane.cd(network.path())
+            # A rect at the zoom the editor already has counts as a rejected
+            # scale change and moves nothing without the flag (22.0.429).
+            pane.setVisibleBounds(
+                hou.BoundingRect(x0, y0, x1, y1),
+                transition_time=0.0,
+                set_center_when_scale_rejected=True,
+            )
+            _let_qt_repaint()
+            # What the image shows, read before the editor goes back.
+            with contextlib.suppress(Exception):
+                visible = pane.visibleBounds()
+            _capture_pane_tab_qt(pane, output_path)
+        finally:
+            with contextlib.suppress(Exception):
+                if pane.pwd().path() != old_network.path():
+                    pane.cd(old_network.path())
+                pane.setVisibleBounds(
+                    old_bounds, transition_time=0.0, set_center_when_scale_rejected=True
+                )
 
     restored = pane.pwd().path() == old_network.path()
     result = {
@@ -782,9 +1103,26 @@ def capture_network_editor(
         "network": network.path(),
         "framed": framed,
         "node_path": node_path,
-        "visible_bounds": [round(v, 3) for v in (*visible.min(), *visible.max())],
+        "visible_bounds": _bounds_list(visible) if visible is not None else None,
         "pane_restored": restored,
     }
+    if focus is not None:
+        node_bounds = None
+        with contextlib.suppress(Exception):
+            (x, y), (w, h) = focus.position(), focus.size()
+            node_bounds = [round(v, 3) for v in (x, y, x + w, y + h)]
+        result["node_bounds"] = node_bounds
+        view = result["visible_bounds"]
+        result["node_in_view"] = (
+            None
+            if node_bounds is None or view is None
+            else (
+                view[0] <= node_bounds[0]
+                and view[1] <= node_bounds[1]
+                and node_bounds[2] <= view[2]
+                and node_bounds[3] <= view[3]
+            )
+        )
     if item_count is not None:
         result["items_framed"] = item_count
     if result["file_exists"]:
@@ -907,7 +1245,9 @@ def set_current_network(network_path: str, other_objects: str | None = "hide") -
     if network_editor is None:
         raise RuntimeError("No Network Editor pane found.")
 
-    network_editor.cd(network_path)
+    # The viewer follows the editor; its cameras and the selection stay.
+    with keep_viewer_state():
+        network_editor.cd(network_path)
 
     return {
         "success": True,

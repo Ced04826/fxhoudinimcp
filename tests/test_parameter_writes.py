@@ -20,6 +20,7 @@ from __future__ import annotations
 # Built-in
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 # Third-party
@@ -31,8 +32,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "houdini", "scr
 
 # Internal
 import fxhoudinimcp_server.handlers.parameter_handlers as parameters  # noqa: E402
+from fxhoudinimcp_server.serialize import ramp_to_dict  # noqa: E402
 
 hou = parameters.hou
+
+# The real serializer; an autouse fixture below swaps it for an identity.
+_SERIALIZE_VALUE = parameters._serialize_value
 
 
 class _PermissionError(Exception):
@@ -55,8 +60,10 @@ class _Parm:
     """A parm whose set() behaves the way HOM's does on an expression.
 
     set() writes the value into the parm's own slot while the expression keeps
-    answering for eval(); only deleteAllKeyframes() drops it. With *reference*
-    the parm is a bare ch() onto that parm, and set() lands there instead.
+    answering for eval(); only deleteAllKeyframes() drops it, and it evaluates
+    the expression it drops to keep the value (logged in `evaluated_on_clear`).
+    With *reference* the parm is a bare ch() onto that parm, and set() lands
+    there instead.
     """
 
     def __init__(
@@ -79,6 +86,7 @@ class _Parm:
         self._string = string
         self._raw = raw
         self.deleted = False
+        self.evaluated_on_clear: list = []
 
     def name(self):
         return self._name
@@ -97,7 +105,12 @@ class _Parm:
             raise hou.OperationFailed("not animated")
         return self._expression
 
+    def setExpression(self, expression, language=None, replace_expression=True):  # noqa: N802
+        self._expression = expression
+
     def deleteAllKeyframes(self):  # noqa: N802 — HOM spelling
+        # HOM keeps the parm at its current value, so it evaluates what it drops.
+        self.evaluated_on_clear.append(self._expression)
         self.deleted = True
         self._expression = None
 
@@ -326,6 +339,39 @@ class TestTuples:
         assert values == [1.0, 2.0]
         assert "expression_kept" not in report
 
+    def test_one_component_can_be_an_expression(self, monkeypatch):
+        # ParmTuple.set([{"expr": "$F"}, 2]) failed with the SWIG overload list.
+        set_expressions = {}
+        monkeypatch.setattr(
+            parameters,
+            "set_whole_expression",
+            lambda parm, expression, language=None: set_expressions.update(
+                {parm.name(): expression}
+            ),
+        )
+        tx, ty = _Parm("tx"), _Parm("ty")
+        node = _node("/obj/geo1")
+        node.parmTuple.return_value = _Tuple([tx, ty])
+        values, report = parameters._set_tuple(node, "t", [{"expr": "$F"}, 2.0])
+        assert set_expressions == {"tx": "$F"}
+        assert ty.eval() == 2.0
+        assert report["expressions_set"] == {"tx": "$F"}
+        assert "expression_kept" not in report
+
+    def test_a_malformed_component_is_refused_before_any_write(self):
+        tx, ty = _Parm("tx"), _Parm("ty", value=5)
+        node = _node("/obj/geo1")
+        node.parmTuple.return_value = _Tuple([tx, ty])
+        with pytest.raises(ValueError, match="expr"):
+            parameters._set_tuple(node, "t", [{"exp": "$F"}, 2.0])
+        assert ty.eval() == 5
+
+    def test_the_wrapper_is_read(self):
+        assert parameters._wrapped_expression(3) is None
+        assert parameters._wrapped_expression({"expr": "$F"})[0] == "$F"
+        with pytest.raises(ValueError, match="language"):
+            parameters._wrapped_expression({"expr": "$F", "language": "vex"})
+
     def test_the_single_setter_merges_the_tuple_report(self, monkeypatch):
         tx = _Parm("tx", expression="$F * 7", expression_value=7)
         node = _node("/obj/geo1/n")
@@ -335,6 +381,45 @@ class TestTuples:
         assert result["parm_name"] == "t"
         assert result["expression_kept"] is True
         assert result["expression_components"][0]["component"] == "tx"
+
+
+###### Clearing an expression does not evaluate it
+
+
+class TestClearingDoesNotEvaluate:
+    """deleteAllKeyframes() evaluates the expression it drops; outside a cook a
+    Ray SOP's `@N.x` then leaves "Local variable 'N' not found" on the node.
+    A constant stands in first, so the only thing evaluated is that constant.
+    """
+
+    def test_a_constant_stands_in_before_the_channel_goes(self):
+        parm = _Parm("dirx", expression="@N.x")
+        parameters._clear_expression(parm)
+        assert parm.evaluated_on_clear == ["0"]
+        assert parm.deleted is True
+        assert parm._expression is None
+
+    def test_set_parameter_clears_without_evaluating(self, monkeypatch):
+        parm = _Parm("dirx", value=0, expression="@N.x", expression_value=0)
+        result = _set(monkeypatch, parm, 1.0, override_expression=True)
+        assert parm.evaluated_on_clear == ["0"]
+        assert result["new_value"] == 1.0
+        assert result["expression_removed"] == "@N.x"
+
+    def test_set_parameters_clears_without_evaluating(self, monkeypatch):
+        parm = _Parm("dirx", value=0, expression="@N.x", expression_value=0)
+        reply = _batch(monkeypatch, {"dirx": parm}, {"dirx": 1.0}, override_expression=True)
+        assert parm.evaluated_on_clear == ["0"]
+        assert reply["set"][0]["expression_removed"] == "@N.x"
+
+    def test_a_tuple_clears_every_component_without_evaluating(self):
+        components = [_Parm(f"dir{axis}", expression=f"@N.{axis}") for axis in "xyz"]
+        node = _node("/obj/geo1/ray1", type_name="ray")
+        node.parmTuple.return_value = _Tuple(components)
+        values, report = parameters._set_tuple(node, "dir", [0, 1, 0], override_expression=True)
+        assert [p.evaluated_on_clear for p in components] == [["0"], ["0"], ["0"]]
+        assert values == [0, 1, 0]
+        assert "expression_kept" not in report
 
 
 ###### String parameters echo their raw text
@@ -359,6 +444,241 @@ class TestRawValue:
         values, report = parameters._set_tuple(node, "ab", ["$JOB/x", 1])
         assert values == ["/work/proj/x", 1]
         assert report["raw_value"] == ["$JOB/x", None]
+
+
+###### Ramps, written and read as one value
+
+
+class _Basis:
+    def __init__(self, name):
+        self._name = name
+
+    def name(self):
+        return self._name
+
+
+class _Ramp:
+    """Just enough of hou.Ramp: built from (basis, keys, values), read back the same."""
+
+    def __init__(self, basis, keys, values):
+        self._basis, self._keys, self._values = tuple(basis), tuple(keys), tuple(values)
+
+    def basis(self):
+        return self._basis
+
+    def keys(self):
+        return self._keys
+
+    def values(self):
+        return self._values
+
+    def isColor(self):  # noqa: N802 — HOM spelling
+        return any(isinstance(v, tuple) for v in self._values)
+
+
+_BLACK = (0.0, 0.0, 0.0)
+
+
+class _RampParm:
+    """A ramp parm. set() takes a hou.Ramp, or a key count as HOM's does:
+    a key the count adds sits at t=0, black, until its own fields are set."""
+
+    def __init__(self, name="ramp", kind="Ramp", color=True):
+        self._name = name
+        self._kind = kind
+        self._color = color
+        self.ramp = _Ramp((_Basis("Linear"),) * 2, (0.0, 1.0), (_BLACK, (1.0, 1.0, 1.0)))
+
+    def name(self):
+        return self._name
+
+    def parmTemplate(self):  # noqa: N802 — HOM spelling
+        return SimpleNamespace(
+            type=lambda: self._kind, parmType=lambda: "Color" if self._color else "Float"
+        )
+
+    def set(self, value):
+        if isinstance(value, _Ramp):
+            self.ramp = value
+            return
+        added = int(value) - len(self.ramp.keys())
+        self.ramp = _Ramp(
+            self.ramp.basis() + (_Basis("Linear"),) * added,
+            self.ramp.keys() + (0.0,) * added,
+            self.ramp.values() + (_BLACK,) * added,
+        )
+
+    def eval(self):
+        return self.ramp
+
+    def evalAsRamp(self):  # noqa: N802 — HOM spelling
+        return self.ramp
+
+
+class _RampField:
+    """One field of one key of a ramp: `ramp3pos`, or `ramp3c` as a whole."""
+
+    def __init__(self, ramp, index, field):
+        self._ramp, self._index, self._field = ramp, index, field
+
+    def name(self):
+        return f"{self._ramp.name()}{self._index + 1}{self._field}"
+
+    def parmTemplate(self):  # noqa: N802 — HOM spelling
+        return SimpleNamespace(type=lambda: "Float")
+
+    def set(self, value):
+        ramp = self._ramp.ramp
+        keys, values = list(ramp.keys()), list(ramp.values())
+        if self._field == "pos":
+            keys[self._index] = float(value)
+        else:
+            values[self._index] = tuple(float(c) for c in value)
+        self._ramp.ramp = _Ramp(ramp.basis(), keys, values)
+
+    def eval(self):
+        ramp = self._ramp.ramp
+        return (ramp.keys() if self._field == "pos" else ramp.values())[self._index]
+
+
+@pytest.fixture
+def ramps(monkeypatch):
+    monkeypatch.setattr(
+        hou, "parmTemplateType", SimpleNamespace(Ramp="Ramp", Float="Float", String="String")
+    )
+    monkeypatch.setattr(hou, "rampParmType", SimpleNamespace(Color="Color", Float="Float"))
+    monkeypatch.setattr(
+        hou,
+        "rampBasis",
+        SimpleNamespace(
+            Linear=_Basis("Linear"), Constant=_Basis("Constant"), CatmullRom=_Basis("CatmullRom")
+        ),
+    )
+    monkeypatch.setattr(hou, "Ramp", _Ramp)
+
+
+RED_TO_BLUE = {"keys": [0, 1], "values": [[1, 0, 0], [0, 0, 1]]}
+
+
+class TestRampValues:
+    def test_the_shape_is_recognised(self):
+        assert parameters.is_ramp_value({"keys": [0, 1], "values": [0, 1]})
+        assert parameters.is_ramp_value({"keys": [0], "values": [1], "basis": "linear"})
+        assert not parameters.is_ramp_value({"expr": "$F"})
+        assert not parameters.is_ramp_value({"keys": [0], "values": [1], "expr": "x"})
+
+    def test_a_ramp_as_it_reads_back_is_one_too(self):
+        read = {"type": "Ramp", "is_color": False, "basis": ["Linear"], "keys": [0], "values": [1]}
+        assert parameters.is_ramp_value(read)
+
+    def test_a_colour_ramp_takes_one_basis_for_every_key(self, ramps):
+        ramp = parameters.ramp_from_value(_RampParm(), RED_TO_BLUE)
+        assert [b.name() for b in ramp.basis()] == ["Linear", "Linear"]
+        assert ramp.keys() == (0.0, 1.0)
+        assert ramp.values() == ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+
+    def test_basis_names_are_read_loosely_and_per_key(self, ramps):
+        ramp = parameters.ramp_from_value(
+            _RampParm(color=False),
+            {"keys": [0, 0.5], "values": [0, 1], "basis": ["catmull-rom", "Constant"]},
+        )
+        assert [b.name() for b in ramp.basis()] == ["CatmullRom", "Constant"]
+
+    def test_an_unknown_basis_lists_the_real_ones(self, ramps):
+        with pytest.raises(ValueError, match="unknown ramp basis 'smooth'.*CatmullRom"):
+            parameters.ramp_from_value(
+                _RampParm(color=False), {"keys": [0], "values": [1], "basis": "smooth"}
+            )
+
+    def test_keys_and_values_must_pair_up(self, ramps):
+        with pytest.raises(ValueError, match="one value per key"):
+            parameters.ramp_from_value(_RampParm(), {"keys": [0, 1], "values": [[1, 0, 0]]})
+
+    def test_the_shape_is_checked_without_a_parm(self, ramps):
+        # So a build_network dry run refuses what the build would.
+        assert parameters.ramp_shape_error(RED_TO_BLUE) is None
+        assert "unknown ramp basis" in parameters.ramp_shape_error(
+            {"keys": [0], "values": [1], "basis": "smooth"}
+        )
+        assert "one value per key" in parameters.ramp_shape_error({"keys": [0, 1], "values": [1]})
+
+    def test_a_colour_ramp_wants_rgb(self, ramps):
+        with pytest.raises(ValueError, match=r"\[r, g, b\]"):
+            parameters.ramp_from_value(_RampParm(), {"keys": [0], "values": [1]})
+
+    def test_a_ramp_reads_as_data_not_as_its_repr(self, monkeypatch, ramps):
+        other = type("NotAVector", (), {})
+        for name in ("Vector2", "Vector3", "Vector4", "Matrix3", "Matrix4"):
+            monkeypatch.setattr(hou, name, other)
+        ramp = _Ramp((_Basis("Linear"),) * 2, (0.0, 0.5), (_BLACK, (0.0, 1.0, 0.0)))
+        assert _SERIALIZE_VALUE(ramp) == {
+            "type": "Ramp",
+            "is_color": True,
+            "basis": ["Linear", "Linear"],
+            "keys": [0.0, 0.5],
+            "values": [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        }
+
+
+class TestSetParametersWritesAWholeRamp:
+    """A ramp could be written only key by key through its multiparm, and a
+    dict for the whole of it was refused as an expression without "expr".
+    Measured on Houdini 22.0.429 with a POP Color's `ramp`."""
+
+    def test_the_ramp_is_set_and_echoed_as_data(self, monkeypatch, ramps):
+        parm = _RampParm()
+        result = _batch(monkeypatch, {"ramp": parm}, {"ramp": RED_TO_BLUE})
+        assert result["errors"] == []
+        assert result["set"] == [
+            {
+                "parm_name": "ramp",
+                "new_value": {
+                    "type": "Ramp",
+                    "is_color": True,
+                    "basis": ["Linear", "Linear"],
+                    "keys": [0.0, 1.0],
+                    "values": [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                },
+            }
+        ]
+
+    def test_a_ramp_as_it_reads_back_writes_back_as_it_is(self, monkeypatch, ramps):
+        read = ramp_to_dict(_Ramp((_Basis("Constant"),), (0.25,), ((0.0, 1.0, 0.0),)))
+        result = _batch(monkeypatch, {"ramp": _RampParm()}, {"ramp": read})
+        assert result["errors"] == []
+        assert result["set"][0]["new_value"] == read
+
+    def test_a_dict_on_a_parm_that_is_not_a_ramp_is_refused(self, monkeypatch, ramps):
+        parm = _RampParm("scale", kind="Float")
+        result = _batch(monkeypatch, {"scale": parm}, {"scale": RED_TO_BLUE})
+        assert result["set"] == []
+        assert "not a ramp parameter" in result["errors"][0]["error"]
+
+    def test_a_whole_ramp_runs_its_callback_when_asked(self, monkeypatch, ramps):
+        ran = []
+        monkeypatch.setattr(
+            parameters, "_run_callback", lambda parm: ran.append(parm.name()) or {"run": True}
+        )
+        parameters._write_ramp(_RampParm(), RED_TO_BLUE)
+        assert ran == []
+        report = parameters._write_ramp(_RampParm(), RED_TO_BLUE, run_callbacks=True)
+        assert ran == ["ramp"]
+        assert report["callback_run"] is True
+
+    def test_a_ramp_written_key_by_key_echoes_the_end_result(self, monkeypatch, ramps):
+        # Echoed straight after `ramp: 3`, the new key read t=0, black, though
+        # the same call went on to set it.
+        parm = _RampParm()
+        parms = {
+            "ramp": parm,
+            "ramp3pos": _RampField(parm, 2, "pos"),
+            "ramp3c": _RampField(parm, 2, "c"),
+        }
+        result = _batch(monkeypatch, parms, {"ramp": 3, "ramp3pos": 0.5, "ramp3c": [0, 1, 0]})
+        assert result["errors"] == []
+        echoed = result["set"][0]["new_value"]
+        assert echoed["keys"] == [0.0, 1.0, 0.5]
+        assert echoed["values"][2] == [0.0, 1.0, 0.0]
 
 
 ###### The client tools

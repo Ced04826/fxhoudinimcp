@@ -74,6 +74,22 @@ class TestConnectorsOfANode:
         inputs = graph._connectors_of(probe)["inputs"]
         assert [i["name"] for i in inputs] == ["input1", "input2"]
 
+    def test_outputs_carry_their_data_type_too(self):
+        # Whether a multiply comes out float or int was answerable for its
+        # inputs only.
+        probe = _probe(["input1"], ["Input 1"], outputs=["product"])
+        probe.outputDataTypes.return_value = ("float",)
+        assert graph._connectors_of(probe)["outputs"] == [
+            {"index": 0, "name": "product", "label": "Product", "data_type": "float"}
+        ]
+
+    def test_outputs_without_data_types_are_still_listed(self):
+        probe = _probe([], [], outputs=["output1"])
+        probe.outputDataTypes.side_effect = AttributeError("SOPs have none")
+        assert graph._connectors_of(probe)["outputs"] == [
+            {"index": 0, "name": "output1", "label": "Output1"}
+        ]
+
 
 class TestFindingAnInput:
     """One rule for the dry run and for every wiring verb (node_handlers)."""
@@ -165,6 +181,55 @@ class TestProbingAType:
         assert connectors is None and "no license" in why
         scratch.destroy.assert_called_once()
 
+    def _refusing_matnet(self, monkeypatch, probe):
+        """A material network that refuses the type, then a geo that takes it."""
+        root = MagicMock()
+        matnet, geo, attribvop = MagicMock(), MagicMock(), MagicMock()
+        matnet.createNode.side_effect = RuntimeError("Error in child VOP 'P'.")
+        geo.createNode.return_value = attribvop
+        attribvop.createNode.return_value = probe
+        root.createNode.side_effect = lambda type_name, name: {"matnet": matnet, "geo": geo}[
+            type_name
+        ]
+        monkeypatch.setattr(hou, "node", lambda path: root)
+        monkeypatch.setattr(graph, "_container_for", lambda category: "matnet")
+        return root, matnet, geo, attribvop
+
+    def test_a_vop_a_material_network_refuses_is_probed_in_an_attribute_vop(self, monkeypatch):
+        # geometryvopglobal::2.0 fails to match its definition inside a
+        # matnet; inside an Attribute VOP it builds, with its 22 outputs.
+        probe = _probe([], [], outputs=["P", "v"])
+        root, matnet, geo, attribvop = self._refusing_matnet(monkeypatch, probe)
+        node_type = MagicMock()
+        node_type.name.return_value = "geometryvopglobal::2.0"
+
+        connectors, why = graph._connectors_for_type("Vop", node_type)
+
+        assert why is None
+        assert [o["name"] for o in connectors["outputs"]] == ["P", "v"]
+        assert [c.args[0] for c in root.createNode.call_args_list] == ["matnet", "geo"]
+        geo.createNode.assert_called_once_with("attribvop")
+        attribvop.createNode.assert_called_once_with(
+            "geometryvopglobal::2.0", run_init_scripts=False
+        )
+        matnet.destroy.assert_called_once()
+        geo.destroy.assert_called_once()
+
+    def test_when_both_refuse_the_first_reason_is_reported(self, monkeypatch):
+        root, matnet, geo, attribvop = self._refusing_matnet(monkeypatch, None)
+        attribvop.createNode.side_effect = RuntimeError("not in an attribvop either")
+        connectors, why = graph._connectors_for_type("Vop", MagicMock())
+        assert connectors is None
+        assert "Error in child VOP 'P'" in why and "attribvop" not in why
+        matnet.destroy.assert_called_once()
+        geo.destroy.assert_called_once()
+
+    def test_other_categories_have_no_second_container(self, monkeypatch):
+        root, scratch = self._root(monkeypatch, None)
+        scratch.createNode.side_effect = RuntimeError("no license for this type")
+        graph._connectors_for_type("Sop", MagicMock())
+        root.createNode.assert_called_once()
+
     def test_a_container_is_found_by_child_category_when_not_preferred(self, monkeypatch):
         def obj_type(child, hidden=False):
             node_type = MagicMock()
@@ -190,6 +255,43 @@ class TestProbingAType:
         monkeypatch.setattr(graph, "_instance_patterns", lambda t: [])
         *_, connectors = graph._parm_names_for_type(scratch, MagicMock())
         assert connectors["inputs"] == [{"index": 0, "name": "input1", "label": "Input 1"}]
+
+
+class _VopNode(MagicMock):
+    """Stands in for hou.VopNode, so isinstance() can tell a VOP from a SOP."""
+
+
+class TestNodeInfoNamesALiveVopsConnectorTypes:
+    """A variadic VOP input is "undef" on the type and float or int once wired.
+
+    The card can only show the type; whether a wired multiply comes out float
+    is a question about the live node, which HOM answers with
+    inputDataTypes() / outputDataTypes() and no verb returned.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _vop(self, monkeypatch):
+        monkeypatch.setattr(hou, "VopNode", _VopNode, raising=False)
+        monkeypatch.setattr(nodes, "to_jsonable", lambda v: v)
+
+    def _info(self, monkeypatch, node):
+        monkeypatch.setattr(nodes, "_get_node", lambda path: node)
+        return nodes.get_node_info("/obj/geo1/attribvop1/multiply1")
+
+    def test_a_vop_reports_what_its_connectors_carry(self, monkeypatch):
+        node = _VopNode()
+        node.inputNames.return_value = ("input1", "input2")
+        node.inputDataTypes.return_value = ("float", "float")
+        node.outputNames.return_value = ("product",)
+        node.outputDataTypes.return_value = ("float",)
+        info = self._info(monkeypatch, node)
+        assert info["connector_types"] == {
+            "inputs": {"input1": "float", "input2": "float"},
+            "outputs": {"product": "float"},
+        }
+
+    def test_a_sop_has_none(self, monkeypatch):
+        assert "connector_types" not in self._info(monkeypatch, MagicMock())
 
 
 class TestBuildNetworkWiresByName:
@@ -369,3 +471,141 @@ class TestBuildNetworkWiresByName:
             dry_run=True,
         )
         assert result["valid"] is True, result
+
+
+class TestFindingAnOutput:
+    """source_output took an index only: "v" died on int() with "invalid literal"."""
+
+    OUTPUTS = [
+        {"index": 0, "name": "P", "label": "Position"},
+        {"index": 1, "name": "v", "label": "Velocity"},
+        {"index": 11, "name": "Frame", "label": "Frame"},
+    ]
+
+    def test_a_name_or_a_label_resolves_to_the_index(self):
+        assert nodes._find_output(self.OUTPUTS, "v") == 1
+        assert nodes._find_output(self.OUTPUTS, "Velocity") == 1
+        assert nodes._find_output(self.OUTPUTS, "Frame") == 11
+
+    def test_a_typo_names_the_outputs(self):
+        with pytest.raises(
+            ValueError, match=r"no output named 'Positon'.*Did you mean.*'Position'"
+        ):
+            nodes._find_output(self.OUTPUTS, "Positon")
+        with pytest.raises(
+            ValueError, match=r"Outputs: \['P', 'Position', 'v', 'Velocity', 'Frame'\]"
+        ):
+            nodes._find_output(self.OUTPUTS, "zzz")
+
+    def test_the_live_source_resolves_the_name_at_wiring(self):
+        source = _probe([], [], outputs=["P", "v"])
+        source.path.return_value = "/obj/geo1/attribvop1/geometryvopglobal1"
+        assert nodes._output_index(source, "v") == 1
+        assert nodes._output_index(source, "V") == 1  # the label, title-cased by _probe
+        assert nodes._output_index(source, 0) == 0
+        with pytest.raises(ValueError, match="geometryvopglobal1 has no output named 'vel'"):
+            nodes._output_index(source, "vel")
+
+    @staticmethod
+    def _output_of(entry):
+        """The source_output parse_input_entries gives one entry, or its error."""
+        parsed, errors = graph.parse_input_entries([entry], 4, "n")
+        return parsed[0]["source_output"] if parsed else errors
+
+    def test_an_entry_keeps_a_name_and_reads_a_digit_string_as_an_index(self):
+        assert self._output_of({"source": "g", "source_output": "v"}) == "v"
+        assert self._output_of({"source": "g", "source_output": "2"}) == 2
+        assert self._output_of({"source": "g"}) == 0
+        errors = self._output_of({"source": "g", "source_output": True})
+        assert "output index nor a name" in errors[0]
+
+    def test_a_whole_float_is_still_an_index(self):
+        # int() took 1.0 before names were accepted; it must not become the name "1.0".
+        assert self._output_of({"source": "g", "source_output": 1.0}) == 1
+
+
+class TestBuildNetworkWiresFromAnOutputByName:
+    def _network(self, monkeypatch, children=()):
+        parent = MagicMock()
+        parent.path.return_value = "/obj/geo1/attribvop1"
+        parent.children.return_value = list(children)
+        parent.node.side_effect = lambda name: next(
+            (child for child in children if child.name() == name), None
+        )
+        parent.displayNode.return_value = None
+        parent.renderNode.return_value = None
+        category = MagicMock()
+        category.name.return_value = "Vop"
+        parent.childTypeCategory.return_value = category
+        types = {}
+        for name, max_inputs in (("globals", 0), ("vectofloat", 1)):
+            types[name] = MagicMock()
+            types[name].name.return_value = name
+            types[name].maxNumInputs.return_value = max_inputs
+        probes = {
+            "globals": lambda: _probe([], [], outputs=["P", "v"]),
+            "vectofloat": lambda: _probe(["vec"], ["Vector"], outputs=["fval1"]),
+        }
+        parent.createNode.side_effect = lambda type_name, *a, **k: probes[type_name]()
+        monkeypatch.setattr(hou, "node", lambda path: parent if path == parent.path() else None)
+        monkeypatch.setattr(graph, "_resolve_node_type", lambda cat, name: types.get(name))
+        monkeypatch.setattr(graph, "_instance_patterns", lambda t: [])
+        return parent
+
+    def _spec(self, source, source_output):
+        return {
+            "type": "vectofloat",
+            "name": "split",
+            "inputs": [{"input_name": "vec", "source": source, "source_output": source_output}],
+        }
+
+    def test_an_output_name_of_a_spec_node_validates(self, monkeypatch):
+        self._network(monkeypatch)
+        result = graph.build_network(
+            "/obj/geo1/attribvop1",
+            [{"type": "globals", "name": "g"}, self._spec("g", "v")],
+            dry_run=True,
+        )
+        assert result["valid"] is True, result
+
+    def test_a_wrong_output_name_fails_the_dry_run_with_a_hint(self, monkeypatch):
+        self._network(monkeypatch)
+        result = graph.build_network(
+            "/obj/geo1/attribvop1",
+            [{"type": "globals", "name": "g"}, self._spec("g", "vel")],
+            dry_run=True,
+        )
+        assert result["valid"] is False
+        assert len(result["errors"]) == 1, result["errors"]
+        assert "input source 'g' has no output named 'vel'" in result["errors"][0]
+        assert "Did you mean: ['v']" in result["errors"][0]
+
+    def test_an_existing_child_is_checked_on_its_own_outputs(self, monkeypatch):
+        live = _probe([], [], outputs=["P", "v"])
+        live.name.return_value = "geometryvopglobal1"
+        self._network(monkeypatch, children=[live])
+        ok = graph.build_network(
+            "/obj/geo1/attribvop1", [self._spec("geometryvopglobal1", "v")], dry_run=True
+        )
+        assert ok["valid"] is True, ok
+        typo = graph.build_network(
+            "/obj/geo1/attribvop1", [self._spec("geometryvopglobal1", "vel")], dry_run=True
+        )
+        assert "no output named 'vel'" in typo["errors"][0]
+
+    def test_the_build_wires_the_named_output(self, monkeypatch):
+        live = _probe([], [], outputs=["P", "v"])
+        live.name.return_value = "geometryvopglobal1"
+        parent = self._network(monkeypatch, children=[live])
+        built = _probe(["vec"], ["Vector"], outputs=["fval1"])
+        built.path.return_value = "/obj/geo1/attribvop1/split"
+        make = parent.createNode.side_effect
+        parent.createNode.side_effect = lambda type_name, name=None, *a, **k: (
+            built if name == "split" else make(type_name)
+        )
+        monkeypatch.setattr(graph, "place_new_nodes", lambda nodes: None)
+        result = graph.build_network(
+            "/obj/geo1/attribvop1", [self._spec("geometryvopglobal1", "v")]
+        )
+        assert result["success"] is True, result
+        built.setInput.assert_called_once_with(0, live, 1)

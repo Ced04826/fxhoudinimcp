@@ -75,6 +75,17 @@ class TestBadValuesAreRejected:
                 ("context", "not found", "unknown", "invalid", "must be", "one of"),
             )
 
+    @pytest.mark.parametrize(
+        ("argument", "value", "named"),
+        [("point_size", 0, "point_size"), ("color_scheme", "midnight", "darkgrey")],
+    )
+    def test_viewport_display_refuses_a_bad_value_before_the_ui(self, call, argument, value, named):
+        # Checked before the viewer is looked up, so hython answers the same.
+        answer = call("viewport.set_viewport_display", assert_failure=True, **{argument: value})
+        message = message_of(answer)
+        assert_useful("viewport.set_viewport_display", message, (named,))
+        assert "no ui" not in message.lower(), message
+
     def test_switching_to_a_take_that_does_not_exist_is_rejected(self, call):
         answer = call("takes.set_current_take", assert_failure=True, name="no_such_take_xyz")
         message = message_of(answer)
@@ -140,6 +151,21 @@ class TestBadValuesAreRejected:
         assert "notacommand_xyz" in flat or "unknown" in flat or "error" in flat, (
             f"execute_hscript swallowed an unknown command entirely: {result}"
         )
+
+    @pytest.mark.parametrize(
+        ("command", "params", "named"),
+        [
+            ("viewport.set_viewport_direction", {"distance": 0}, "distance"),
+            ("viewport.set_viewport_direction", {"rotation": [0, 45]}, "rotation"),
+            ("viewport.frame_all", {"bounds": [0, 0, 0, 1, 1]}, "bounds"),
+            ("viewport.frame_all", {"node_paths": [GONE]}, GONE),
+        ],
+    )
+    def test_the_view_refuses_a_bad_value_before_the_ui(self, call, command, params, named):
+        # Checked before the viewer is looked up, so hython answers the same.
+        message = message_of(call(command, assert_failure=True, **params))
+        assert named in message, message
+        assert "no ui" not in message.lower(), message
 
 
 def test_the_no_failure_input_list_is_still_true():

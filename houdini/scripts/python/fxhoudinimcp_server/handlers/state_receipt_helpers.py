@@ -379,6 +379,20 @@ def _as_index(value: Any) -> int | None:
     return int(value)
 
 
+def _as_output(value: Any) -> int | str | None:
+    """An output index, an output name ("v" on a VOP global), or None.
+
+    A name is resolved against the source by build_network: on the probed
+    or live connectors in the dry run, on the built source when wiring.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lstrip("-").isdigit():
+            return int(text)
+        return text or None
+    return _as_index(value)
+
+
 def parse_input_entries(
     entries: Any,
     max_inputs: int,
@@ -433,7 +447,7 @@ def parse_input_entries(
                     continue
             else:
                 index = _as_index(entry.get("index", position))
-            output = _as_index(entry.get("source_output", 0))
+            output = _as_output(entry.get("source_output", 0))
             if index is None:
                 errors.append(
                     f"node {label}: input entry {position} has a non-integer "
@@ -442,11 +456,11 @@ def parse_input_entries(
                 continue
             if output is None:
                 errors.append(
-                    f"node {label}: input {index} has a non-integer "
-                    f"'source_output': {entry.get('source_output')!r}"
+                    f"node {label}: input {index} has a 'source_output' that is neither "
+                    f"an output index nor a name: {entry.get('source_output')!r}"
                 )
                 continue
-            if output < 0:
+            if isinstance(output, int) and output < 0:
                 errors.append(f"node {label}: input {index} has a negative source_output {output}")
                 continue
             if entry.get("indirect_input") is not None:
@@ -559,7 +573,11 @@ def check_parm_value(label: str, type_name: str, parm_name: str, value: Any, inf
             )
             return errors
         for position, component in enumerate(value):
-            if isinstance(component, (list, tuple, dict)):
+            if isinstance(component, dict):
+                # {"expr": ...} sets that component's expression; build_network
+                # checks the wrapper itself (_wrapped_expression).
+                continue
+            if isinstance(component, (list, tuple)):
                 errors.append(
                     f"node {label}: parm '{parm_name}' component {position} is "
                     f"a {type(component).__name__}; components are scalars"
@@ -784,10 +802,7 @@ def component_type_error(parm: Any, value: Any, label: str) -> str | None:
         try:
             float(value)
         except ValueError:
-            return (
-                f"'{label}' is a {template} parameter with no menu; "
-                f"{value!r} is not a number"
-            )
+            return f"'{label}' is a {template} parameter with no menu; {value!r} is not a number"
     if template == "String" and isinstance(value, (bytes, bytearray)):
         return f"'{label}' is a String parameter; pass text, not bytes"
     return None
@@ -799,7 +814,9 @@ def component_type_error(parm: Any, value: Any, label: str) -> str | None:
 def positive_int(value: Any, name: str, maximum: int | None = None) -> int:
     """A positive integer argument, checked before anything irreversible runs."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be a positive integer, not {type(value).__name__}: {value!r}")
+        raise ValueError(
+            f"{name} must be a positive integer, not {type(value).__name__}: {value!r}"
+        )
     if isinstance(value, float) and not float(value).is_integer():
         raise ValueError(f"{name} must be a whole number, got {value!r}")
     number = int(value)

@@ -772,3 +772,46 @@ def test_readme_names_every_client_the_cli_accepts():
     for key in inst.CLIENT_KEYS:
         if key not in ("auto", "none", "both"):
             assert f"`{key}`" in text, f"README never names --client {key}"
+
+
+def test_readme_gives_every_client_its_own_row():
+    """Parity: no client is the featured one and the rest an afterthought.
+
+    The manual section used to show Claude Code and Claude Desktop as worked
+    examples and put the other seven in a table below.
+    """
+    text = _README.read_text(encoding="utf-8")
+    table = re.search(r"\n\| Client \| Register with \| Remove with \|\n(.+?)\n\n", text, re.S)
+    assert table, "the manual client table has moved or been removed from README.md"
+    rows = {line.split("|")[1].strip() for line in table.group(1).splitlines()[1:]}
+    labels = {label for label, *_ in inst.CLI_CLIENTS.values()} | {
+        label for label, *_ in inst.JSON_CLIENTS.values()
+    }
+    assert rows == labels
+    for label, executable, add, remove in inst.CLI_CLIENTS.values():
+        assert " ".join([executable, *add, "<python>", "-m", "fxhoudinimcp"]) in table.group(1), (
+            label
+        )
+        assert " ".join([executable, *remove]) in table.group(1), label
+
+
+def test_readme_json_examples_parse_and_are_formatted():
+    """A copied example must work, and read like the file it goes into.
+
+    One lost its escaped backslashes once; another was squeezed onto two lines.
+    """
+    text = _README.read_text(encoding="utf-8")
+    blocks = re.findall(r"```json\n(.+?)```", text, re.S)
+    assert blocks
+    for block in blocks:
+        json.loads(block)
+        # One key per line; a short list such as ["-m", "fxhoudinimcp"] may
+        # stay inline, as client configs usually write it.
+        crowded = [line for line in block.splitlines() if len(re.findall(r'"\s*:', line)) > 1]
+        assert not crowded, crowded
+
+
+def test_cline_entry_goes_where_cline_reads_it():
+    # Issue #130: Cline 3 reads ~/.cline/data/settings, not VS Code's globalStorage.
+    path = inst.JSON_CLIENTS["cline"][3]
+    assert path == ("~", ".cline", "data", "settings", "cline_mcp_settings.json")

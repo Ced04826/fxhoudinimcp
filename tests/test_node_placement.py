@@ -56,6 +56,7 @@ class _FakeNode:
         self.positions = []
         self.layouts = []
         self.user_data = {}
+        self.wired = ()
 
     def parent(self):
         return self._parent
@@ -84,6 +85,16 @@ class _FakeNode:
     def children(self):
         return ()
 
+    def inputs(self):
+        return self.wired
+
+    def inputConnections(self):  # noqa: N802 - HOM's name
+        return [
+            MagicMock(**{"inputIndex.return_value": i, "inputItem.return_value": item})
+            for i, item in enumerate(self.wired)
+            if item is not None
+        ]
+
     def path(self):
         return self._path
 
@@ -92,6 +103,16 @@ class _FakeNode:
 
     def type(self):
         return MagicMock(**{"name.return_value": "box"})
+
+
+class _IndirectInput:
+    """hou.SubnetIndirectInput: a subnet's input connector, not a node."""
+
+    def __init__(self, number):
+        self._number = number
+
+    def number(self):
+        return self._number
 
 
 class _FakeParent(_FakeNode):
@@ -408,9 +429,14 @@ _PLACEMENT_EXEMPT = {
     # under /obj, destroyed in the same call.
     ("_connectors_for_type", "root"),
     ("_connectors_for_type", "scratch"),
+    # ... or an Attribute VOP inside it, when a VOP type will not build in a
+    # material network.
+    ("_connectors_for_type", "parent"),
     # build_network's probe of a spec with its parms applied, in the build's
     # own parent, destroyed in the same call like _parm_names_for_type's.
     ("_probe_connectors", "scratch"),
+    # Its replay of a spec's parms to see which stay locked at the build.
+    ("_locked_on_build", "scratch"),
     # The /mat context itself: a root-level manager, which the floor
     # deliberately never moves (moveToGoodPosition relocates /obj).
     ("_create_material_network", "hou.node('/')"),
@@ -493,3 +519,131 @@ class TestPlacementIsRecorded:
         node = parent.created[0]
         assert node.positions == [(0, 0)]
         assert node.placements == []
+
+
+class _Vec(tuple):
+    """Just enough of hou.Vector2 for the position arithmetic in copy_node."""
+
+    def __new__(cls, x, y):
+        return super().__new__(cls, (x, y))
+
+    def __add__(self, other):
+        return _Vec(self[0] + other[0], self[1] + other[1])
+
+
+class TestCopyNodePlacement:
+    """hou.copyNodesTo keeps the original's position, so copy_node put the
+    copy exactly on top of its original and said nothing about where it was.
+    Measured on Houdini 22.0.429: a node at (3, -2) was copied to (3, -2)."""
+
+    def _setup(self, monkeypatch, into_other_network=False):
+        network = _FakeNode("/obj/geo1")
+        other = _FakeNode("/obj/geo2")
+        original = _FakeNode("/obj/geo1/box1", pos=_Vec(3.0, -2.0), parent=network)
+        original.size = lambda: _Vec(1.13, 0.4)
+        target = other if into_other_network else network
+        copied = _FakeNode(f"{target.path()}/box2", pos=original.pos, parent=target)
+        calls = []
+
+        def copy_nodes_to(sources, parent):
+            calls.append(parent)
+            return (copied,)
+
+        monkeypatch.setattr(nodes.hou, "copyNodesTo", copy_nodes_to, raising=False)
+        monkeypatch.setattr(nodes.hou, "Vector2", _Vec, raising=False)
+        found = {"/obj/geo1/box1": original, "/obj/geo2": other}
+        monkeypatch.setattr(nodes, "_get_node", lambda path: found[path])
+        return copied, calls
+
+    def test_a_copy_in_the_same_network_lands_beside_its_original(self, monkeypatch):
+        copied, _ = self._setup(monkeypatch)
+        reply = nodes.copy_node("/obj/geo1/box1")
+        assert copied.pos == pytest.approx((5.13, -2.0))  # one node width + 1 to the right
+        assert reply["position"] == list(copied.position())
+        assert reply["offset_applied"] == pytest.approx([2.13, 0.0])
+
+    def test_an_explicit_offset_wins(self, monkeypatch):
+        copied, _ = self._setup(monkeypatch)
+        reply = nodes.copy_node("/obj/geo1/box1", offset=[0, -5])
+        assert copied.pos == (3.0, -7.0)
+        assert reply["position"] == [3.0, -7.0]
+        assert reply["offset_applied"] == [0.0, -5.0]
+
+    def test_a_copy_into_another_network_keeps_the_original_position(self, monkeypatch):
+        copied, _ = self._setup(monkeypatch, into_other_network=True)
+        reply = nodes.copy_node("/obj/geo1/box1", dest_parent="/obj/geo2")
+        assert copied.positions == []  # nothing to hide there
+        assert reply["position"] == [3.0, -2.0]
+        assert reply["offset_applied"] is None
+
+    def test_the_copy_is_recorded_as_placed(self, monkeypatch):
+        """Its position is decided, so the floor must not move it later."""
+        copied, _ = self._setup(monkeypatch, into_other_network=True)
+        nodes.copy_node("/obj/geo1/box1", dest_parent="/obj/geo2")
+        assert copied.userData(config._PLACED_TAG) is not None
+
+    @pytest.mark.parametrize("offset", [[1], [1, 2, 3], "12", 5, ["a", 0]])
+    def test_a_bad_offset_is_refused_before_anything_is_copied(self, monkeypatch, offset):
+        _, calls = self._setup(monkeypatch)
+        with pytest.raises(ValueError, match=r"offset must be \[dx, dy\]"):
+            nodes.copy_node("/obj/geo1/box1", offset=offset)
+        assert calls == []
+
+
+class TestCopyNodeNamesTheCopysInputs:
+    """copy_node's reply said nothing about the copy's wires. Measured on
+    Houdini 22.0.429: a DOP network wired from a grid and a merge was copied
+    with both wires in place, and the reply named neither, so the caller read
+    the copy's inputs back to find out."""
+
+    def _copy(self, monkeypatch, copied_wires, into_other_network=False, first_empty=False):
+        network = _FakeNode("/obj/geo1")
+        other = _FakeNode("/obj/geo2")
+        grid = _FakeNode("/obj/geo1/grid1", parent=network)
+        merge = _FakeNode("/obj/geo1/merge1", parent=network)
+        original = _FakeNode("/obj/geo1/dopnet1", pos=_Vec(0.0, 0.0), parent=network)
+        original.size = lambda: _Vec(1.0, 0.4)
+        original.wired = (None, merge) if first_empty else (grid, merge)
+        target = other if into_other_network else network
+        copied = _FakeNode(f"{target.path()}/dopnet2", pos=original.pos, parent=target)
+        copied.wired = copied_wires(grid, merge)
+        monkeypatch.setattr(
+            nodes.hou, "copyNodesTo", lambda sources, parent: (copied,), raising=False
+        )
+        monkeypatch.setattr(nodes.hou, "Vector2", _Vec, raising=False)
+        monkeypatch.setattr(nodes.hou, "SubnetIndirectInput", _IndirectInput, raising=False)
+        found = {"/obj/geo1/dopnet1": original, "/obj/geo2": other}
+        monkeypatch.setattr(nodes, "_get_node", lambda path: found[path])
+        dest = "/obj/geo2" if into_other_network else None
+        return nodes.copy_node("/obj/geo1/dopnet1", dest_parent=dest)
+
+    def test_the_wires_the_copy_kept_are_named(self, monkeypatch):
+        reply = self._copy(monkeypatch, lambda grid, merge: (grid, merge))
+        assert reply["inputs"] == [
+            {"index": 0, "from": "/obj/geo1/grid1"},
+            {"index": 1, "from": "/obj/geo1/merge1"},
+        ]
+        assert "inputs_not_copied" not in reply
+
+    def test_an_empty_input_keeps_the_index_of_the_next(self, monkeypatch):
+        reply = self._copy(monkeypatch, lambda grid, merge: (None, merge), first_empty=True)
+        assert reply["inputs"] == [{"index": 1, "from": "/obj/geo1/merge1"}]
+        assert "inputs_not_copied" not in reply
+
+    def test_a_copy_into_another_network_names_the_wires_it_lost(self, monkeypatch):
+        reply = self._copy(monkeypatch, lambda grid, merge: (), into_other_network=True)
+        assert reply["inputs"] == []
+        assert reply["inputs_not_copied"] == [
+            {"index": 0, "from": "/obj/geo1/grid1"},
+            {"index": 1, "from": "/obj/geo1/merge1"},
+        ]
+
+    def test_a_wire_from_the_subnet_s_own_input_is_named_as_such(self, monkeypatch):
+        # Measured on 22.0: inputs() read it as the node feeding the subnet
+        # from outside, which the copy is not wired to.
+        connector = _IndirectInput(0)
+        reply = self._copy(monkeypatch, lambda grid, merge: (connector, merge))
+        assert reply["inputs"] == [
+            {"index": 0, "indirect_input": 0},
+            {"index": 1, "from": "/obj/geo1/merge1"},
+        ]

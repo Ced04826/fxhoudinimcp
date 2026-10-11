@@ -42,6 +42,10 @@ OUTPUT_PARMS = (
     "file",
     "dopoutput",
     "copoutput",
+    # Mantra's ROP. Appended last so no other node type changes precedence.
+    # Without it a Mantra render had no file to check: the verdict called a
+    # render that wrote nothing "unverified", with success true.
+    "vm_picture",
 )
 
 # Output values that are not files. "__render__.usd" is the in-memory stage a LOP

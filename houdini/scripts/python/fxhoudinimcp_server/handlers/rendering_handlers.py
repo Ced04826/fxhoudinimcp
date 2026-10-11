@@ -20,6 +20,7 @@ from typing import Any
 import hou
 
 # Internal
+from fxhoudinimcp_server.callbacks import CallbackError, press
 from fxhoudinimcp_server.config import place_new_node
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
@@ -31,7 +32,13 @@ from fxhoudinimcp_server.outputs import (
     reported_outputs,
     write_verdict,
 )
-from fxhoudinimcp_server.ui import require_ui
+from fxhoudinimcp_server.ui import (
+    keep_viewer_state,
+    require_ui,
+    selection_hidden,
+    viewer_context,
+    viewer_stays_out_of_dops,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +132,9 @@ def render_viewport(
         settings.resolution(tuple(resolution))
 
     # Use the flipbook approach for a single-frame capture
-    scene_viewer.flipbook(viewport, settings)
+    # A selected object would be drawn with its selection outline.
+    with selection_hidden():
+        scene_viewer.flipbook(viewport, settings)
 
     # Handle frame number that flipbook may insert into the filename
     actual_path = _find_flipbook_output(output_path, cur_frame)
@@ -137,6 +146,8 @@ def render_viewport(
         "resolution": resolution,
         "camera": camera,
         "frame": cur_frame,
+        # Which network the image shows, and a note when it is a DOP view.
+        **viewer_context(scene_viewer),
     }
 
 
@@ -174,31 +185,50 @@ def render_quad_view(
     if not viewports:
         raise RuntimeError("No viewports available in the Scene Viewer.")
 
+    if resolution is not None and len(resolution) != 2:
+        raise ValueError("resolution must be a list of [width, height]")
+
     saved_files = []
     base, ext = os.path.splitext(output_path)
 
-    for vp in viewports:
-        vp_name = vp.name()
-        vp_output = f"{base}_{vp_name}{ext}"
+    # A flipbook of a viewport the layout hides writes nothing, so in the
+    # default Single layout three of the four "saved" files never existed.
+    # Show all four for the capture and put the user's layout back.
+    layout = scene_viewer.viewportLayout()
+    scene_viewer.setViewportLayout(hou.geometryViewportLayout.Quad)
+    try:
+        for vp in viewports:
+            vp_name = vp.name()
+            vp_output = f"{base}_{vp_name}{ext}"
 
-        settings = scene_viewer.flipbookSettings().stash()
+            settings = scene_viewer.flipbookSettings().stash()
 
-        _no_mplay(settings)
-        settings.frameRange((hou.frame(), hou.frame()))
-        settings.output(vp_output)
+            _no_mplay(settings)
+            settings.frameRange((hou.frame(), hou.frame()))
+            settings.output(vp_output)
 
-        if resolution is not None:
-            if len(resolution) != 2:
-                raise ValueError("resolution must be a list of [width, height]")
-            settings.resolution(tuple(resolution))
+            if resolution is not None:
+                settings.useResolution(True)
+                settings.resolution(tuple(resolution))
 
-        scene_viewer.flipbook(vp, settings)
-        saved_files.append({"viewport": vp_name, "output_path": vp_output})
+            with selection_hidden():
+                scene_viewer.flipbook(vp, settings)
+            vp_output = _find_flipbook_output(vp_output, hou.frame())
+            saved_files.append(
+                {
+                    "viewport": vp_name,
+                    "output_path": vp_output,
+                    "file_exists": os.path.isfile(vp_output),
+                }
+            )
+    finally:
+        scene_viewer.setViewportLayout(layout)
 
     return {
-        "success": True,
+        "success": all(entry["file_exists"] for entry in saved_files),
         "viewports": saved_files,
         "frame": hou.frame(),
+        **viewer_context(scene_viewer),
     }
 
 
@@ -384,27 +414,43 @@ def create_render_node(
     if out_context is None:
         raise RuntimeError("/out context not found.")
 
-    # Map friendly renderer names to actual node types
+    # Friendly names to the ROP types /out really has, in preference order. The
+    # SOP-level names (rop_geometry, rop_alembic) are what the docs advertise, but
+    # in /out the same nodes are "geometry" and "alembic": creating those raised a
+    # bare "Invalid node type name".
     renderer_map = {
-        "karma": "karma",
-        "opengl": "opengl",
-        "mantra": "ifd",
-        "ifd": "ifd",
-        "geometry": "rop_geometry",
-        "rop_geometry": "rop_geometry",
-        "alembic": "rop_alembic",
-        "rop_alembic": "rop_alembic",
-        "fetch": "fetch",
-        "merge": "merge",
-        "usdrender": "usdrender",
-        "usd_rop": "usd_rop",
-        "filmboxfbx": "filmboxfbx",
-        "comp": "comp",
-        "wedge": "wedge",
-        "baketexture": "baketexture",
+        "karma": ("karma",),
+        "opengl": ("opengl",),
+        "mantra": ("ifd",),
+        "ifd": ("ifd",),
+        "geometry": ("geometry", "rop_geometry"),
+        "rop_geometry": ("geometry", "rop_geometry"),
+        "alembic": ("alembic", "rop_alembic"),
+        "rop_alembic": ("alembic", "rop_alembic"),
+        "usd": ("usd", "usd_rop"),
+        "usd_rop": ("usd", "usd_rop"),
+        "fbx": ("filmboxfbx", "rop_fbx"),
+        "rop_fbx": ("filmboxfbx", "rop_fbx"),
+        "filmboxfbx": ("filmboxfbx", "rop_fbx"),
+        "gltf": ("gltf", "rop_gltf"),
+        "rop_gltf": ("gltf", "rop_gltf"),
+        "fetch": ("fetch",),
+        "merge": ("merge",),
+        "usdrender": ("usdrender",),
+        "comp": ("comp",),
+        "wedge": ("wedge",),
+        "baketexture": ("baketexture",),
     }
 
-    node_type = renderer_map.get(renderer.lower(), renderer)
+    available = set(hou.ropNodeTypeCategory().nodeTypes())
+    candidates = renderer_map.get(renderer.lower(), (renderer,))
+    node_type = next((c for c in candidates if c in available), None)
+    if node_type is None:
+        raise ValueError(
+            f"No ROP type '{renderer}' in this Houdini (looked for: {', '.join(candidates)}). "
+            f"Renderer names that work here: {', '.join(sorted(k for k, v in renderer_map.items() if any(c in available for c in v)))}. "
+            "Other types in /out can be passed by their exact name."
+        )
 
     try:
         node = out_context.createNode(node_type, name)
@@ -436,6 +482,27 @@ def create_render_node(
         "node_type": node.type().name(),
         "renderer": renderer,
     }
+
+
+# Renderers that write their image from a separate process (husk, mantra).
+# render() can return before the file lands, and a Karma CPU frame took ~3 s to
+# appear on a laptop: the 2 s default called that render "nothing was written".
+_OUT_OF_PROCESS_RENDERERS = ("karma", "usdrender", "usdrender_rop", "ifd", "karmarendersettings")
+_OUT_OF_PROCESS_GRACE = 20.0
+
+
+def _render_grace(node) -> float:
+    """Seconds to keep looking for a render's file: longer for out-of-process renderers.
+
+    The wait ends the moment a file (or an error) appears, so the extra time is
+    only paid by a render that really wrote nothing.
+    """
+    from fxhoudinimcp_server.config import output_grace_seconds
+
+    grace = output_grace_seconds()
+    if node.type().name().split("::")[0] in _OUT_OF_PROCESS_RENDERERS:
+        return max(grace, _OUT_OF_PROCESS_GRACE)
+    return grace
 
 
 ###### rendering.start_render
@@ -582,10 +649,124 @@ def _background_status(node_path: str) -> dict[str, Any] | None:
     }
 
 
+#: "Wait for Render to Complete" on a Karma LOP / usdrender ROP. Off on a fresh
+#: Karma LOP (22.0.429): execute returns while husk is still rendering, and a
+#: foreground render is judged before its file exists.
+_FOREGROUND_PARM = "soho_foreground"
+
+
+def _override_targets(node: hou.Node, overrides: dict) -> list[tuple[str, hou.Parm, Any]]:
+    """(name, parm, value) for every override, all resolved before anything is set.
+
+    A parm tuple ("t", "res") takes a list and expands to its components, the
+    way set_parameters takes it.
+    """
+    if not isinstance(overrides, dict) or not overrides:
+        raise ValueError("overrides must be a non-empty {parm_name: value} dict.")
+    targets: list[tuple[str, hou.Parm, Any]] = []
+    missing: list[str] = []
+    for name, value in overrides.items():
+        parm = node.parm(name)
+        if parm is not None:
+            targets.append((name, parm, value))
+            continue
+        parm_tuple = node.parmTuple(name)
+        if parm_tuple is None:
+            missing.append(name)
+            continue
+        if not isinstance(value, (list, tuple)) or len(value) != len(parm_tuple):
+            raise ValueError(
+                f"Override '{name}' on {node.path()} has {len(parm_tuple)} components; "
+                f"pass a list of {len(parm_tuple)} values."
+            )
+        targets.extend(
+            (f"{name}[{i}]", component, v)
+            for i, (component, v) in enumerate(zip(parm_tuple, value, strict=True))
+        )
+    if missing:
+        from fxhoudinimcp_server.handlers.parameter_handlers import parm_labels, suggest_parms
+
+        labels = parm_labels(node)
+        hints = {name: close for name in missing if (close := suggest_parms(name, labels))}
+        hint = f" Did you mean: {hints}?" if hints else ""
+        raise ValueError(
+            f"No parameter(s) {missing} on {node.path()} to override; nothing was set.{hint}"
+        )
+    return targets
+
+
+def _snapshot(parm: hou.Parm) -> dict[str, Any]:
+    """What putting *parm* back needs: its keyframes (an expression is one), else its value."""
+    keys = tuple(parm.keyframes())
+    if keys:
+        return {"keyframes": keys}
+    if parm.parmTemplate().type() == hou.parmTemplateType.String:
+        # "$HIP/render/$F4.exr" comes back as written, not as today's expansion.
+        return {"value": parm.unexpandedString()}
+    return {"value": parm.eval()}
+
+
+def _restore_overrides(
+    applied: list[tuple[str, hou.Parm, dict[str, Any]]],
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Put every overridden parm back, expressions and keyframes included."""
+    restored: list[str] = []
+    failed: list[dict[str, str]] = []
+    for name, parm, state in reversed(applied):
+        try:
+            with contextlib.suppress(Exception):
+                parm.deleteAllKeyframes()
+            if "keyframes" in state:
+                for key in state["keyframes"]:
+                    parm.setKeyframe(key)
+            else:
+                parm.set(state["value"])
+            restored.append(name)
+        except Exception as e:  # keep restoring the rest
+            failed.append({"parm": name, "error": readable_message(e)})
+    return restored, failed
+
+
+def _apply_overrides(
+    targets: list[tuple[str, hou.Parm, Any]],
+    applied: list[tuple[str, hou.Parm, dict[str, Any]]],
+) -> None:
+    """Set each override, adding it to *applied* with what puts it back.
+
+    set() over an expression keeps the expression, so the keys go first. A
+    write Houdini refuses (a locked parm, a value of the wrong type) puts back
+    what was already set and names the parm: the render never runs on half of
+    the overrides.
+    """
+    for name, parm, value in targets:
+        state = _snapshot(parm)
+        try:
+            if state.get("keyframes"):
+                parm.deleteAllKeyframes()
+            parm.set(value)
+        except (hou.Error, TypeError) as e:
+            # The refused parm is put back quietly: a write refused as locked
+            # refuses the restore just the same, having changed nothing.
+            _restore_overrides([(name, parm, state)])
+            _, failed = _restore_overrides(applied)
+            applied.clear()
+            after = (
+                f" These could not be put back: {failed}."
+                if failed
+                else " The overrides set before it were put back."
+            )
+            raise ValueError(
+                f"Override '{name}' on {parm.node().path()} could not be set: "
+                f"{readable_message(e)}. Nothing was rendered.{after}"
+            ) from e
+        applied.append((name, parm, state))
+
+
 def start_render(
     node_path: str,
     frame_range: list = None,
     background: bool = False,
+    overrides: dict = None,
 ) -> dict:
     """Begin rendering a ROP node.
 
@@ -598,12 +779,21 @@ def start_render(
             at once; get_render_progress follows the process. Off by default:
             a foreground render shows the user Houdini's own progress dialog,
             and the dispatcher puts no deadline on it.
+        overrides: {parm_name: value} set for this render only and put back
+            afterwards, expressions and keyframes included, even when the
+            render fails. A parm tuple takes a list. Foreground only.
     """
     node, category, can_render = _renderable(node_path)
-    execute_parm = node.parm("execute")
 
     if frame_range is not None and len(frame_range) < 2:
         raise ValueError("frame_range must have at least [start, end].")
+
+    if background and overrides:
+        raise ValueError(
+            "overrides apply to a foreground render only: a background render loads "
+            "the saved hip, which does not carry them. Save the values first, or "
+            "render in the foreground."
+        )
 
     if background:
         before = reported_outputs(node)
@@ -626,6 +816,41 @@ def start_render(
             "outputs": before,
         }
 
+    overrides = dict(overrides or {})
+    foreground = node.parm(_FOREGROUND_PARM)
+    forced = foreground is not None and _FOREGROUND_PARM not in overrides and not foreground.eval()
+    if forced:
+        overrides[_FOREGROUND_PARM] = 1
+    targets = _override_targets(node, overrides) if overrides else []
+    applied: list[tuple[str, hou.Parm, dict[str, Any]]] = []
+    try:
+        _apply_overrides(targets, applied)
+        result = _render_in_foreground(node, node_path, category, can_render, frame_range)
+    finally:
+        restored, not_restored = _restore_overrides(applied)
+    if applied:
+        result["overrides_applied"] = [name for name, _, _ in applied]
+        result["overrides_restored"] = restored
+        if not_restored:
+            result["overrides_not_restored"] = not_restored
+    if forced:
+        result["foreground_forced"] = (
+            f"{_FOREGROUND_PARM} (Wait for Render to Complete) was off, which lets "
+            "the render return before the image is written; it was on for this "
+            "render and is off again."
+        )
+    return result
+
+
+def _render_in_foreground(
+    node: hou.Node,
+    node_path: str,
+    category: str,
+    can_render: bool,
+    frame_range: list | None,
+) -> dict:
+    """Render *node* in this Houdini and judge what it wrote."""
+    execute_parm = node.parm("execute")
     # Snapshot the outputs so "did this write anything" is answerable afterwards
     # rather than inferred from a call that did not raise. Evaluated at the first
     # frame of the range: at the playbar's frame a render of 41-43 read as
@@ -653,8 +878,10 @@ def start_render(
             method = "execute button"
             if frame_range is not None:
                 _apply_frame_range_parms(node, frame_range)
-            execute_parm.pressButton()
-    except hou.OperationFailed as e:
+            # Save to Disk is a Python callback: pressButton() would answer
+            # its exception with a modal window instead of raising.
+            press(execute_parm)
+    except (hou.OperationFailed, CallbackError) as e:
         with at_frame(first_frame):
             verdict = failure_verdict(node, before, e)
         return {"node_path": node_path, "category": category, "method": method, **verdict}
@@ -666,7 +893,7 @@ def start_render(
     # verifying a screenshot of an image that was never written, so read the
     # node's own errors and whether the files moved.
     with at_frame(first_frame):
-        verdict = write_verdict(node, before, action="Render")
+        verdict = write_verdict(node, before, action="Render", grace=_render_grace(node))
     return {
         "node_path": node_path,
         "category": category,
@@ -712,19 +939,22 @@ def render_node_network(
     if network_editor is None:
         raise RuntimeError("No Network Editor pane found.")
 
-    # Navigate to the node's parent network so the node is visible
-    parent = node.parent()
-    if parent is not None:
-        network_editor.cd(parent.path())
-
-    # Frame the node in the editor
-    network_editor.setCurrentNode(node)
-    network_editor.homeToSelection()
-
     # Capture the network editor as an image via Qt widget grab
     from fxhoudinimcp_server.handlers.viewport_handlers import _capture_pane_tab_qt
 
-    _capture_pane_tab_qt(network_editor, output_path)
+    # Navigate to the node's parent network so the node is visible, and frame
+    # it, keeping the viewer's cameras and the selection. Showing a node in a
+    # DOP network takes the Scene Viewer there too; the editor goes back after
+    # the shot.
+    with viewer_stays_out_of_dops():
+        with keep_viewer_state():
+            parent = node.parent()
+            if parent is not None:
+                network_editor.cd(parent.path())
+            network_editor.setCurrentNode(node)
+            network_editor.homeToSelection()
+
+        _capture_pane_tab_qt(network_editor, output_path)
 
     return {
         "success": True,

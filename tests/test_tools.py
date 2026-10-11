@@ -7,16 +7,23 @@ import pytest
 from support import tool_input_schema
 
 # Internal
+from fxhoudinimcp.bridge import NO_TIMEOUT
 from fxhoudinimcp.errors import ConnectionError as HoudiniConnectionError
 from fxhoudinimcp.tools.code import execute_python, set_update_mode
 from fxhoudinimcp.tools.materials import list_materials
-from fxhoudinimcp.tools.nodes import create_network_box, create_node, set_object_transform
+from fxhoudinimcp.tools.nodes import (
+    create_network_box,
+    create_node,
+    press_button,
+    set_object_transform,
+)
 from fxhoudinimcp.tools.scene import (
     get_houdini_connection_status,
     get_scene_info,
     new_scene,
     undo,
 )
+from fxhoudinimcp.tools.viewport import frame_all, set_viewport_direction, set_viewport_display
 from fxhoudinimcp.tools.workflows import setup_pyro_sim
 
 
@@ -35,7 +42,13 @@ class TestSceneTools:
         mock_bridge.execute.assert_called_once_with("scene.new_scene", {"save_current": True})
 
     @pytest.mark.asyncio
-    async def test_connection_status_success(self, mock_ctx, mock_bridge):
+    async def test_connection_status_success(self, mock_ctx, mock_bridge, monkeypatch):
+        from fxhoudinimcp.tools import session
+
+        async def one_session(bridge):
+            return [{"port": 8100, "pid": 123, "current": True, "started_here": False}]
+
+        monkeypatch.setattr(session, "list_sessions", one_session)
         mock_bridge.base_url = "http://localhost:8100"
         mock_bridge.health_check.return_value = {"status": "ok", "pid": 123}
         result = await get_houdini_connection_status(mock_ctx)
@@ -43,6 +56,7 @@ class TestSceneTools:
             "connected": True,
             "base_url": "http://localhost:8100",
             "health": {"status": "ok", "pid": 123},
+            "sessions": [{"port": 8100, "pid": 123, "current": True, "started_here": False}],
         }
 
     @pytest.mark.asyncio
@@ -129,6 +143,17 @@ class TestNodeTools:
             "nodes.create_node",
             {"parent_path": "/obj", "node_type": "geo", "name": "my_geo", "position": [0, 0]},
         )
+
+    @pytest.mark.asyncio
+    async def test_press_button_sends_action_only_when_asked(self, mock_ctx, mock_bridge):
+        await press_button(mock_ctx, node_path="/obj/d/pf", parm_name="expr")
+        await press_button(mock_ctx, node_path="/obj/d/pf", parm_name="expr", action=True)
+        sent = [call.args[1] for call in mock_bridge.execute.call_args_list]
+        assert sent == [
+            {"node_path": "/obj/d/pf", "parm_name": "expr"},
+            {"node_path": "/obj/d/pf", "parm_name": "expr", "action": True},
+        ]
+        assert mock_bridge.execute.call_args.kwargs == {"timeout": NO_TIMEOUT}
 
 
 class TestCodeTools:
@@ -228,6 +253,7 @@ class TestEvidenceTools:
         mock_bridge.execute.assert_called_once_with(
             "graph.cook_frame_range",
             {"node_path": "/obj/geo1/sim", "step": 1.0, "volumes": False},
+            timeout=NO_TIMEOUT,
         )
 
     @pytest.mark.asyncio
@@ -254,6 +280,7 @@ class TestEvidenceTools:
                 "end": 5,
                 "attribs": ["heat"],
             },
+            timeout=NO_TIMEOUT,
         )
 
     @pytest.mark.asyncio
@@ -310,6 +337,67 @@ class TestEvidenceTools:
             },
         )
 
+    @pytest.mark.asyncio
+    async def test_get_parameters_non_default_only(self, mock_ctx, mock_bridge):
+        from fxhoudinimcp.tools.parameters import get_parameters
+
+        mock_bridge.execute.return_value = {"rows": []}
+        await get_parameters(mock_ctx, inside="/obj/sim/popnet", non_default_only=True)
+        mock_bridge.execute.assert_called_once_with(
+            "parameters.get_parameters",
+            {
+                "include_defaults": False,
+                "non_default_only": True,
+                "inside": "/obj/sim/popnet",
+                "recursive": False,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_parameters_into_locked_assets(self, mock_ctx, mock_bridge):
+        from fxhoudinimcp.tools.parameters import get_parameters
+
+        mock_bridge.execute.return_value = {"rows": []}
+        await get_parameters(
+            mock_ctx,
+            inside="/obj/sim",
+            patterns=["file"],
+            recursive=True,
+            include_locked_assets=True,
+        )
+        mock_bridge.execute.assert_called_once_with(
+            "parameters.get_parameters",
+            {
+                "include_defaults": False,
+                "patterns": ["file"],
+                "inside": "/obj/sim",
+                "recursive": True,
+                "include_locked_assets": True,
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_verify_network_does_not_force_a_cook_by_default(self, mock_ctx, mock_bridge):
+        from fxhoudinimcp.tools.graph import verify_network
+
+        mock_bridge.execute.return_value = {"healthy": True}
+        await verify_network(mock_ctx, parent_path="/obj/geo1")
+        mock_bridge.execute.assert_called_once_with(
+            "graph.verify_network",
+            {"parent_path": "/obj/geo1", "force_cook": False},
+        )
+
+    @pytest.mark.asyncio
+    async def test_verify_network_forwards_force_cook(self, mock_ctx, mock_bridge):
+        from fxhoudinimcp.tools.graph import verify_network
+
+        mock_bridge.execute.return_value = {"healthy": True}
+        await verify_network(mock_ctx, parent_path="/obj/geo1", force_cook=True)
+        mock_bridge.execute.assert_called_once_with(
+            "graph.verify_network",
+            {"parent_path": "/obj/geo1", "force_cook": True},
+        )
+
 
 class TestParityTools:
     @pytest.mark.asyncio
@@ -338,6 +426,39 @@ class TestParityTools:
         await set_update_mode(mock_ctx)
         mock_bridge.execute.assert_called_once_with("code.set_update_mode", {})
 
+    @pytest.mark.asyncio
+    async def test_viewport_direction_sends_only_the_free_view(self, mock_ctx, mock_bridge):
+        await set_viewport_direction(mock_ctx, rotation=[-20, 30, 0], distance=12)
+        mock_bridge.execute.assert_called_once_with(
+            "viewport.set_viewport_direction", {"rotation": [-20, 30, 0], "distance": 12}
+        )
+
+    @pytest.mark.asyncio
+    async def test_frame_all_sends_the_nodes_to_frame(self, mock_ctx, mock_bridge):
+        await frame_all(mock_ctx, node_paths=["/obj/geo1"])
+        mock_bridge.execute.assert_called_once_with(
+            "viewport.frame_all", {"node_paths": ["/obj/geo1"]}
+        )
+
+    @pytest.mark.asyncio
+    async def test_viewport_display_sends_only_what_was_given(self, mock_ctx, mock_bridge):
+        await set_viewport_display(mock_ctx, environment_background=False)
+        mock_bridge.execute.assert_called_once_with(
+            "viewport.set_viewport_display", {"environment_background": False}
+        )
+
+    @pytest.mark.asyncio
+    async def test_viewport_display_sends_the_grid_point_size_and_scheme(
+        self, mock_ctx, mock_bridge
+    ):
+        await set_viewport_display(
+            mock_ctx, reference_plane=False, point_size=4, color_scheme="darkgrey"
+        )
+        mock_bridge.execute.assert_called_once_with(
+            "viewport.set_viewport_display",
+            {"reference_plane": False, "point_size": 4, "color_scheme": "darkgrey"},
+        )
+
 
 class TestNodeCard:
     """The card is the lookup that replaces guessing at parameter names."""
@@ -356,9 +477,7 @@ class TestNodeCard:
         )
 
     @pytest.mark.asyncio
-    async def test_help_can_be_asked_for_when_the_names_are_not_enough(
-        self, mock_ctx, mock_bridge
-    ):
+    async def test_help_can_be_asked_for_when_the_names_are_not_enough(self, mock_ctx, mock_bridge):
         from fxhoudinimcp.tools.graph import get_node_card
 
         mock_bridge.execute.return_value = {"type": "polyfill"}

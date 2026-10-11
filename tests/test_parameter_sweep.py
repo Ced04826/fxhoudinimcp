@@ -7,6 +7,16 @@ an execute_python. get_parameters now takes `inside` (a network) instead of
 capped at 2000 rows with `truncated`. `patterns` is required there, and
 `node_path` with `inside` is refused.
 
+A recursive sweep does not read the nodes inside locked HDAs (the instance
+itself is read): a POP network's file patterns came back as hundreds of rows
+of the solvers' own internals. They are counted in
+`skipped_inside_locked_assets`; include_locked_assets=True reads them.
+
+non_default_only=True keeps only the parameters changed from their defaults,
+each with its default beside the value; with `inside` it needs no patterns.
+"What was changed on these 33 nodes of a POP network" was 33 get_node_info
+calls or an execute_python.
+
 hou is mocked here and only through monkeypatch; the live check ran on
 Houdini 22.0.429 (six file SOPs, one call, six rows, `$JOB` visible raw).
 """
@@ -16,6 +26,7 @@ from __future__ import annotations
 # Built-in
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 # Third-party
@@ -55,11 +66,13 @@ def _parm(name, value, raw=None, kind="String", label=None):
     return parm
 
 
-def _node(path, type_name, parms):
+def _node(path, type_name, parms, inside_locked=False):
     node = MagicMock()
     node.path.return_value = path
     node.type.return_value.name.return_value = type_name
     node.parms.return_value = list(parms)
+    node.isLockedHDA.return_value = False
+    node.isInsideLockedHDA.return_value = inside_locked
     return node
 
 
@@ -77,10 +90,81 @@ def _image(path, raw):
 def _library(monkeypatch, children, descendants=None):
     parent = MagicMock()
     parent.path.return_value = "/mat/lib"
+    parent.isLockedHDA.return_value = False
+    parent.isInsideLockedHDA.return_value = False
     parent.children.return_value = list(children)
     parent.allSubChildren.return_value = list(descendants or children)
     monkeypatch.setattr(parameters.hou, "node", lambda path: parent if path == "/mat/lib" else None)
     return parent
+
+
+class TestRecursiveSweepStopsAtLockedAssets:
+    def _popnet(self, monkeypatch):
+        solver = _node("/obj/sim/popnet/popsolver1", "popsolver", [_parm("file", "")])
+        buried = _node(
+            "/obj/sim/popnet/popsolver1/filedef",
+            "file",
+            [_parm("file", "default.bgeo")],
+            inside_locked=True,
+        )
+        cache = _node("/obj/sim/filecache1", "filecache", [_parm("file", "$HIP/sim.bgeo.sc")])
+        parent = _library(monkeypatch, [], descendants=[solver, buried, cache])
+        return parent
+
+    def test_the_insides_of_a_locked_asset_are_skipped_and_counted(self, monkeypatch):
+        self._popnet(monkeypatch)
+        result = parameters._get_parameters(inside="/mat/lib", patterns=["file"], recursive=True)
+        assert [r["node"] for r in result["rows"]] == [
+            "/obj/sim/popnet/popsolver1",
+            "/obj/sim/filecache1",
+        ]
+        assert result["nodes_scanned"] == 2
+        assert result["skipped_inside_locked_assets"] == 1
+        assert "include_locked_assets=True" in result["note"]
+
+    def test_include_locked_assets_reads_them(self, monkeypatch):
+        self._popnet(monkeypatch)
+        result = parameters._get_parameters(
+            inside="/mat/lib", patterns=["file"], recursive=True, include_locked_assets=True
+        )
+        assert len(result["rows"]) == 3
+        assert "skipped_inside_locked_assets" not in result
+        assert "note" not in result
+
+    def test_reading_inside_loads_the_delayed_contents(self, monkeypatch):
+        # A fresh popsolver's ~670 nodes are not loaded until synced, so
+        # include_locked_assets answered none of them.
+        parent = self._popnet(monkeypatch)
+        parameters._get_parameters(
+            inside="/mat/lib", patterns=["file"], recursive=True, include_locked_assets=True
+        )
+        parent.allSubChildren.assert_called_once_with(sync_delayed_definition=True)
+        parent.allSubChildren.reset_mock()
+        parameters._get_parameters(inside="/mat/lib", patterns=["file"], recursive=True)
+        parent.allSubChildren.assert_called_once_with(sync_delayed_definition=False)
+
+    def test_a_sweep_that_starts_inside_a_locked_asset_reads_it(self, monkeypatch):
+        parent = self._popnet(monkeypatch)
+        parent.isLockedHDA.return_value = True
+        result = parameters._get_parameters(inside="/mat/lib", patterns=["file"], recursive=True)
+        assert len(result["rows"]) == 3
+        assert "skipped_inside_locked_assets" not in result
+
+    def test_the_skipped_count_follows_node_type(self, monkeypatch):
+        # node_type="file" scanned 2 and reported every buried node skipped.
+        self._popnet(monkeypatch)
+        result = parameters._get_parameters(
+            inside="/mat/lib", patterns=["file"], recursive=True, node_type="filecache"
+        )
+        assert result["nodes_scanned"] == 1
+        # The one buried node is a "file", not a "filecache": nothing to skip.
+        assert "skipped_inside_locked_assets" not in result
+
+    def test_nothing_skipped_answers_as_before(self, monkeypatch):
+        _library(monkeypatch, [], descendants=[_image("/mat/lib/sub/img", "$JOB/a.exr")])
+        result = parameters._get_parameters(inside="/mat/lib", patterns=["file"], recursive=True)
+        assert len(result["rows"]) == 1
+        assert "skipped_inside_locked_assets" not in result
 
 
 class TestGetParametersInsideANetwork:
@@ -165,3 +249,157 @@ class TestGetParametersInsideANetwork:
         result = parameters._get_parameters("/mat/lib/a", patterns=["file"])
         assert result["parameters"]["file"]["raw_value"] == "$JOB/a.exr"
         assert "rows" not in result
+
+
+class TestDefaultBesideTheValue:
+    """include_defaults said "changed" without saying from what."""
+
+    def _with_default(self, parm, defaults, index=0, expressions=("",)):
+        parm.componentIndex.return_value = index
+        template = parm.parmTemplate.return_value
+        template.defaultValue.return_value = defaults
+        template.defaultExpression.return_value = expressions
+        return parm
+
+    def test_the_component_default_is_reported(self):
+        parm = self._with_default(_parm("ty", 2.5, kind="Float"), (0.0, 1.0, 0.0), index=1)
+        assert parameters._default_of(parm) == {"default": 1.0}
+
+    def test_a_default_expression_is_named(self):
+        parm = self._with_default(_parm("f1", 1, kind="Float"), (1.0,), expressions=("$FSTART",))
+        assert parameters._default_of(parm) == {"default": 1.0, "default_expression": "$FSTART"}
+
+    def test_a_single_string_expression_is_not_cut_to_one_character(self):
+        # A toggle or a menu answers one value and one expression string.
+        parm = self._with_default(_parm("enable", 1, kind="Toggle"), False, expressions="$F>1")
+        assert parameters._default_of(parm) == {"default": False, "default_expression": "$F>1"}
+
+    def test_a_toggle_token_is_not_an_expression(self):
+        # box's rebar answers "off" from defaultExpression() on 22.0.368.
+        parm = self._with_default(_parm("rebar", 0, kind="Toggle"), False, expressions="off")
+        assert parameters._default_of(parm) == {"default": False}
+
+    def test_a_template_without_a_default_answers_nothing(self):
+        parm = _parm("folder", 0, kind="Folder")
+        parm.parmTemplate.return_value.defaultValue.side_effect = AttributeError
+        assert parameters._default_of(parm) == {}
+
+    def test_a_single_node_reports_the_default_beside_the_value(self, monkeypatch):
+        parm = self._with_default(_parm("sizex", 7.5, kind="Float"), (1.0,))
+        node = _node("/obj/geo1/box1", "box", [parm])
+        monkeypatch.setattr(parameters.hou, "node", lambda path: node)
+        result = parameters._get_parameters("/obj/geo1/box1", include_defaults=True)
+        assert result["parameters"]["sizex"] == {
+            "value": 7.5,
+            "is_at_default": False,
+            "default": 1.0,
+        }
+        plain = parameters._get_parameters("/obj/geo1/box1")
+        assert "default" not in plain["parameters"]["sizex"]
+
+    def test_a_parm_at_its_default_does_not_repeat_it(self, monkeypatch):
+        # The default only repeats the value there: +85% on a popsource sweep.
+        parm = self._with_default(_parm("sizex", 1.0, kind="Float"), (1.0,))
+        parm.isAtDefault.return_value = True
+        node = _node("/obj/geo1/box1", "box", [parm])
+        monkeypatch.setattr(parameters.hou, "node", lambda path: node)
+        result = parameters._get_parameters("/obj/geo1/box1", include_defaults=True)
+        assert result["parameters"]["sizex"] == {"value": 1.0, "is_at_default": True}
+
+    def test_the_default_reaches_the_rows(self, monkeypatch):
+        image = _image("/mat/lib/a", "$JOB/a.exr")
+        self._with_default(image.parms.return_value[0], ("",))
+        _library(monkeypatch, [image])
+        result = parameters._get_parameters(
+            inside="/mat/lib", patterns=["file"], include_defaults=True
+        )
+        assert result["rows"][0]["default"] == ""
+
+
+class TestOnlyWhatWasChanged:
+    """Which parameters of a network were changed, and from what, in one call."""
+
+    @staticmethod
+    def _changed(name, value, default, at_default=False):
+        parm = _parm(name, value, kind="Float")
+        parm.isAtDefault.return_value = at_default
+        parm.componentIndex.return_value = 0
+        template = parm.parmTemplate.return_value
+        template.defaultValue.return_value = (default,)
+        template.defaultExpression.return_value = ("",)
+        return parm
+
+    def _source(self):
+        return _node(
+            "/mat/lib/source_first_input",
+            "popsource",
+            [
+                self._changed("life", 1.0, 100.0),
+                self._changed("seed", 0.0, 0.0, at_default=True),
+            ],
+        )
+
+    def test_a_single_node_answers_only_the_changed_parm_with_its_default(self, monkeypatch):
+        node = self._source()
+        monkeypatch.setattr(parameters.hou, "node", lambda path: node)
+        result = parameters._get_parameters("/mat/lib/source_first_input", non_default_only=True)
+        assert result["parameters"] == {
+            "life": {"value": 1.0, "is_at_default": False, "default": 100.0}
+        }
+        assert result["matched"] == 1
+
+    def test_a_network_needs_no_patterns(self, monkeypatch):
+        quiet = _node("/mat/lib/solver", "popsolver", [self._changed("substep", 1.0, 1.0, True)])
+        _library(monkeypatch, [self._source(), quiet])
+        result = parameters._get_parameters(inside="/mat/lib", non_default_only=True)
+        assert [(r["node"], r["parm"], r["default"]) for r in result["rows"]] == [
+            ("/mat/lib/source_first_input", "life", 100.0)
+        ]
+        assert result["nodes_scanned"] == 2
+        assert result["nodes_matched"] == 1
+        assert result["non_default_only"] is True
+
+    def test_patterns_still_narrow_it(self, monkeypatch):
+        _library(monkeypatch, [self._source()])
+        result = parameters._get_parameters(
+            inside="/mat/lib", patterns=["seed"], non_default_only=True
+        )
+        assert result["rows"] == []
+
+    def test_a_parm_that_cannot_say_counts_as_default(self, monkeypatch):
+        parm = self._changed("odd", 1.0, 0.0)
+        parm.isAtDefault.side_effect = RuntimeError("no default")
+        _library(monkeypatch, [_node("/mat/lib/n", "null", [parm])])
+        result = parameters._get_parameters(inside="/mat/lib", non_default_only=True)
+        assert result["rows"] == []
+
+    def test_a_switched_folder_tab_is_not_a_change(self, monkeypatch):
+        # A folder stores its open tab; measured on 22.0, a switched tab is
+        # off its default.
+        node = _node("/obj/geo1/w", "attribwrangle", [_parm("folder01", 1, kind="Folder")])
+        monkeypatch.setattr(parameters.hou, "node", lambda path: node)
+        result = parameters._get_parameters("/obj/geo1/w", non_default_only=True)
+        assert result["parameters"] == {}
+
+    def test_a_ramp_and_its_keys_answer_with_the_ramp_s_own_default(self, monkeypatch):
+        # Measured on 22.0: a fresh popcolor's ramp2pos is off isAtDefault,
+        # and the ramp parm stays at it after a key moved.
+        monkeypatch.setattr(parameters.hou, "parmTemplateType", SimpleNamespace(Ramp="Ramp"))
+        ramp = _parm("ramp", 2, kind="Ramp")
+        ramp.parmTemplate.return_value.type.return_value = "Ramp"
+        ramp.isAtDefault.return_value = True
+        key = _parm("ramp2pos", 1.0, kind="Float")
+        key.parentMultiParm.return_value = ramp
+        ramp.isAtRampDefault.return_value = True
+        assert not parameters._off_default(key)
+        assert not parameters._off_default(ramp)
+        ramp.isAtRampDefault.return_value = False
+        assert parameters._off_default(key)
+        assert parameters._off_default(ramp)
+
+    def test_without_it_a_network_still_wants_patterns_and_names_the_way_out(self, monkeypatch):
+        _library(monkeypatch, [self._source()])
+        with pytest.raises(ValueError, match="non_default_only"):
+            parameters._get_parameters(inside="/mat/lib")
+        plain = parameters._get_parameters(inside="/mat/lib", patterns=["life"])
+        assert "non_default_only" not in plain

@@ -23,6 +23,9 @@ from fxhoudinimcp.server import _get_bridge, mcp
 async def get_parameter(ctx: Context, node_path: str, parm_name: str) -> dict:
     """Get the value and metadata of a parameter.
 
+    A ramp reads as {"type": "Ramp", "basis", "keys", "values", "is_color"},
+    which set_parameters and build_network take back as it is.
+
     Args:
         node_path: Node path.
         parm_name: Parameter name.
@@ -44,6 +47,7 @@ async def set_parameter(
     parm_name: str,
     value: Value,
     override_expression: bool = False,
+    run_callbacks: bool = False,
     expression_policy: str | None = None,
     return_values: str = "summary",
 ) -> dict:
@@ -60,8 +64,20 @@ async def set_parameter(
     writes THROUGH it into the parameter it reads, so the value lands on
     another node. The reply names that parameter in `written_through`.
 
+    Inside a DOP network a write does not reset frames already simulated:
+    `simulation_cache` names the network to pass to reset_simulation.
+
     A String parameter echoes `raw_value` (the unexpanded text, `$JOB/...`)
     next to the expanded `new_value`.
+
+    A list with {"expr": ...} components ("t": [{"expr": "$F"}, 0, 0]) and
+    a whole ramp ({"keys", "values", "basis"}) go through set_parameters:
+    this tool's `value` takes plain values only.
+
+    A LOCKED parameter (karmarendersettings resolutiony under res_mode
+    autoheight) takes nothing at all; the error names the menu whose callback
+    sets the lock. Houdini runs such callbacks only from the UI: set that menu
+    with run_callbacks=True first, then the locked parameter.
 
     Args:
         node_path: Node path.
@@ -69,6 +85,9 @@ async def set_parameter(
         value: New value (int, float, string, bool, or list).
         override_expression: Remove an expression standing in the way,
             instead of reporting that the write did not take.
+        run_callbacks: Run the parameter's callback script after the write,
+            as editing it in the UI does (`callback_run` in the reply, and
+            `callback_error` when the callback raised).
         expression_policy: Alias of override_expression: "replace" is
             override_expression=True, "preserve" is the default report-only
             write. Contradicting override_expression is an error.
@@ -83,6 +102,7 @@ async def set_parameter(
         "parm_name": parm_name,
         "value": value,
         "override_expression": override_expression,
+        "run_callbacks": run_callbacks,
         "return_values": return_values,
     }
     if expression_policy is not None:
@@ -99,10 +119,14 @@ async def set_parameters(
     node_path: str,
     params: dict[str, Any],
     override_expression: bool = False,
+    run_callbacks: bool = False,
     expression_policy: str | None = None,
     return_values: str = "summary",
 ) -> dict:
-    """Batch-set multiple parameters on a node.
+    """Batch-set multiple parameters on a node, in the order given.
+
+    Inside a DOP network a write does not reset frames already simulated:
+    `simulation_cache` names the network to pass to reset_simulation.
 
     Parameters that held an expression and therefore ignored the literal are
     listed in `expressions_kept`, with a top-level `warning`: a batch whose
@@ -112,12 +136,26 @@ async def set_parameters(
     carries the same keys as set_parameter's reply. Pass
     override_expression=True to clear those expressions and links instead.
 
+    Locked parameters are in `errors` with `locked: true` and listed in
+    `locked_parms`; the error names the menu whose callback sets the lock.
+    With run_callbacks=True each parameter's callback runs after its write, so
+    `{"res_mode": "manual", "resolutiony": 1080}` unlocks and then writes; a
+    callback that raised is listed in `callbacks_not_run`.
+
     Args:
         node_path: Node path.
-        params: Mapping of parameter names to values. A value written
-            {"expr": "...", "language": "hscript" | "python"} is set as an
-            expression, as in build_network.
+        params: Mapping of parameter names to values, written in this order.
+            A value written {"expr": "...", "language": "hscript" | "python"}
+            is set as an expression, as in build_network, also as one
+            component of a list ("t": [{"expr": "$F"}, 0, 0]). A ramp takes the
+            whole ramp at once: {"keys": [0, 1], "values": [[1, 0, 0],
+            [0, 0, 1]], "basis": "linear"} (one basis or one per key; a
+            float ramp takes numbers), the shape get_parameter reads it in.
+            A ramp's `new_value` is what it holds once the whole call is
+            through, so a key added by count and then set reads as set.
         override_expression: Remove expressions standing in the way.
+        run_callbacks: Run each parameter's callback script after its write,
+            as the UI does.
         expression_policy: Alias of override_expression: "replace" is
             override_expression=True, "preserve" is the default report-only
             write. Contradicting override_expression is an error.
@@ -132,6 +170,7 @@ async def set_parameters(
         "node_path": node_path,
         "params": params,
         "override_expression": override_expression,
+        "run_callbacks": run_callbacks,
         "return_values": return_values,
     }
     if expression_policy is not None:
@@ -316,6 +355,12 @@ async def get_expression(ctx: Context, node_path: str, parm_name: str) -> dict:
 async def revert_parameter(ctx: Context, node_path: str, parm_name: str) -> dict:
     """Revert a parameter to its default value.
 
+    A default that is itself an expression comes back, named in
+    `default_expression` with its `default_expression_language`;
+    `expression_error` says when it does not evaluate.
+
+    A locked parameter cannot be reverted; the error names what sets the lock.
+
     Args:
         node_path: Node path.
         parm_name: Parameter name.
@@ -473,6 +518,8 @@ async def get_parameters(
     inside: str | None = None,
     recursive: bool = False,
     node_type: str | None = None,
+    include_locked_assets: bool = False,
+    non_default_only: bool = False,
 ) -> dict:
     """Read many parameter values at once, matched by name or label substring.
 
@@ -490,14 +537,24 @@ async def get_parameters(
     Args:
         node_path: Node to read.
         patterns: Substrings matched against parameter name and label. Omit for
-            everything, up to the cap. Required with `inside`.
-        include_defaults: Also report whether each value is still the default.
+            everything, up to the cap. Required with `inside`, unless
+            non_default_only.
+        include_defaults: Also report whether each value is still the default,
+            and, where it differs, the default (`default`, `default_expression`).
         inside: Network to read instead of a single node.
         recursive: With `inside`, include every descendant, not only children.
+            Nodes inside locked HDAs (a solver's own internals) are skipped
+            and counted in `skipped_inside_locked_assets`.
         node_type: With `inside`, only nodes of this type (e.g. "mtlximage").
+        include_locked_assets: With `recursive`, read inside locked HDAs too.
+        non_default_only: Only parameters changed from their defaults, each
+            with its default: "what was changed on every node of this network"
+            in one call (with `inside`, no patterns needed).
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {"include_defaults": include_defaults}
+    if non_default_only:
+        params["non_default_only"] = True
     if node_path is not None:
         params["node_path"] = node_path
     if patterns is not None:
@@ -507,4 +564,6 @@ async def get_parameters(
         params["recursive"] = recursive
         if node_type is not None:
             params["node_type"] = node_type
+        if include_locked_assets:
+            params["include_locked_assets"] = True
     return await bridge.execute("parameters.get_parameters", params)

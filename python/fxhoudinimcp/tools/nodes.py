@@ -91,14 +91,24 @@ async def copy_node(
     node_path: str,
     dest_parent: str | None = None,
     new_name: str | None = None,
+    offset: list[float] | None = None,
 ) -> dict:
     """Copy a node, optionally into a different parent network.
+
+    In the same network the copy lands one node width to the right of its
+    original instead of on top of it; in another network it keeps the
+    original's position. `offset` overrides both, and `position` in the reply
+    says where the copy is. `inputs` lists the wires the copy kept
+    ({index, from}, or {index, indirect_input} for a subnet's own input
+    connector); `inputs_not_copied` the original's wires it could not keep,
+    as in a copy into another network.
 
     Args:
         ctx: MCP context.
         node_path: Source node path.
         dest_parent: Destination parent path.
         new_name: Name for the copy.
+        offset: [dx, dy] from the original's position.
     """
     bridge = _get_bridge(ctx)
     params: dict = {"node_path": node_path}
@@ -106,6 +116,8 @@ async def copy_node(
         params["dest_parent"] = dest_parent
     if new_name is not None:
         params["new_name"] = new_name
+    if offset is not None:
+        params["offset"] = offset
     return await bridge.execute("nodes.copy_node", params)
 
 
@@ -132,8 +144,14 @@ async def move_node(ctx: Context, node_path: str, dest_parent: str) -> dict:
 async def get_node_info(ctx: Context, node_path: str) -> dict:
     """Get type, connections, flags, errors, cook time, and non-default parameters for a node.
 
+    A parameter whose expression uses a SOP local variable ($CEX, $BBX, $PT, @N.x)
+    is not evaluated outside a cook: it comes with `value: null`, its `expression`
+    and `local_variable: true`.
+
     Returns only parameters that differ from their defaults (non_default_parameters)
     plus a total_param_count. Use get_parameter_schema to inspect the full parameter list.
+    A VOP node also gets `connector_types`: the data type each input and output
+    carries now (a variadic input is "undef" on the type until it is wired).
 
     Args:
         ctx: MCP context.
@@ -149,17 +167,22 @@ async def list_children(
     parent_path: str,
     recursive: bool = False,
     filter_type: str | None = None,
+    include_locked_assets: bool = False,
 ) -> dict:
     """List children of a network node.
 
     Avoid `recursive=True` on large networks — it can return hundreds or
     thousands of nodes. Prefer `find_nodes` with a specific pattern instead.
+    A recursive listing does not enter locked assets (a POP or FLIP solver's
+    insides): the asset itself is listed, flagged `locked_asset`.
 
     Args:
         ctx: MCP context.
         parent_path: Parent network path.
         recursive: Include all descendants (use sparingly on large scenes).
         filter_type: Node type filter (e.g. 'box', 'merge').
+        include_locked_assets: With recursive, also list what locked assets
+            contain.
     """
     bridge = _get_bridge(ctx)
     params: dict = {
@@ -168,6 +191,8 @@ async def list_children(
     }
     if filter_type is not None:
         params["filter_type"] = filter_type
+    if include_locked_assets:
+        params["include_locked_assets"] = True
     return await bridge.execute("nodes.list_children", params)
 
 
@@ -279,6 +304,7 @@ async def press_button(
     parm_name: str,
     arguments: dict[str, Any] | None = None,
     cook: bool = False,
+    action: bool = False,
 ) -> dict:
     """Press a button parameter — "Stash Input", "Reload Geometry", an
     asset's own Build button — and read the node's errors and warnings
@@ -286,13 +312,22 @@ async def press_button(
 
     The call holds until the callback returns, with no deadline. A callback
     that opens a dialog blocks Houdini's main thread and this bridge with it;
-    read the button's script first if in doubt. For a Save to Disk or a
-    render use write_cache / start_render, which report a verdict.
+    read the button's script first if in doubt. A Python callback that
+    RAISES does not hang anything: the bridge runs it rather than
+    pressButton(), and its error comes back as this call's error.
+    `callback_route` says how the press ran: python, hscript or native (a
+    built-in action). For a Save to Disk or a render use write_cache /
+    start_render, which report a verdict.
 
     A press usually only dirties the node, so `errors`/`warnings` are from
     its last cook unless `cook=True`; without it `needs_cook` says whether
     they are stale (a cook that failed leaves it True too). `has_script_callback` is False for built-in buttons that still
     do work (File's Reload, Stash's Stash Input).
+
+    A parm that is not a button and has no callback is refused: pressing it
+    does nothing. The small action button beside a field ("Create spare
+    parameters" on a VEXpression) runs with action=True; an action that
+    opens a picker holds the bridge like a dialog does.
 
     Args:
         node_path: Node that owns the button.
@@ -300,6 +335,8 @@ async def press_button(
         arguments: Optional kwargs handed to the callback script; values
             must be int, bool, float or str.
         cook: Cook the node after the press so errors describe the result.
+        action: Run the parm's action button (script_action) instead of its
+            callback.
     """
     bridge = _get_bridge(ctx)
     payload: dict[str, Any] = {"node_path": node_path, "parm_name": parm_name}
@@ -307,6 +344,8 @@ async def press_button(
         payload["arguments"] = arguments
     if cook:
         payload["cook"] = True
+    if action:
+        payload["action"] = True
     return await bridge.execute("nodes.press_button", payload, timeout=NO_TIMEOUT)
 
 

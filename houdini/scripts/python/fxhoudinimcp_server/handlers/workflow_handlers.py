@@ -14,10 +14,11 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.config import focus_editor_enabled, layout_if_enabled, place_new_node
+from fxhoudinimcp_server.config import layout_if_enabled, place_new_node
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
-from fxhoudinimcp_server.ui import set_other_objects
+from fxhoudinimcp_server.handlers.node_handlers import _refuse_taken_name
+from fxhoudinimcp_server.ui import focus_network_editor
 
 ###### Helpers
 
@@ -31,25 +32,12 @@ def _get_node(node_path: str) -> hou.Node:
 
 
 def _focus_network_editor(node: hou.Node, place_unpositioned: bool = True) -> None:
-    """Best-effort: lay out, pan the editor to *node*, hide the other objects."""
-    try:
-        parent = node.parent()
-        if parent is not None:
-            layout_if_enabled(parent, place_unpositioned=place_unpositioned)
-        if not focus_editor_enabled():
-            return  # the switch is off: placement only, the panes stay put
-        for pane_tab in hou.ui.paneTabs():
-            if pane_tab.type() == hou.paneTabType.NetworkEditor:
-                if parent is not None:
-                    pane_tab.cd(parent.path())
-                pane_tab.setCurrentNode(node)
-                pane_tab.homeToSelection()
-                # The viewer follows into the new object; the source object and
-                # the rest of the scene would otherwise draw over the sim.
-                set_other_objects("hide")
-                return
-    except Exception:
-        pass
+    """Best-effort: lay out, pan the editor to *node*, hide the other objects.
+
+    The viewer follows into the new object; the source object and the rest of
+    the scene would otherwise draw over the sim.
+    """
+    focus_network_editor(node, place_unpositioned, other_objects="hide")
 
 
 def _ensure_obj_context() -> hou.Node:
@@ -908,7 +896,7 @@ def _setup_vellum_sim(
 
 
 def _create_material(
-    name: str = "material1",
+    name: str | None = None,
     mat_type: str = "principled",
     base_color: list = None,
     roughness: float = 0.5,
@@ -929,6 +917,11 @@ def _create_material(
         opacity: Opacity (0.0 = transparent, 1.0 = opaque).
     """
     mat = _ensure_mat_context()
+    # A name the caller chose is theirs or an error; only the default numbers up.
+    if name:
+        _refuse_taken_name(mat, name)
+    else:
+        name = "material1"
     color = list(base_color[:3]) if base_color is not None and len(base_color) >= 3 else None
 
     if mat_type == "principled":
@@ -1197,6 +1190,12 @@ def _setup_render(
         _set_parm_safe(rop, "res_overridex", resolution[0])
         _set_parm_safe(rop, "res_overridey", resolution[1])
         applied["resolution"] = "override_camerares + res_override"
+        # The Karma ROP in /out also has its own resolutionx/y, and that is
+        # the size it renders at: the override pair alone left a 1280x720
+        # image while this reply said 320x180.
+        if _set_parm_safe(rop, "resolutionx", resolution[0]):
+            _set_parm_safe(rop, "resolutiony", resolution[1])
+            applied["resolution"] += " + resolutionx/y"
     elif _set_parm_safe(rop, "resolutionx", resolution[0]):
         _set_parm_safe(rop, "resolutiony", resolution[1])
         applied["resolution"] = "resolutionx/y"

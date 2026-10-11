@@ -44,7 +44,15 @@ _NO_UNDO_GROUP = frozenset({"scene.undo", "scene.redo"})
 # while Houdini keeps working. FXHOUDINIMCP_TIMEOUT_<COMMAND> can still put
 # one back per command.
 _UNBOUNDED_COMMANDS = frozenset(
-    {"cache.write_cache", "rendering.start_render", "nodes.press_button"}
+    {
+        "cache.write_cache",
+        "rendering.start_render",
+        "nodes.press_button",
+        # A frame loop under Houdini's progress bar: a sparse pyro sim at 13 s a
+        # frame ran past 120 s while Houdini kept cooking, and the next command
+        # timed out queued behind it.
+        "graph.cook_frame_range",
+    }
 )
 
 # What to do when a command does time out, where the answer is not simply a
@@ -65,6 +73,12 @@ _TIMEOUT_HINTS = {
         "unless FXHOUDINIMCP_TIMEOUT_NODES_PRESS_BUTTON set one; for a Save to Disk or a "
         "render, write_cache / start_render report a verdict."
     ),
+    "graph.cook_frame_range": (
+        "Houdini is still cooking the range under its progress bar. Wait for the "
+        "verdict; it can be stopped from that bar and answers with the frames cooked "
+        "so far. This command has no deadline unless "
+        "FXHOUDINIMCP_TIMEOUT_GRAPH_COOK_FRAME_RANGE set one."
+    ),
     "code.execute_python": (
         "If this was a cook, a render or a Save to Disk, use write_cache / start_render "
         "instead of pressing buttons in Python: they have no deadline and report a verdict."
@@ -77,13 +91,20 @@ def command_timeout(command: str) -> float | None:
 
     ``FXHOUDINIMCP_TIMEOUT_<COMMAND>`` wins (the dotted name uppercased with
     dots as underscores, so ``tops.cook_top_node`` reads
-    ``FXHOUDINIMCP_TIMEOUT_TOPS_COOK_TOP_NODE``), then ``FXHOUDINIMCP_TIMEOUT``
-    for every command, then the built-in default. Read from the process
-    environment on purpose: this runs on an hwebserver worker thread, where
-    ``hou.getenv`` is not safe to call.
+    ``FXHOUDINIMCP_TIMEOUT_TOPS_COOK_TOP_NODE``), then a command with no
+    deadline has none, then ``FXHOUDINIMCP_TIMEOUT`` for every other command,
+    then the built-in default. Read from the process environment on purpose:
+    this runs on an hwebserver worker thread, where ``hou.getenv`` is not safe
+    to call.
     """
     specific = "FXHOUDINIMCP_TIMEOUT_" + command.upper().replace(".", "_")
     for name in (specific, "FXHOUDINIMCP_TIMEOUT"):
+        # The every-command value does not reach a command with no deadline:
+        # `fxhoudinimcp install` writes FXHOUDINIMCP_TIMEOUT=120 into the
+        # package, which put 120 s back on write_cache, start_render and
+        # press_button for every install. Only the command's own variable does.
+        if name == "FXHOUDINIMCP_TIMEOUT" and command in _UNBOUNDED_COMMANDS:
+            return None
         raw = os.environ.get(name, "").strip()
         if not raw:
             continue
@@ -95,8 +116,6 @@ def command_timeout(command: str) -> float | None:
         if value > 0:
             return value
         logger.warning("Ignoring %s=%r: must be positive", name, raw)
-    if command in _UNBOUNDED_COMMANDS:
-        return None
     return _COMMAND_TIMEOUT
 
 
@@ -254,7 +273,10 @@ def dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
             def _run():
                 try:
                     container["result"] = hdefereval.executeInMainThreadWithResult(_execute)
-                except Exception as exc:
+                except BaseException as exc:  # noqa: BLE001
+                    # BaseException too: a KeyboardInterrupt or SystemExit from
+                    # the main thread used to kill this thread with nothing in
+                    # the container, and the caller read a bare KeyError 'result'.
                     container["error"] = exc
                     container["tb"] = traceback.format_exc()
 
@@ -286,7 +308,10 @@ def dispatch(command: str, params: dict[str, Any]) -> dict[str, Any]:
                     "status": "error",
                     "error": {
                         "code": "DISPATCH_ERROR",
-                        "message": f"Failed to dispatch to main thread: {container['error']}",
+                        "message": (
+                            "Failed to dispatch to main thread: "
+                            f"{type(container['error']).__name__}: {container['error']}"
+                        ),
                         "traceback": container.get("tb", ""),
                     },
                 }

@@ -233,3 +233,23 @@ def test_startup_calls_exist_on_the_real_module():
                     f"{name} calls mcp.{func.attr}(), which is not part of the "
                     "API the menu is meant to use"
                 )
+
+
+def test_connect_dialog_names_every_client_install_registers():
+    """Parity: every client install.py knows is named, with its manual form.
+
+    The dialog used to say install "finds Claude Code and Claude Desktop" and
+    gave a manual line for Claude Code only, while install registered nine.
+    """
+    from fxhoudinimcp import install
+
+    details = _run_item("fxhoudinimcp_connect")["details"]
+    for key, (label, executable, add, _remove) in install.CLI_CLIENTS.items():
+        line = " ".join([executable, *add, "<python>", "-m", "fxhoudinimcp"])
+        assert line in details, f"no manual line for {label}: {line}"
+        assert key in details
+    for key, (label, *_rest) in install.JSON_CLIENTS.items():
+        assert label in details, f"{label} is not named"
+        assert key in details
+    assert '"command": "<python>"' in details
+    assert '"command": "python"' not in details

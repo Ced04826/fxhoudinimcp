@@ -13,9 +13,11 @@ from typing import Any
 import hou
 
 # Internal
-from fxhoudinimcp_server.config import focus_editor_enabled, layout_if_enabled, place_new_node
+from fxhoudinimcp_server.config import place_new_node
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
+from fxhoudinimcp_server.handlers.node_handlers import _refuse_taken_name
+from fxhoudinimcp_server.ui import focus_network_editor as _focus_network_editor
 
 ###### Helpers
 
@@ -26,25 +28,6 @@ def _get_node(node_path: str) -> hou.Node:
     if node is None:
         raise ValueError(f"Node not found: {node_path}")
     return node
-
-
-def _focus_network_editor(node: hou.Node) -> None:
-    """Best-effort: layout the parent network, then pan the editor to *node*."""
-    try:
-        parent = node.parent()
-        if parent is not None:
-            layout_if_enabled(parent)
-        if not focus_editor_enabled():
-            return  # the switch is off: placement only, the panes stay put
-        for pane_tab in hou.ui.paneTabs():
-            if pane_tab.type() == hou.paneTabType.NetworkEditor:
-                if parent is not None:
-                    pane_tab.cd(parent.path())
-                pane_tab.setCurrentNode(node)
-                pane_tab.homeToSelection()
-                return
-    except Exception:
-        pass
 
 
 ###### chops.get_chop_data
@@ -154,6 +137,8 @@ def _create_chop_node(
         name: Optional name for the new node.
     """
     parent = _get_node(parent_path)
+    if name:
+        _refuse_taken_name(parent, name)
 
     try:
         node = parent.createNode(chop_type, node_name=name)

@@ -24,11 +24,18 @@ async def get_houdini_connection_status(ctx: Context) -> dict:
     """Check the MCP-to-Houdini bridge without raising on disconnect.
 
     Returns structured connection diagnostics, including the configured bridge
-    URL and Houdini health payload when reachable. Use this before live viewport
-    workflows when Houdini may have restarted or its hwebserver may not be
-    running.
+    URL and Houdini health payload when reachable, and `sessions`: every
+    Houdini serving the plugin (port, pid, version), the one in use marked
+    current. connect_houdini switches; start_houdini starts one. Use this
+    before live viewport workflows when Houdini may have restarted.
     """
+    from fxhoudinimcp.tools.session import list_sessions
+
     bridge = _get_bridge(ctx)
+    try:
+        sessions = await list_sessions(bridge)
+    except Exception:
+        sessions = None
     try:
         health = await bridge.health_check()
     except HoudiniConnectionError as exc:
@@ -37,6 +44,7 @@ async def get_houdini_connection_status(ctx: Context) -> dict:
             "base_url": bridge.base_url,
             "error": str(exc),
             "details": exc.details,
+            "sessions": sessions,
         }
     except Exception as exc:
         return {
@@ -44,6 +52,7 @@ async def get_houdini_connection_status(ctx: Context) -> dict:
             "base_url": bridge.base_url,
             "error": str(exc),
             "details": {"type": type(exc).__name__},
+            "sessions": sessions,
         }
 
     # mcp.health is deliberately free of hou.* access, so it cannot report the
@@ -68,6 +77,7 @@ async def get_houdini_connection_status(ctx: Context) -> dict:
         "connected": True,
         "base_url": bridge.base_url,
         "health": health,
+        "sessions": sessions,
     }
 
     # Advisory only: tells the assistant when the version markers in the

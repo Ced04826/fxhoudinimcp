@@ -301,6 +301,15 @@ def _explain_node(node_path: str, **_: Any) -> dict:
     node = _get_node(node_path)
     node_type = node.type()
 
+    # Errors first: evaluating parms (below) then reading errors() in the
+    # same tick pins a transient expression error, see get_node_info.
+    errors = []
+    warnings = []
+    with contextlib.suppress(Exception):
+        errors = list(node.errors())
+    with contextlib.suppress(Exception):
+        warnings = list(node.warnings())
+
     # Type description
     type_desc = node_type.description()
     type_name = node_type.name()
@@ -334,12 +343,6 @@ def _explain_node(node_path: str, **_: Any) -> dict:
         )
 
     # Current state
-    errors = []
-    warnings = []
-    with contextlib.suppress(Exception):
-        errors = list(node.errors())
-    with contextlib.suppress(Exception):
-        warnings = list(node.warnings())
     try:
         cook_time = node.cookTime()
     except Exception:

@@ -137,9 +137,17 @@ class HoudiniBridge:
     """
 
     def __init__(self, host: str = "localhost", port: int = 8100, timeout: float = 60.0):
+        self.host = host
+        self.port = port
         self.base_url = f"http://{host}:{port}"
         self.timeout = timeout
         self._client: httpx.AsyncClient | None = None
+
+    async def retarget(self, port: int) -> None:
+        """Talk to the Houdini on ``port`` from now on (connect_houdini, start_houdini)."""
+        self.port = port
+        self.base_url = f"http://{self.host}:{port}"
+        await self._reset_client()
 
     @property
     def _api_url(self) -> str:

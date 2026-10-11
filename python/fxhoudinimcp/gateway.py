@@ -52,6 +52,7 @@ ABOUT = {
     "parameters": "read and write parameters, expressions, spare parameters, links",
     "rendering": "render settings, ROPs, Karma and husk renders, viewport renders",
     "scene": "hip files: new, load, save, import, export, undo",
+    "session": "which Houdini this server talks to: connect to another port, start or stop one",
     "shelf": "shelf tools",
     "takes": "takes: list, create, switch",
     "tops": "PDG / TOP networks: cook, work items, schedulers, logs",

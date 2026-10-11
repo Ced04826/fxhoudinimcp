@@ -16,16 +16,23 @@ from typing import Any
 import hou
 
 # Internal
+from fxhoudinimcp_server.callbacks import (
+    CallbackError,
+    action_script,
+    callback_script,
+    press,
+    run_action,
+)
 from fxhoudinimcp_server.config import (
     auto_layout_enabled,
-    focus_editor_enabled,
-    layout_if_enabled,
     mark_placed,
     place_new_node,
 )
 from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.errors import readable_message
+from fxhoudinimcp_server.handlers.dop_handlers import dop_cache_note
 from fxhoudinimcp_server.serialize import to_jsonable
+from fxhoudinimcp_server.ui import focus_network_editor as _focus_network_editor
 
 ###### Helpers
 
@@ -48,31 +55,6 @@ def _node_summary(node: hou.Node) -> dict:
     }
 
 
-def _focus_network_editor(node: hou.Node, place_unpositioned: bool = True) -> None:
-    """Best-effort: layout the parent network, then pan the editor to *node*.
-
-    Callers that created nothing pass ``place_unpositioned=False``, so a call
-    that only rewires or flips a flag never relocates a node the user parked at
-    the origin. The panning half only runs with ``FXHOUDINIMCP_FOCUS_EDITOR``
-    on (see ``focus_editor_enabled``); the layout half always runs.
-    """
-    try:
-        parent = node.parent()
-        if parent is not None:
-            layout_if_enabled(parent, place_unpositioned)
-        if not focus_editor_enabled():
-            return
-        for pane_tab in hou.ui.paneTabs():
-            if pane_tab.type() == hou.paneTabType.NetworkEditor:
-                if parent is not None:
-                    pane_tab.cd(parent.path())
-                pane_tab.setCurrentNode(node)
-                pane_tab.homeToSelection()
-                return
-    except Exception:
-        pass  # Never let UI helpers break a tool call
-
-
 ###### nodes.create_node
 
 
@@ -91,6 +73,8 @@ def create_node(
         position: Optional [x, y] position in the network editor.
     """
     parent = _get_node(parent_path)
+    if name:
+        _refuse_taken_name(parent, name)
 
     try:
         node = parent.createNode(node_type, node_name=name)
@@ -111,13 +95,16 @@ def create_node(
 
     _focus_network_editor(node)
 
-    return {
+    result = {
         "success": True,
         "node_path": node.path(),
         "node_type": node.type().name(),
         "name": node.name(),
         "position": list(node.position()),
     }
+    if cache := dop_cache_note([node]):
+        result["simulation_cache"] = cache
+    return result
 
 
 ###### nodes.delete_node
@@ -145,6 +132,22 @@ def delete_node(node_path: str) -> dict:
 ###### nodes.rename_node
 
 
+def _refuse_taken_name(parent, name: str, node=None) -> None:
+    """Raise when ``name`` belongs to another child of ``parent``.
+
+    Houdini's own answer to a clash is a silent "name1", which rename, copy and
+    create then reported as success under a name the caller never asked for,
+    so every later call on the requested name hit the other node. build_network
+    already refused; this makes the single-node tools agree.
+    """
+    taken = parent.node(name)
+    if taken is not None and taken != node:
+        raise ValueError(
+            f"'{name}' is already taken in {parent.path()} by {taken.path()}. "
+            f"Rename or delete that node first, or pick another name."
+        )
+
+
 def rename_node(node_path: str, new_name: str) -> dict:
     """Rename an existing node.
 
@@ -154,7 +157,8 @@ def rename_node(node_path: str, new_name: str) -> dict:
     """
     node = _get_node(node_path)
     old_name = node.name()
-    node.setName(new_name, unique_name=True)
+    _refuse_taken_name(node.parent(), new_name, node)
+    node.setName(new_name)
 
     return {
         "success": True,
@@ -171,28 +175,88 @@ def copy_node(
     node_path: str,
     dest_parent: str = None,
     new_name: str = None,
+    offset: list = None,
 ) -> dict:
     """Copy a node, optionally into a different parent network.
+
+    ``hou.copyNodesTo`` keeps the original's position, so a copy made in the
+    same network lands exactly on top of its original and hides it. There
+    the copy is moved one node width (plus a unit of gap) to the right; in
+    another network it keeps the original's position. ``offset`` overrides
+    both, and ``position`` in the reply says where the copy is.
 
     Args:
         node_path: Path to the source node.
         dest_parent: Destination parent path. If None, copies within the same parent.
         new_name: Optional name for the copied node.
+        offset: Optional [dx, dy] from the original's position.
     """
     node = _get_node(node_path)
     parent = _get_node(dest_parent) if dest_parent else node.parent()
 
+    # Checked before copying, so a bad offset does not leave a stray copy behind.
+    if offset is not None:
+        try:
+            if not isinstance(offset, (list, tuple)):
+                raise TypeError
+            dx, dy = (float(value) for value in offset)
+        except (TypeError, ValueError):
+            raise ValueError(f"offset must be [dx, dy], got {offset!r}.") from None
+        offset = [dx, dy]
+    if new_name:
+        _refuse_taken_name(parent, new_name)
+
     copied = hou.copyNodesTo([node], parent)[0]
 
     if new_name:
-        copied.setName(new_name, unique_name=True)
+        copied.setName(new_name)
 
-    return {
+    if offset is None and parent == node.parent():
+        offset = [float(node.size()[0]) + 1.0, 0.0]
+    if offset is not None:
+        copied.setPosition(node.position() + hou.Vector2(offset[0], offset[1]))
+    # The copy's position is decided here, including a copy that keeps the
+    # original's (0, 0) in another network -- without the tag the floor would
+    # read that as "never positioned" and move it on a later call.
+    mark_placed(copied)
+
+    result = {
         "success": True,
         "source_path": node_path,
         "copied_path": copied.path(),
         "name": copied.name(),
+        "position": list(copied.position()),
+        "offset_applied": offset,
     }
+    # The wires the copy came with: without them a caller had to read the
+    # copy's inputs back to learn they had survived. A copy into another
+    # network cannot keep a wire from this one, and that is said rather than
+    # left to be discovered.
+    with contextlib.suppress(Exception):
+        kept = _wires(copied)
+        result["inputs"] = [{"index": i, **kept[i]} for i in sorted(kept)]
+        original = _wires(node)
+        lost = [{"index": i, **original[i]} for i in sorted(original) if i not in kept]
+        if lost:
+            result["inputs_not_copied"] = lost
+    return result
+
+
+def _wires(node: hou.Node) -> dict[int, dict[str, Any]]:
+    """Each input of *node* by index: {"from": path}, or {"indirect_input": n}.
+
+    inputConnections(), not inputs(): measured on 22.0, a wire from a
+    subnet's input connector read in inputs() as the node feeding the subnet
+    from outside, a node the copy is not wired to.
+    """
+    wires: dict[int, dict[str, Any]] = {}
+    for conn in node.inputConnections():
+        item = conn.inputItem()
+        if isinstance(item, hou.SubnetIndirectInput):
+            wires[conn.inputIndex()] = {"indirect_input": item.number()}
+        else:
+            wires[conn.inputIndex()] = {"from": item.path()}
+    return wires
 
 
 ###### nodes.move_node
@@ -268,10 +332,38 @@ def _is_at_default(parm: hou.Parm, value: Any, default: Any) -> bool:
         return False
 
 
+# SOP local variables, which only exist while the node cooks ($CEX/$CEY/$CEZ
+# for a pivot at the centroid, $BBX, $SIZEX, $XMIN, $NPT, $PT, a Group SOP's
+# factory $N), and `@attr` references (a Ray SOP's factory `@N.x`).
+_COOK_LOCAL = re.compile(
+    r"\$(?:CE[XYZ]|GC[XYZ]|BB[XYZ]|SIZE[XYZ]|[XYZ](?:MIN|MAX)|NPT|NPRIM|PT|PR|VTX|NVTX|NGRP|N)\b"
+    r"|(?<![\w@])@[A-Za-z_]\w*"
+)
+
+_COOK_LOCAL_NOTE = (
+    "SOP local variable: substituted while the node cooks, so it is not evaluated "
+    "here (outside a cook it reads 0). Judge the value by the cooked geometry."
+)
+
+
+def _cook_local_expression(parm: hou.Parm) -> str | None:
+    """*parm*'s expression when it uses a SOP local variable, else None."""
+    try:
+        expression = parm.expression()
+    except Exception:
+        return None
+    if isinstance(expression, str) and _COOK_LOCAL.search(expression):
+        return expression
+    return None
+
+
 def _non_default_parms(node: hou.Node, parms: list[hou.Parm]) -> list[dict[str, Any]]:
     """The parameters of *node* that differ from their defaults, as summaries.
 
     Buttons, folders, separators and labels carry no value and are skipped.
+    An expression with a SOP local variable is named, not evaluated: a pivot
+    at ``$CEX $CEY $CEZ`` read as ``px = 0.0`` on a healthy Transform, and the
+    evaluation put an "Unable to evaluate expression" error on it.
     """
     summary: list[dict[str, Any]] = []
     for parm in parms:
@@ -281,6 +373,28 @@ def _non_default_parms(node: hou.Node, parms: list[hou.Parm]) -> list[dict[str, 
         except Exception:
             continue
         if type_name in _VALUELESS_PARM_TYPES:
+            continue
+        expression = _cook_local_expression(parm)
+        if expression is not None:
+            try:
+                default = _component_default(parm)
+            except Exception:
+                default = None
+            # A type's own expression (a Group SOP's $N) is its default.
+            if _is_at_default(parm, None, default):
+                continue
+            summary.append(
+                {
+                    "name": parm.name(),
+                    "label": parm.description(),
+                    "value": None,
+                    "default": to_jsonable(default),
+                    "type": type_name,
+                    "expression": expression,
+                    "local_variable": True,
+                    "note": _COOK_LOCAL_NOTE,
+                }
+            )
             continue
         try:
             val = parm.eval()
@@ -314,6 +428,22 @@ def get_node_info(node_path: str) -> dict:
         node_path: Absolute path to the node.
     """
     node = _get_node(node_path)
+
+    # Errors and warnings BEFORE any parameter is evaluated. Evaluating a
+    # cook-local expression outside a cook (a factory ``$N`` in a Group SOP's
+    # rangeend, ``@N.x`` in a Ray SOP's dir) sets a transient "Unable to
+    # evaluate expression" on the node, and errors() called afterwards in the
+    # same main-thread tick makes it stick: a healthy node came back with a
+    # real error, and kept it until it was force-cooked. Read first, it is
+    # the node's actual state and nothing is left behind.
+    try:
+        errors = list(node.errors())
+    except Exception:
+        errors = []
+    try:
+        warnings = list(node.warnings())
+    except Exception:
+        warnings = []
 
     # Only return parameters that differ from their defaults — this keeps
     # the response compact (a complex node can have 500+ parms, most at default).
@@ -358,16 +488,6 @@ def get_node_info(node_path: str) -> dict:
     with contextlib.suppress(Exception):
         flags["lock"] = node.isHardLocked()
 
-    # Errors and warnings
-    try:
-        errors = list(node.errors())
-    except Exception:
-        errors = []
-    try:
-        warnings = list(node.warnings())
-    except Exception:
-        warnings = []
-
     # Cook time
     try:
         cook_time = node.cookTime()
@@ -382,7 +502,7 @@ def get_node_info(node_path: str) -> dict:
         "category": node_type.category().name(),
     }
 
-    return {
+    info = {
         "node_path": node.path(),
         "name": node.name(),
         "type": type_info,
@@ -399,6 +519,16 @@ def get_node_info(node_path: str) -> dict:
         "position": list(node.position()),
         "color": list(node.color().rgb()),
     }
+    # What a VOP's connectors carry now: a variadic input is "undef" on the
+    # type and becomes float or int once wired, so whether a multiply comes
+    # out float is a question about the live node, not its card.
+    with contextlib.suppress(Exception):
+        if isinstance(node, hou.VopNode):
+            info["connector_types"] = {
+                "inputs": dict(zip(node.inputNames(), node.inputDataTypes(), strict=False)),
+                "outputs": dict(zip(node.outputNames(), node.outputDataTypes(), strict=False)),
+            }
+    return info
 
 
 ###### nodes.list_children
@@ -408,6 +538,7 @@ def list_children(
     parent_path: str,
     recursive: bool = False,
     filter_type: str = None,
+    include_locked_assets: bool = False,
 ) -> dict:
     """List children of a network node.
 
@@ -415,17 +546,43 @@ def list_children(
         parent_path: Path to the parent network.
         recursive: If True, list all descendants, not just direct children.
         filter_type: Optional node type name to filter by (e.g. "box", "merge").
+        include_locked_assets: With *recursive*, also descend into locked
+            assets. Off by default: a POP network's solver assets filled the
+            500-node cap with their own insides, and the user's nodes were
+            lost among them. A locked asset is still listed, flagged
+            ``locked_asset``.
     """
     parent = _get_node(parent_path)
+    # Listing a locked asset's insides is asking for them: there, every
+    # subnet is uneditable and the walk would stop at the first level.
+    with contextlib.suppress(Exception):
+        if parent.isLockedHDA() or parent.isInsideLockedHDA():
+            include_locked_assets = True
 
-    children = parent.allSubChildren() if recursive else parent.children()
+    # A locked asset's contents load on demand: a fresh popsolver answers 0
+    # children until synced.
+    children = (
+        parent.allSubChildren(
+            recurse_in_locked_nodes=bool(include_locked_assets),
+            sync_delayed_definition=bool(include_locked_assets),
+        )
+        if recursive
+        else parent.children()
+    )
 
     _MAX_CHILDREN = 500
     results = []
     for child in children:
         if filter_type and child.type().name() != filter_type:
             continue
-        results.append(_node_summary(child))
+        summary = _node_summary(child)
+        if recursive and not include_locked_assets:
+            # Say where the listing stopped, so the caller knows there is more.
+            with contextlib.suppress(Exception):
+                # isNetwork(), not children(): unsynced contents count 0.
+                if child.isLockedHDA() is True and child.isNetwork() is True:
+                    summary["locked_asset"] = True
+        results.append(summary)
         if len(results) >= _MAX_CHILDREN:
             break
 
@@ -622,6 +779,43 @@ def _find_input(inputs: list[dict[str, Any]], input_name: str, max_inputs: int =
     raise ValueError(f"has no input named '{input_name}'.{hint}")
 
 
+def _find_output(outputs: list[dict[str, Any]], output_name: str) -> int:
+    """Index of the output called *output_name*: names first, then labels.
+
+    The output-side twin of _find_input, used by build_network's dry run and
+    by its wiring, so the two cannot disagree about what a name means.
+    """
+    for key in ("name", "label"):
+        for entry in outputs:
+            if entry.get(key) == output_name:
+                return int(entry["index"])
+    candidates: list[str] = []
+    for entry in outputs:
+        for value in (entry.get("name"), entry.get("label")):
+            if value and value not in candidates:
+                candidates.append(value)
+    close = get_close_matches(output_name, candidates, n=3, cutoff=0.4)
+    if close:
+        hint = f" Did you mean: {close}?"
+    else:
+        hint = f" Outputs: {candidates[:15] + (['...'] if len(candidates) > 15 else [])}"
+    raise ValueError(f"has no output named '{output_name}'.{hint}")
+
+
+def _output_index(source: hou.Node, source_output: int | str) -> int:
+    """*source_output* as an index on the live *source*: an index, or an output name."""
+    if isinstance(source_output, int):
+        return source_output
+    outputs = [{"index": i, "name": name} for i, name in enumerate(source.outputNames())]
+    with contextlib.suppress(Exception):
+        for entry, label in zip(outputs, source.outputLabels(), strict=False):
+            entry["label"] = label
+    try:
+        return _find_output(outputs, source_output)
+    except ValueError as exc:
+        raise ValueError(f"{source.path()} {exc}") from None
+
+
 def _resolve_input_index(dest: hou.Node, input_index: int, input_name: str | None) -> int:
     """Turn an input name (VOP connector such as "base_color") into its index.
 
@@ -735,6 +929,8 @@ def connect_nodes(
     if indirect_input is not None:
         # source_path stays a path a caller can reuse; the connector is here.
         result["indirect_input"] = int(indirect_input)
+    if cache := dop_cache_note([dest], rewired=True):
+        result["simulation_cache"] = cache
     return result
 
 
@@ -852,19 +1048,28 @@ def press_button(
     parm_name: str,
     arguments: dict | None = None,
     cook: bool = False,
+    action: bool = False,
 ) -> dict:
     """Press a button parameter and report what the node says afterwards.
 
     Runs the button's callback exactly as a click would ("Stash Input",
     "Reload Geometry", an asset's own Build button). The call holds until
     the callback returns, with no deadline; a callback that opens a dialog
-    holds Houdini's main thread, and with it this bridge, until the dialog
-    is closed.
+    of its own holds Houdini's main thread, and with it this bridge, until
+    the dialog is closed. A Python callback that RAISES does not: it runs
+    here rather than through pressButton(), whose modal "Error running
+    callback" window would hold the bridge, and its error is the reply.
+    `callback_route` says which way the press went.
 
     A press usually only dirties the node: `errors` and `warnings` are from
     its last cook, which may predate the press. `cook=True` cooks the node
     after the press so they describe the result; without it `needs_cook`
     says whether they are stale (a cook that failed leaves it True too).
+
+    A parameter that is not a button and has no callback is refused:
+    pressButton() on it does nothing. The small action button beside a
+    field ("Create spare parameters" on a VEXpression) is the parm's
+    ``script_action`` tag, not its callback; ``action=True`` runs it.
 
     Args:
         node_path: Node that owns the button.
@@ -872,6 +1077,8 @@ def press_button(
         arguments: Optional kwargs handed to the callback script; values
             must be int, bool, float or str.
         cook: Cook the node after the press (default False).
+        action: Run the parm's action button (``script_action``) instead of
+            its callback (default False).
     """
     node = _get_node(node_path)
     parm = node.parm(parm_name)
@@ -891,12 +1098,42 @@ def press_button(
             )
     template = parm.parmTemplate()
     parm_type = template.type().name()
+    action_code = action_script(parm)
+    action_help = ""
+    with contextlib.suppress(Exception):
+        help_tag = template.tags().get("script_action_help")
+        if isinstance(help_tag, str):
+            action_help = help_tag
+    if action and not action_code:
+        raise ValueError(
+            f"{node.path()}/{parm_name} has no action button (no script_action tag). "
+            f"Nothing was run."
+        )
+    if not action and parm_type != "Button" and not callback_script(parm):
+        # pressButton() on it returns without doing anything, which used to
+        # come back as success.
+        message = (
+            f"{node.path()}/{parm_name} is a {parm_type} parameter with no callback: "
+            f"pressing it does nothing. Nothing was run."
+        )
+        if action_code:
+            message += (
+                f" Its action button ({action_help or 'script_action'}) runs with "
+                f"action=True; an action that opens a picker or a dialog holds the "
+                f"bridge until it is closed."
+            )
+        raise ValueError(message)
     started = time.perf_counter()
     try:
-        if arguments:
-            parm.pressButton(dict(arguments))
+        if action:
+            run_action(parm, dict(arguments) if arguments else None)
+            route = "action"
         else:
-            parm.pressButton()
+            # Not parm.pressButton() for a Python callback: one that raises
+            # opens Houdini's modal error window and holds the main thread.
+            route = press(parm, dict(arguments) if arguments else None)
+    except CallbackError as exc:
+        raise ValueError(str(exc)) from exc
     except Exception as exc:
         raise ValueError(
             f"Callback of {node.path()}/{parm_name} failed: {readable_message(exc)}"
@@ -909,7 +1146,12 @@ def press_button(
         "parm_type": parm_type,
         "duration_ms": duration_ms,
         "cooked": False,
+        # python: the callback script ran here; hscript / native: pressButton();
+        # action: the parm's script_action ran here.
+        "callback_route": route,
     }
+    if action and action_help:
+        result["action_help"] = action_help
     if cook:
         # A failed cook is an answer, not a failure of the press: its
         # messages land in errors() below.
@@ -927,7 +1169,7 @@ def press_button(
         # Built-in buttons (File's Reload, Stash's Stash Input) are handled in
         # C++ and have no script callback; False does not mean inert.
         result["has_script_callback"] = bool(template.scriptCallback())
-    if parm_type != "Button":
+    if parm_type != "Button" and not action:
         result["note"] = (
             f"'{parm_name}' is a {parm_type} parameter, not a Button; its callback "
             f"script (if any) was triggered the way pressButton does for any parameter."
@@ -952,6 +1194,7 @@ def connect_nodes_batch(
     """
     results = []
     errors = []
+    wired: list = []
 
     last_dest = None
     for conn in connections:
@@ -965,6 +1208,7 @@ def connect_nodes_batch(
             in_idx = _resolve_input_index(dest, in_idx, conn.get("input_name"))
             dest.setInput(in_idx, source, out_idx)
             last_dest = dest
+            wired.append(dest)
             entry = {
                 "source_path": _get_node(src_path).path(),
                 "dest_path": dest.path(),
@@ -986,11 +1230,14 @@ def connect_nodes_batch(
     if last_dest is not None:
         _focus_network_editor(last_dest, place_unpositioned=False)
 
-    return {
+    reply = {
         "success": len(errors) == 0,
         "connected": results,
         "errors": errors,
     }
+    if cache := dop_cache_note(wired, rewired=True):
+        reply["simulation_cache"] = cache
+    return reply
 
 
 ###### nodes.disconnect_node
@@ -1070,11 +1317,14 @@ def disconnect_node(
     else:
         raise ValueError("Provide either input_index or set disconnect_all=True.")
 
-    return {
+    reply = {
         "success": True,
         "node_path": node_path,
         "disconnected_inputs": disconnected,
     }
+    if cache := dop_cache_note([node], rewired=True):
+        reply["simulation_cache"] = cache
+    return reply
 
 
 ###### nodes.reorder_inputs
@@ -1118,11 +1368,14 @@ def reorder_inputs(node_path: str, new_order: list) -> dict:
             item, output_index = wires[old_idx]
             node.setInput(new_idx, item, output_index)
 
-    return {
+    reply = {
         "success": True,
         "node_path": node_path,
         "new_order": order,
     }
+    if cache := dop_cache_note([node], rewired=True):
+        reply["simulation_cache"] = cache
+    return reply
 
 
 ###### nodes.set_node_flags

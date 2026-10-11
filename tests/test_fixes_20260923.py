@@ -40,6 +40,7 @@ import fxhoudinimcp_server.handlers.context_handlers as context  # noqa: E402
 import fxhoudinimcp_server.handlers.graph_handlers as graph  # noqa: E402
 import fxhoudinimcp_server.handlers.node_handlers as nodes  # noqa: E402
 import fxhoudinimcp_server.handlers.viewport_handlers as viewport  # noqa: E402
+import fxhoudinimcp_server.ui as ui  # noqa: E402
 from fxhoudinimcp_server.handlers.state_receipt_helpers import json_safe  # noqa: E402
 
 
@@ -281,10 +282,11 @@ class TestFocusEditorSwitch:
         pane = MagicMock()
         pane.type.return_value = nodes.hou.paneTabType.NetworkEditor
         monkeypatch.setattr(nodes.hou.ui, "paneTabs", lambda: [pane], raising=False)
-        monkeypatch.setattr(nodes, "focus_editor_enabled", lambda: enabled)
+        # The eight handler copies became one, ui.focus_network_editor.
+        monkeypatch.setattr(ui, "focus_editor_enabled", lambda: enabled)
         layouts = []
         monkeypatch.setattr(
-            nodes, "layout_if_enabled", lambda parent, place=True: layouts.append((parent, place))
+            ui, "layout_if_enabled", lambda parent, place=True: layouts.append((parent, place))
         )
         parent = MagicMock()
         parent.path.return_value = "/obj/geo1"

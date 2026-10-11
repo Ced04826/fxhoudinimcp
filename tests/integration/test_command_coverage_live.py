@@ -52,6 +52,27 @@ class TestDops:
         )
 
 
+class TestDopRelationships:
+    def test_merge_relationship_is_reported(self, call):
+        """``hou.DopObject`` has no ``relationships()``; this used to report 0 forever."""
+        net = hou.node("/obj").createNode("dopnet", "reltest")
+        a = net.createNode("emptyobject", "a")
+        b = net.createNode("emptyobject", "b")
+        merge = net.createNode("merge", "m")
+        merge.setInput(0, a)
+        merge.setInput(1, b)
+        merge.setDisplayFlag(True)
+        hou.setFrame(2)
+
+        result = call("dops.get_dop_relationships", node_path=net.path())
+
+        assert result["relationship_count"] >= 1, result
+        by_name = {r["name"]: r for r in result["relationships"]}
+        assert "m" in by_name, sorted(by_name)
+        assert by_name["m"]["objects_in_group"], by_name["m"]
+
+
+@pytest.mark.usefixtures("saved_hip")
 class TestTops:
     def test_top_cook_lifecycle(self, call):
         topnet = call("nodes.create_node", parent_path="/obj", node_type="topnet", name="pdg")[
@@ -434,6 +455,10 @@ class TestLopsModule:
         call("lops.get_usd_layers", node_path=stage)
         call("lops.inspect_usd_layer", node_path=stage, layer_index=0, allow_error=True)
         call("lops.get_usd_prim_stats", node_path=stage)
+        rows = call(
+            "lops.get_usd_attributes", node_path=stage, prims=["/geo/*"], attr_patterns=["radius"]
+        )
+        assert rows["prims_matched"] >= 1 and rows["rows"], rows
         call("lops.get_last_modified_prims", node_path=stage)
         found = call("lops.find_usd_prims", node_path=stage, pattern="*ball*")
         assert "ball" in str(found)
@@ -467,6 +492,30 @@ class TestLopsModule:
         assert "5" in str(intensity.get("value", intensity)), (
             f"set_light_properties claimed intensity=5.0 but stage says {intensity}"
         )
+
+    def test_vector_values_given_as_lists_reach_the_stage(self, call):
+        """JSON has no tuples, and USD refuses a list for a color3f attribute."""
+        lopnet = call("nodes.create_node", parent_path="/obj", node_type="lopnet", name="vec")[
+            "node_path"
+        ]
+        light = call("lops.create_light", parent_path=lopnet, light_type="distant")
+        prim_path = light["prim_path"]
+
+        updated = call(
+            "lops.set_light_properties",
+            node_path=light["node_path"],
+            prim_path=prim_path,
+            properties={"color": [1.0, 0.5, 0.25]},
+        )
+
+        assert updated["success"], updated
+        color = call(
+            "lops.get_usd_attribute",
+            node_path=updated["python_node"],
+            prim_path=prim_path,
+            attr_name="inputs:color",
+        )
+        assert [round(c, 3) for c in color["value"]] == [1.0, 0.5, 0.25], color
 
 
 class TestMopUp:
@@ -514,13 +563,11 @@ class TestMopUp:
         assert "{0,0,1}" in str(code)
         validated = call("vex.validate_vex", node_path=wrangle)
         assert validated["is_valid"] is True, validated
-        call(
-            "vex.create_vex_expression",
-            node_path=wrangle,
-            parm_name="tx",
-            expression="@Frame",
-            allow_error=True,
+        expr = call(
+            "vex.create_vex_expression", node_path="/obj/g", parm_name="tx", vex_code="$F * 2"
         )
+        assert expr["success"] is True, expr
+        assert hou.parm("/obj/g/tx").expression() == "$F * 2"
 
     def test_lops_and_materials_extras(self, call):
         lopnet = call("nodes.create_node", parent_path="/obj", node_type="lopnet", name="stage")[
@@ -532,7 +579,8 @@ class TestMopUp:
         assert prims, prims
         rig = call("lops.create_light_rig", parent_path=lopnet, preset="three_point")
         assert rig, rig
-        types = call("materials.list_material_types")
+        # Filtered: the full list (1100+ types) is capped before "principled".
+        types = call("materials.list_material_types", filter="principled")
         assert "principled" in str(types)
 
     def test_rendering_and_viewport_extras(self, call, tmp_path):
@@ -589,3 +637,45 @@ class TestAnimationModule:
         frame = call("animation.get_frame")
         assert "25" in str(frame)
         call("animation.playbar_control", action="stop", allow_error=True)
+
+
+class TestCreateRenderNodeAdvertisedNames:
+    """The tool's docs name rop_geometry, rop_alembic and usd_rop, but /out spells those
+    geometry, alembic and usd; creating them raised a bare "Invalid node type name".
+    The suite only smoke-called it, so it never noticed."""
+
+    @pytest.mark.parametrize(
+        ("renderer", "expected_type"),
+        [
+            ("rop_geometry", "geometry"),
+            ("geometry", "geometry"),
+            ("rop_alembic", "alembic"),
+            ("alembic", "alembic"),
+            ("usd_rop", "usd"),
+            ("fbx", "filmboxfbx"),
+            ("karma", "karma"),
+            ("opengl", "opengl"),
+            ("fetch", "fetch"),
+            ("merge", "merge"),
+        ],
+    )
+    def test_each_advertised_name_makes_the_node(self, call, renderer, expected_type):
+        result = call("rendering.create_render_node", renderer=renderer, name="adv")
+
+        assert result["success"] is True, result
+        assert result["node_type"] == expected_type, result
+        assert hou.node(result["node_path"]) is not None
+
+    def test_an_unknown_renderer_says_what_is_available(self, call):
+        error = call("rendering.create_render_node", expect_error=True, renderer="notarenderer")
+
+        message = str(error["message"])
+        assert "notarenderer" in message, message
+        assert "geometry" in message and "karma" in message, f"no list of what does work: {message}"
+
+    def test_output_path_lands_on_a_geometry_rop(self, call, tmp_path):
+        out = str(tmp_path / "o.$F4.bgeo.sc").replace("\\", "/")
+
+        result = call("rendering.create_render_node", renderer="rop_geometry", output_path=out)
+
+        assert hou.node(result["node_path"]).parm("sopoutput").unexpandedString() == out

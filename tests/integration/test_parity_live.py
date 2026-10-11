@@ -135,6 +135,7 @@ class TestObjectTransform:
         assert "nothing" in error["message"].lower()
 
 
+@pytest.mark.usefixtures("saved_hip")
 class TestPdgFailures:
     @pytest.fixture
     def failing_top(self, call) -> str:
@@ -177,9 +178,12 @@ class TestPdgFailures:
     def test_failed_items_carry_their_traceback(self, call, failing_top):
         failed = call("tops.get_failed_work_items", node_path=failing_top)
         assert failed["failed"], failed
-        assert all(
-            "parity: deliberate failure" in item.get("log_tail", "") for item in failed["failed"]
-        ), failed
+        # A repeat of an earlier item's traceback points back to it by name
+        # (log_tail_same_as) rather than sending the same 2 KB again.
+        tails = {item["name"]: item["log_tail"] for item in failed["failed"] if "log_tail" in item}
+        for item in failed["failed"]:
+            tail = item.get("log_tail") or tails.get(item.get("log_tail_same_as"), "")
+            assert "parity: deliberate failure" in tail, failed
 
     def test_cook_that_fails_every_item_does_not_report_success(self, call):
         """cook_top_node said success: true, errors: [] with every item cooked_fail.

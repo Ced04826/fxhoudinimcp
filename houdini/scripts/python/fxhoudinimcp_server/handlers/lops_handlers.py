@@ -8,15 +8,21 @@ from __future__ import annotations
 
 # Built-in
 import contextlib
+import fnmatch
+import functools
 import itertools
+import re
 from typing import Any
 
 # Third-party
 import hou
 
 # Internal
-from fxhoudinimcp_server.config import focus_editor_enabled, layout_if_enabled, place_new_node
+from fxhoudinimcp_server.config import place_new_node
 from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.handlers.node_handlers import _refuse_taken_name
+from fxhoudinimcp_server.outputs import at_frame
+from fxhoudinimcp_server.ui import focus_network_editor as _focus_network_editor
 
 # USD modules -- may not be available in all Houdini configurations
 try:
@@ -29,25 +35,6 @@ except ImportError:
 
 
 ###### Helpers
-
-
-def _focus_network_editor(node: hou.Node) -> None:
-    """Best-effort: layout the parent network, then pan the editor to *node*."""
-    try:
-        parent = node.parent()
-        if parent is not None:
-            layout_if_enabled(parent)
-        if not focus_editor_enabled():
-            return  # the switch is off: placement only, the panes stay put
-        for pane_tab in hou.ui.paneTabs():
-            if pane_tab.type() == hou.paneTabType.NetworkEditor:
-                if parent is not None:
-                    pane_tab.cd(parent.path())
-                pane_tab.setCurrentNode(node)
-                pane_tab.homeToSelection()
-                return
-    except Exception:
-        pass
 
 
 def _require_pxr() -> None:
@@ -246,17 +233,107 @@ def _hidden_descendants(prim: Usd.Prim) -> int:
     return max(0, count - 1)
 
 
+def _stage_frame() -> float | None:
+    """The current frame, or None when hou cannot say."""
+    with contextlib.suppress(Exception):
+        return float(hou.frame())
+    return None
+
+
+def _cooked_at_time(handler):
+    """Run a stage read with the stage cooked at the requested *time*.
+
+    A LOP stage holds what its nodes authored at the frame they cooked on: an
+    Xform LOP with ty = $F carries one time sample, at the current frame. Read
+    at Usd.TimeCode(10) from frame 1, it answered ty = 1 under "time": 10.
+    The playbar goes to *time* for the read and back after; a stage whose
+    samples come from a file reads the same either way.
+    """
+
+    # wraps keeps the handler's signature visible: the dispatcher reads it to
+    # explain a bad argument, and a bare **kwargs answered every call alike.
+    @functools.wraps(handler)
+    def run(**kwargs):
+        time = kwargs.get("time")
+        if time is None or time == _stage_frame():
+            return handler(**kwargs)
+        with at_frame(float(time)):
+            return handler(**kwargs)
+
+    return run
+
+
+def _read_time(time: float | None) -> tuple[Any, float | None, str]:
+    """(time code, time, time_source) for reading many attributes at once.
+
+    No *time* means the current frame, which is what the viewport and a
+    render of that frame resolve. A time-sampled attribute read at the
+    default time code answers its default slot instead, a value the render
+    never sees once samples exist. An attribute without samples resolves to
+    its default at any time code, so one frame serves every attribute.
+    """
+    if time is not None:
+        return Usd.TimeCode(float(time)), float(time), "requested"
+    frame = _stage_frame()
+    if frame is not None:
+        return Usd.TimeCode(frame), frame, "stage_frame"
+    return Usd.TimeCode.Default(), None, "default"
+
+
+def _name_matcher(patterns: list[str] | str | None):
+    """A predicate on attribute/relationship names: globs, None = everything."""
+    if not patterns:
+        return lambda name: True
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    return lambda name: any(fnmatch.fnmatchcase(name, p) for p in patterns)
+
+
+def _attr_entry(attr: Any, time_code: Any, full: bool) -> dict[str, Any]:
+    """One attribute: name, type, authored, value at *time_code*, sample count."""
+    entry: dict[str, Any] = {
+        "name": attr.GetName(),
+        "type": str(attr.GetTypeName()),
+        "is_authored": attr.IsAuthored(),
+    }
+    if attr.IsAuthored() or attr.HasValue():
+        try:
+            entry["value"] = _usd_value_to_python(
+                attr.Get(time_code), array_limit=None if full else _ARRAY_SUMMARY_LIMIT
+            )
+        except Exception:
+            entry["value"] = None
+            entry["error"] = "Could not read value"
+    samples = 0
+    with contextlib.suppress(Exception):
+        samples = int(attr.GetNumTimeSamples())
+    if samples:
+        # The value above is the one at this time, not the default slot; the
+        # count says it differs at other frames.
+        entry["time_samples"] = samples
+    return entry
+
+
+def _relationship_entry(rel: Any) -> dict[str, Any]:
+    """One relationship: name and targets (a RenderSettings' `camera`)."""
+    return {"name": rel.GetName(), "relationship": True, "targets": _binding_targets(rel)}
+
+
 def _prim_to_dict(
     prim: Usd.Prim,
     include_attrs: bool = False,
     full: bool = False,
     instance_proxies: bool = False,
+    time_code: Any = None,
+    attr_patterns: list[str] | str | None = None,
 ) -> dict[str, Any]:
     """Convert a USD prim to a JSON-safe dict.
 
     With include_attrs, array values longer than _ARRAY_SUMMARY_LIMIT are
     summarised unless *full* is set, and `children` lists the prims under
-    an instanceable prim's prototype when *instance_proxies* is set.
+    an instanceable prim's prototype when *instance_proxies* is set. Values
+    are read at *time_code* (default: the default time code), and
+    *attr_patterns* narrows the attributes and relationships listed.
     """
     # is_active / has_payload only when they are not the default: true and
     # false on nearly every row of a listing, about a third of each row.
@@ -285,23 +362,18 @@ def _prim_to_dict(
     info["kind"] = str(kind) if kind else ""
 
     if include_attrs:
-        attrs: list[dict[str, Any]] = []
-        for attr in prim.GetAttributes():
-            attr_info: dict[str, Any] = {
-                "name": attr.GetName(),
-                "type": str(attr.GetTypeName()),
-                "is_authored": attr.IsAuthored(),
-            }
-            if attr.IsAuthored() or attr.HasValue():
-                try:
-                    attr_info["value"] = _usd_value_to_python(
-                        attr.Get(), array_limit=None if full else _ARRAY_SUMMARY_LIMIT
-                    )
-                except Exception:
-                    attr_info["value"] = None
-                    attr_info["error"] = "Could not read value"
-            attrs.append(attr_info)
-        info["attributes"] = attrs
+        if time_code is None:
+            time_code = Usd.TimeCode.Default()
+        wanted = _name_matcher(attr_patterns)
+        info["attributes"] = [
+            _attr_entry(attr, time_code, full)
+            for attr in prim.GetAttributes()
+            if wanted(attr.GetName())
+        ]
+        with contextlib.suppress(Exception):
+            info["relationships"] = [
+                _relationship_entry(rel) for rel in prim.GetRelationships() if wanted(rel.GetName())
+            ]
 
         if instance_proxies:
             children = [
@@ -429,13 +501,23 @@ def _get_usd_prim(
     prim_path: str,
     full: bool = False,
     traverse_instance_proxies: bool = False,
+    time: float | None = None,
+    attr_patterns: list[str] | str | None = None,
 ) -> dict[str, Any]:
-    """Detailed prim info with type, kind, attributes, and children.
+    """Detailed prim info with type, kind, attributes, relationships, and children.
 
     Array attributes are summarised (size, element type, head, range) unless
     *full* is set; get_usd_attribute reads one array in windows. An
     instanceable prim answers `children: []` until traverse_instance_proxies
     is set, since its contents live on the prototype.
+
+    Values are read at *time*, or at the current frame without it. They used
+    to come from the default slot: a RenderSettings whose `resolution` had a
+    default of (2048, 1080) and samples of (1920, 1080) at frame 1 and
+    (1280, 720) at frame 24 answered (2048, 1080) on frame 24, which a render
+    of that frame never uses. A time-sampled attribute carries
+    `time_samples`. *attr_patterns* (globs) narrows attributes and
+    relationships.
     """
     stage = _get_lop_stage(node_path)
 
@@ -443,6 +525,7 @@ def _get_usd_prim(
     if not prim.IsValid():
         raise hou.OperationFailed(f"USD prim not found at '{prim_path}' on stage from {node_path}")
 
+    time_code, time_used, time_source = _read_time(time)
     return {
         "node_path": node_path,
         "prim": _prim_to_dict(
@@ -450,12 +533,16 @@ def _get_usd_prim(
             include_attrs=True,
             full=bool(full),
             instance_proxies=bool(traverse_instance_proxies),
+            time_code=time_code,
+            attr_patterns=attr_patterns,
         ),
         "arrays_summarised": not full,
+        "time": time_used,
+        "time_source": time_source,
     }
 
 
-register_handler("lops.get_usd_prim", _get_usd_prim)
+register_handler("lops.get_usd_prim", _cooked_at_time(_get_usd_prim))
 
 
 ###### lops.list_usd_prims
@@ -593,9 +680,7 @@ def _get_usd_attribute(
     time_used = time
     time_source = "requested" if time is not None else "default"
     if time is None and samples:
-        with contextlib.suppress(Exception):
-            time_used = float(hou.frame())
-            time_source = "stage_frame"
+        time_used, time_source = _stage_frame(), "stage_frame"
         if time_used is None or not (samples[0] <= time_used <= samples[-1]):
             time_used = samples[0]
             time_source = "first_sample"
@@ -648,7 +733,202 @@ def _get_usd_attribute(
     return reply
 
 
-register_handler("lops.get_usd_attribute", _get_usd_attribute)
+register_handler("lops.get_usd_attribute", _cooked_at_time(_get_usd_attribute))
+
+
+###### lops.get_usd_attributes
+
+#: Rows one get_usd_attributes call returns; the rest is counted, not sent.
+_ATTRIBUTE_ROW_CAP = 500
+
+
+def _prim_pattern(pattern: str) -> re.Pattern:
+    """A prim-path glob as a regex.
+
+    `*` and `?` stay inside one path element and `**` crosses them, so
+    `/Render/Vars/*` is the RenderVars and `/Render/**` everything under
+    /Render.
+    """
+    out = []
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def _matching_prims(
+    stage: Usd.Stage, node_path: str, prims: list[str], instance_proxies: bool
+) -> list[Usd.Prim]:
+    """Prims named by *prims*: exact paths looked up, globs matched on one walk.
+
+    Raises:
+        hou.OperationFailed: if an exact path names no prim.
+    """
+    found: dict[str, Usd.Prim] = {}
+    globs = [p for p in prims if any(c in p for c in "*?")]
+    for path in prims:
+        if path in globs:
+            continue
+        prim = stage.GetPrimAtPath(path)
+        if not prim or not prim.IsValid():
+            raise hou.OperationFailed(f"USD prim not found at '{path}' on stage from {node_path}")
+        found[str(prim.GetPath())] = prim
+    if globs:
+        compiled = [_prim_pattern(g) for g in globs]
+        for prim in _traverse(stage, None, instance_proxies):
+            path = str(prim.GetPath())
+            if path not in found and any(c.match(path) for c in compiled):
+                found[path] = prim
+    return list(found.values())
+
+
+def _get_usd_attributes(
+    *,
+    node_path: str,
+    prims: list[str] | str,
+    attr_patterns: list[str] | str | None = None,
+    prim_type: str | None = None,
+    relationships: bool = True,
+    time: float | None = None,
+    full: bool = False,
+    traverse_instance_proxies: bool = False,
+    limit: int = _ATTRIBUTE_ROW_CAP,
+) -> dict[str, Any]:
+    """Attributes (and relationships) of many prims as one table.
+
+    Reading `sourceName` off every RenderVar, `lpetag` off every light and
+    the `camera` relationship of the render settings took a get_usd_prim per
+    prim, each around 130 attributes long on a RenderSettings. One row per
+    prim and attribute instead, capped at *limit* with the rest counted.
+
+    *prims*: prim paths or globs (`*` within one path element, `**`
+    across); *prim_type* narrows by type name (glob, e.g. `*Light`). Values
+    are read at *time* or the current frame, as get_usd_prim does.
+    """
+    stage = _get_lop_stage(node_path)
+    if isinstance(prims, str):
+        prims = [prims]
+    if not isinstance(prims, (list, tuple)) or not prims:
+        raise ValueError("prims must be a prim path or glob, or a non-empty list of them.")
+    prims = [str(p) for p in prims]
+    wanted = _name_matcher(attr_patterns)
+    time_code, time_used, time_source = _read_time(time)
+    limit = max(1, int(limit))
+
+    matched_prims = _matching_prims(stage, node_path, prims, bool(traverse_instance_proxies))
+    if prim_type:
+        matched_prims = [
+            prim
+            for prim in matched_prims
+            if fnmatch.fnmatchcase(str(prim.GetTypeName()), prim_type)
+        ]
+    rows: list[dict[str, Any]] = []
+    matched = 0
+    for prim in matched_prims:
+        base = {"prim": str(prim.GetPath()), "prim_type": str(prim.GetTypeName())}
+        for attr in prim.GetAttributes():
+            if not wanted(attr.GetName()):
+                continue
+            matched += 1
+            if len(rows) < limit:
+                rows.append({**base, **_attr_entry(attr, time_code, bool(full))})
+        if relationships:
+            for rel in prim.GetRelationships():
+                if not wanted(rel.GetName()):
+                    continue
+                matched += 1
+                if len(rows) < limit:
+                    rows.append({**base, **_relationship_entry(rel)})
+    return {
+        "node_path": node_path,
+        "prims": prims,
+        "attr_patterns": attr_patterns,
+        "prim_type": prim_type,
+        "prims_matched": len(matched_prims),
+        "time": time_used,
+        "time_source": time_source,
+        "matched": matched,
+        "returned": len(rows),
+        "truncated": matched > len(rows),
+        "rows": rows,
+    }
+
+
+register_handler("lops.get_usd_attributes", _cooked_at_time(_get_usd_attributes))
+
+
+###### lops.get_usd_world_transform
+
+# A frame list longer than this is refused: each frame recooks the stage.
+_MAX_TRANSFORM_FRAMES = 500
+
+
+def _decompose(matrix) -> dict[str, Any]:
+    """Translate, rotate (XYZ degrees), scale and the row-major matrix of a Gf.Matrix4d."""
+    transform = Gf.Transform(matrix)
+    rotation = transform.GetRotation().Decompose(
+        Gf.Vec3d.XAxis(), Gf.Vec3d.YAxis(), Gf.Vec3d.ZAxis()
+    )
+    return {
+        "translate": list(transform.GetTranslation()),
+        "rotate": list(rotation),
+        "scale": list(transform.GetScale()),
+        "matrix": [list(matrix.GetRow(row)) for row in range(4)],
+    }
+
+
+def _get_usd_world_transform(
+    *,
+    node_path: str,
+    prim_paths: list[str] | str,
+    frames: list[float] | None = None,
+) -> dict[str, Any]:
+    """World transform of prims at one or more frames, the playbar restored after.
+
+    get_usd_prim gives the local xformOps, which say nothing about where a prim
+    ends up under an animated parent. Each frame recooks the stage there (see
+    _cooked_at_time), so LOP-authored animation reads right, not only samples
+    that came from a file.
+    """
+    if isinstance(prim_paths, str):
+        prim_paths = [prim_paths]
+    if not prim_paths:
+        raise ValueError("prim_paths must name at least one prim.")
+    wanted = [float(f) for f in frames] if frames else [_stage_frame()]
+    if len(wanted) > _MAX_TRANSFORM_FRAMES:
+        raise ValueError(
+            f"{len(wanted)} frames; at most {_MAX_TRANSFORM_FRAMES}, since each one recooks the stage."
+        )
+
+    results: dict[str, list[dict[str, Any]]] = {path: [] for path in prim_paths}
+    for frame in wanted:
+        with at_frame(frame if frame != _stage_frame() else None):
+            stage = _get_lop_stage(node_path)
+            time_code = Usd.TimeCode(frame) if frame is not None else Usd.TimeCode.Default()
+            cache = UsdGeom.XformCache(time_code)
+            for path in prim_paths:
+                prim = stage.GetPrimAtPath(path)
+                if not prim.IsValid():
+                    raise hou.OperationFailed(
+                        f"USD prim not found at '{path}' on stage from {node_path}"
+                    )
+                entry = {"frame": frame, **_decompose(cache.GetLocalToWorldTransform(prim))}
+                results[path].append(entry)
+    return {"node_path": node_path, "frames": wanted, "prims": results}
+
+
+register_handler("lops.get_usd_world_transform", _get_usd_world_transform)
 
 
 ###### lops.get_usd_layers
@@ -809,6 +1089,8 @@ def _create_lop_node(
     parent = hou.node(parent_path)
     if parent is None:
         raise hou.OperationFailed(f"Parent node not found: {parent_path}")
+    if name:
+        _refuse_taken_name(parent, name)
 
     node = parent.createNode(lop_type, node_name=name)
 
@@ -865,13 +1147,20 @@ def _edit_attributes_after(node: hou.Node, node_name: str, prim_path: str, value
         f"prim = stage.GetPrimAtPath({prim_path!r})",
         "if not prim or not prim.IsValid():",
         f"    raise RuntimeError('Prim not found: ' + {prim_path!r})",
+        # JSON gives lists, but USD takes a tuple for a vector or matrix
+        # attribute (a list is refused as a vector<VtValue>) and a list for an
+        # array attribute (a tuple is refused there), so convert by type.
+        "def _usd_value(attr, v):",
+        "    if isinstance(v, list) and not attr.GetTypeName().isArray:",
+        "        return tuple(_usd_value(attr, x) for x in v)",
+        "    return v",
     ]
     for attr_name, value in values.items():
         lines += [
             f"attr = prim.GetAttribute({attr_name!r})",
             "if not attr or not attr.IsValid():",
             f"    raise RuntimeError('No attribute ' + {attr_name!r} + ' on ' + {prim_path!r})",
-            f"if not attr.Set({value!r}):",
+            f"if not attr.Set(_usd_value(attr, {value!r})):",
             f"    raise RuntimeError('USD refused the value for ' + {attr_name!r})",
         ]
     python_node = node.parent().createNode("pythonscript", node_name=node_name)
@@ -1457,6 +1746,8 @@ def _create_light(
         raise hou.OperationFailed(f"Parent node not found: {parent_path}")
 
     lop_type, shape = _lop_light_type(light_type)
+    if name:
+        _refuse_taken_name(parent, name)
     node = parent.createNode(lop_type, node_name=name)
     _set_light_shape(node, shape)
 

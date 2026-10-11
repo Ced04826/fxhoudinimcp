@@ -81,9 +81,11 @@ if _failed:
 # x was reloaded before it. The dispatcher is never reloaded, since it holds
 # the registry the reloaded modules register into.
 _HELPER_MODULES = ["errors", "serialize", "config", "ui", "outputs", "geometry_math"]
-# Helpers that are not handler modules come first: a reload that skipped them
+# dop_handlers first: node, parameter and graph handlers import dop_cache_note.
+# Helpers that are not handler modules come next: a reload that skipped them
 # answered success with their old code still running.
 _IMPORTED_FROM = [
+    "dop_handlers",
     "state_receipt_helpers",
     "viewport_capture_extras",
     "node_handlers",

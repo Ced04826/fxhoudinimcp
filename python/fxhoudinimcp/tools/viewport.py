@@ -9,6 +9,9 @@ from __future__ import annotations
 
 # Built-in
 import asyncio
+import os
+import tempfile
+import time
 from typing import Any
 
 # Third-party
@@ -16,6 +19,20 @@ from fxhoudinimcp._sdk import Context
 
 # Internal
 from fxhoudinimcp.server import _get_bridge, mcp
+
+
+def capture_path(output_path: str | None, prefix: str) -> str:
+    """``output_path``, or a fresh PNG under the temp dir when none was given.
+
+    Without it the agent had to invent a path on every capture. The temp dir
+    is this process's, which is Houdini's machine unless FXHOUDINIMCP_BIND
+    opened the plugin to remote clients; pass a shared path then.
+    """
+    if output_path:
+        return output_path
+    folder = os.path.join(tempfile.gettempdir(), "fxhoudinimcp")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, f"{prefix}_{time.time_ns() // 1_000_000}.png")
 
 
 @mcp.tool()
@@ -66,20 +83,42 @@ async def set_viewport_camera(
 @mcp.tool()
 async def set_viewport_display(
     ctx: Context,
-    display_mode: str,
+    display_mode: str | None = None,
     pane_name: str | None = None,
+    environment_background: bool | None = None,
+    reference_plane: bool | None = None,
+    point_size: float | None = None,
+    color_scheme: str | None = None,
 ) -> dict:
-    """Set the viewport shading mode.
+    """Set how the viewport draws: shading, environment background, grid,
+    particle point size, colour scheme. Any of them in one call; each is read
+    back in the reply.
 
     Args:
         display_mode: One of 'wireframe', 'shaded', 'smooth', 'smooth_wire',
             'hidden_line', 'flat', 'flat_wire', 'matcap', 'matcap_wire'.
         pane_name: Pane tab name.
+        environment_background: False hides an environment (dome) light's
+            map behind the scene, True shows it. Set on every view of the
+            viewer; the reply reads it back per view.
+        reference_plane: False hides the reference plane (the grid), True
+            shows it.
+        point_size: Diameter in pixels of particles drawn as points, on every
+            view of the viewer.
+        color_scheme: 'dark', 'darkgrey', 'grey' or 'light', on every view.
     """
     bridge = _get_bridge(ctx)
-    params: dict[str, Any] = {"display_mode": display_mode}
-    if pane_name is not None:
-        params["pane_name"] = pane_name
+    params: dict[str, Any] = {}
+    for key, value in (
+        ("display_mode", display_mode),
+        ("pane_name", pane_name),
+        ("environment_background", environment_background),
+        ("reference_plane", reference_plane),
+        ("point_size", point_size),
+        ("color_scheme", color_scheme),
+    ):
+        if value is not None:
+            params[key] = value
     return await bridge.execute("viewport.set_viewport_display", params)
 
 
@@ -129,42 +168,68 @@ async def frame_selection(
 async def frame_all(
     ctx: Context,
     pane_name: str | None = None,
+    node_paths: list[str] | None = None,
+    bounds: list[float] | None = None,
 ) -> dict:
-    """Frame all geometry in the viewport.
+    """Frame all geometry in the viewport, or only some nodes or a box.
 
     Args:
         pane_name: Pane tab name.
+        node_paths: Frame just these objects or SOPs (their world bounds),
+            not the spread of everything in the scene. An object frames what
+            it draws: a null its marker, a camera or a light its icon.
+        bounds: Frame [xmin, ymin, zmin, xmax, ymax, zmax], world space. A
+            point is framed as a 1-unit cube around it (`padded` in the reply).
     """
     bridge = _get_bridge(ctx)
     params: dict[str, Any] = {}
-    if pane_name is not None:
-        params["pane_name"] = pane_name
+    for key, value in (("pane_name", pane_name), ("node_paths", node_paths), ("bounds", bounds)):
+        if value is not None:
+            params[key] = value
     return await bridge.execute("viewport.frame_all", params)
 
 
 @mcp.tool()
 async def set_viewport_direction(
     ctx: Context,
-    direction: str,
+    direction: str | None = None,
     pane_name: str | None = None,
+    rotation: list[float] | None = None,
+    pivot: list[float] | None = None,
+    distance: float | None = None,
 ) -> dict:
-    """Set the viewport to a standard viewing direction.
+    """Set the viewport to a standard viewing direction, or place the free view.
+
+    rotation/pivot/distance orbit the viewport's own (non-camera) view:
+    rotation [rx, ry, rz] in degrees about the pivot, distance from it. The
+    reply reads the view back. Looking through a camera, move the camera.
 
     Args:
         direction: "front", "back", "top", "bottom", "left", "right", or "perspective".
         pane_name: Pane tab name.
+        rotation: [rx, ry, rz] degrees for the free view.
+        pivot: [x, y, z] the free view orbits.
+        distance: Distance of the free view from its pivot along its view
+            axis (the dolly); a sideways pan is not counted in it.
     """
     bridge = _get_bridge(ctx)
-    params: dict[str, Any] = {"direction": direction}
-    if pane_name is not None:
-        params["pane_name"] = pane_name
+    params: dict[str, Any] = {}
+    for key, value in (
+        ("direction", direction),
+        ("pane_name", pane_name),
+        ("rotation", rotation),
+        ("pivot", pivot),
+        ("distance", distance),
+    ):
+        if value is not None:
+            params[key] = value
     return await bridge.execute("viewport.set_viewport_direction", params)
 
 
 @mcp.tool()
 async def capture_screenshot(
     ctx: Context,
-    output_path: str,
+    output_path: str | None = None,
     pane_name: str | None = None,
     settle_seconds: float = 0,
 ) -> dict:
@@ -173,9 +238,12 @@ async def capture_screenshot(
     The image is written to disk only; open ``output_path`` with your file
     reader to look at it. Prefer get_geometry_info, get_node_info or
     get_scene_summary unless visual confirmation is genuinely needed.
+    A Scene Viewer capture names the network it shows (`viewer_network`);
+    `viewer_note` says when that is a DOP network, drawn as the simulation's
+    objects rather than the SOP display.
 
     Args:
-        output_path: Image file path.
+        output_path: Image file path. Default: a new PNG in the temp dir.
         pane_name: Pane tab name.
         settle_seconds: Wait this long before capturing, without blocking
             Houdini, so a Karma viewport can converge after a change. Use
@@ -184,7 +252,7 @@ async def capture_screenshot(
     bridge = _get_bridge(ctx)
     if settle_seconds > 0:
         await asyncio.sleep(min(settle_seconds, 120))
-    params: dict[str, Any] = {"output_path": output_path}
+    params: dict[str, Any] = {"output_path": capture_path(output_path, "screenshot")}
     if pane_name is not None:
         params["pane_name"] = pane_name
     return await bridge.execute("viewport.capture_screenshot", params)
@@ -193,13 +261,17 @@ async def capture_screenshot(
 @mcp.tool()
 async def capture_network_editor(
     ctx: Context,
-    output_path: str,
+    output_path: str | None = None,
     node_path: str | None = None,
     network_path: str | None = None,
     bounds: list[float] | None = None,
     margin: float = 0.05,
 ) -> dict:
     """Capture the network editor, framed on a whole network, a node, or bounds.
+
+    With node_path the view is put on that node at once (no animated flight),
+    and the reply says what the frame shows: visible_bounds, node_bounds and
+    node_in_view, all in network space.
 
     The image is written to disk only; open ``output_path`` with your file
     reader to look at it. Prefer get_node_info or list_children for inspecting
@@ -210,7 +282,7 @@ async def capture_network_editor(
     single colour (the pane did not draw).
 
     Args:
-        output_path: Image file path.
+        output_path: Image file path. Default: a new PNG in the temp dir.
         node_path: Frame this node with its direct inputs and outputs.
         network_path: Frame this whole network: nodes, boxes, sticky notes,
             dots. Default: the pane's current network, whole.
@@ -219,7 +291,10 @@ async def capture_network_editor(
         margin: Border around what is framed, as a fraction of its size.
     """
     bridge = _get_bridge(ctx)
-    params: dict[str, Any] = {"output_path": output_path, "margin": margin}
+    params: dict[str, Any] = {
+        "output_path": capture_path(output_path, "network"),
+        "margin": margin,
+    }
     for key, value in (
         ("node_path", node_path),
         ("network_path", network_path),

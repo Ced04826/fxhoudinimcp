@@ -17,13 +17,16 @@ from typing import Any
 import hou
 
 # Internal
+from fxhoudinimcp_server.callbacks import CallbackError, _is_python, callback_script, press
 from fxhoudinimcp_server.dispatcher import register_handler
+from fxhoudinimcp_server.errors import readable_message
+from fxhoudinimcp_server.handlers.dop_handlers import dop_cache_note
 from fxhoudinimcp_server.handlers.state_receipt_helpers import (
     clip,
     resolve_expression_policy,
     value_receipt,
 )
-from fxhoudinimcp_server.serialize import geometry_summary
+from fxhoudinimcp_server.serialize import geometry_summary, ramp_to_dict
 
 ###### Helpers
 
@@ -62,6 +65,27 @@ def suggest_parms(wanted: str, labels: dict[str, str], n: int = 3) -> list[str]:
     ]
     found += get_close_matches(wanted, sorted(labels), n=n, cutoff=0.5)
     return list(dict.fromkeys(found))[: n + 1]
+
+
+def _wrapped_expression(value: Any) -> tuple[str, Any] | None:
+    """(expression, hou.exprLanguage) of an ``{"expr": ..., "language": ...}`` value.
+
+    None for anything else (a literal). Raises ValueError for a dict without
+    "expr", with other keys, or with a language other than hscript/python.
+    """
+    if not isinstance(value, dict):
+        return None
+    unknown = sorted(set(value) - {"expr", "language"})
+    if "expr" not in value or unknown:
+        raise ValueError(
+            f'an expression is written {{"expr": ..., "language": "hscript" | "python"}}, '
+            f"got {value!r}"
+        )
+    language = str(value.get("language", "hscript")).strip().lower()
+    if language not in ("hscript", "python"):
+        raise ValueError(f"expression language must be 'hscript' or 'python', got {language!r}")
+    python = language == "python"
+    return str(value["expr"]), hou.exprLanguage.Python if python else hou.exprLanguage.Hscript
 
 
 def set_whole_expression(parm: hou.Parm, expression: str, language: Any = None) -> int:
@@ -119,6 +143,90 @@ def _parm_type_name(parm_template: hou.ParmTemplate) -> str:
     return parm_template.type().name()
 
 
+# What a whole ramp is written as: the shape serialize.ramp_to_dict reads it
+# back in, so a ramp read from one parm can be written to another as it is.
+_RAMP_KEYS = frozenset({"keys", "values", "basis", "is_color", "type"})
+
+
+def is_ramp_value(value: Any) -> bool:
+    """Whether *value* is a whole ramp: ``{"keys": [...], "values": [...], "basis": ...}``."""
+    return (
+        isinstance(value, dict)
+        and "keys" in value
+        and "values" in value
+        and not set(value) - _RAMP_KEYS
+    )
+
+
+def _ramp_basis(name: Any) -> Any:
+    """hou.rampBasis for a name such as "linear" or "CatmullRom", in any case."""
+    wanted = str(name).replace("-", "").replace("_", "").lower()
+    known = sorted(a for a in dir(hou.rampBasis) if not a.startswith("_") and a[0].isupper())
+    for attr in known:
+        if attr.lower() == wanted:
+            return getattr(hou.rampBasis, attr)
+    raise ValueError(f"unknown ramp basis {name!r}; known: {known}")
+
+
+def ramp_shape_error(value: dict) -> str | None:
+    """What is wrong with a ramp value whatever parm it goes to, or None.
+
+    The checks that need no parm, so a build_network dry run makes them too:
+    it answered valid for a ramp with a bad basis, and the build then failed.
+    """
+    try:
+        keys = [float(k) for k in value["keys"]]
+        values = list(value["values"])
+    except (TypeError, ValueError):
+        return "a ramp's keys are numbers and its values a list"
+    if len(keys) != len(values):
+        return f"a ramp needs one value per key: {len(keys)} keys, {len(values)} values"
+    basis = value.get("basis", "linear")
+    names = list(basis) if isinstance(basis, (list, tuple)) else [basis] * len(keys)
+    if len(names) != len(keys):
+        return f"a ramp takes one basis or one per key: {len(keys)} keys, {len(names)} bases"
+    try:
+        for name in names:
+            _ramp_basis(name)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def ramp_from_value(parm: hou.Parm, value: dict) -> hou.Ramp:
+    """The hou.Ramp a ``{"keys", "values", "basis"}`` value describes, for *parm*.
+
+    `basis` is one name for every key or one per key, "linear" when left out;
+    a colour ramp takes [r, g, b] values, a float ramp numbers. A dict on a
+    parameter that is not a ramp is refused: there a dict is an expression.
+    """
+    template = parm.parmTemplate()
+    if template.type() != hou.parmTemplateType.Ramp:
+        raise ValueError(
+            f"'{parm.name()}' is not a ramp parameter; a dict for it is an "
+            f'expression, {{"expr": ...}}'
+        )
+    if problem := ramp_shape_error(value):
+        raise ValueError(problem)
+    keys = [float(k) for k in value["keys"]]
+    values = list(value["values"])
+    if template.parmType() == hou.rampParmType.Color:
+        try:
+            values = [tuple(float(c) for c in v) for v in values]
+        except TypeError:
+            raise ValueError("a colour ramp takes [r, g, b] values") from None
+        if any(len(v) != 3 for v in values):
+            raise ValueError("a colour ramp takes [r, g, b] values")
+    else:
+        try:
+            values = [float(v) for v in values]
+        except TypeError:
+            raise ValueError("a float ramp takes numbers as values") from None
+    basis = value.get("basis", "linear")
+    names = list(basis) if isinstance(basis, (list, tuple)) else [basis] * len(keys)
+    return hou.Ramp(tuple(_ramp_basis(n) for n in names), tuple(keys), tuple(values))
+
+
 def _serialize_value(value: Any) -> Any:
     """Convert a value to a JSON-safe Python type."""
     if isinstance(value, hou.Vector2):
@@ -132,7 +240,8 @@ def _serialize_value(value: Any) -> Any:
     if isinstance(value, hou.Matrix4):
         return [list(row) for row in value.asTupleOfTuples()]
     if isinstance(value, hou.Ramp):
-        return str(value)
+        # Data, in the shape a ramp is written in; its repr was all a caller got.
+        return ramp_to_dict(value)
     if isinstance(value, (list, tuple)):
         return [_serialize_value(v) for v in value]
     return value
@@ -251,7 +360,7 @@ def _get_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any]:
         "raw_value": _serialize_value(parm.rawValue()),
         "parm_type": _parm_type_name(pt),
         "is_locked": parm.isLocked(),
-        "is_at_default": parm.isAtDefault(),
+        "is_at_default": not _off_default(parm),
     }
     if data_parm:
         result["data"] = data_parm["data"]
@@ -277,14 +386,159 @@ register_handler("parameters.get_parameter", _get_parameter)
 ###### Handler: parameters.set_parameter
 
 
+class LockedParmError(ValueError):
+    """A write refused because the parm is locked by its node's interface."""
+
+
+def _is_locked(parm: hou.Parm) -> bool:
+    # HOM answers a real bool; anything else (a stand-in) is not a lock.
+    with contextlib.suppress(Exception):
+        return parm.isLocked() is True
+    return False
+
+
+def _words(text: str) -> list[str]:
+    """*text* split into lowercase words, camelCase and snake_case alike."""
+    return [w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", text)]
+
+
+def _names_word(text: str, name: str) -> bool:
+    """Whether *name* is a whole word (or a run of words) of *text*.
+
+    `resolution` is a word of `updateResolutionParameters`; `t` is not a word
+    of `setTranslate`, which a plain substring test would have matched.
+    """
+    wanted = _words(name)
+    found = _words(text)
+    size = len(wanted)
+    return bool(wanted) and any(found[i : i + size] == wanted for i in range(len(found) - size + 1))
+
+
+def locked_controllers(parm: hou.Parm) -> list[dict[str, Any]]:
+    """Menu and toggle parms on *parm*'s node whose Python callback names its tuple.
+
+    A parm lock is set and cleared by the node's own interface scripts, not by
+    a value: on a karmarendersettings `res_mode` = autoheight locks
+    resolutiony, and only the callback of `res_mode` (loputils'
+    updateResolutionParameters) unlocks it. hou.Parm.set() does not run that
+    callback, which is why writing the menu through the bridge left the lock
+    in place. The callback text naming the tuple is the link.
+    """
+    try:
+        node = parm.node()
+        tuple_name = parm.tuple().name().lower()
+    except Exception:
+        return []
+    found: list[dict[str, Any]] = []
+    for other in node.parms():
+        if other.name() == parm.name():
+            continue
+        callback = callback_script(other)
+        if not callback or not _names_word(callback, tuple_name):
+            continue
+        with contextlib.suppress(Exception):
+            template = other.parmTemplate()
+            # A lock is set and cleared through HOM (parm.lock), i.e. from a
+            # Python callback; an HScript preset button (resolutionMenu) that
+            # merely names the tuple does not control it.
+            if template.scriptCallbackLanguage() != hou.scriptLanguage.Python:
+                continue
+            # A menu of any template type -- res_mode is a String parm with a
+            # Normal menu, not a Menu parm (measured on 22.0.429) -- or a toggle.
+            menu: list[str] = []
+            with contextlib.suppress(Exception):
+                menu = list(other.menuItems())
+            if not menu and template.type() != hou.parmTemplateType.Toggle:
+                continue
+            entry: dict[str, Any] = {"parm": other.name(), "value": other.evalAsString()}
+            if menu:
+                entry["menu"] = menu
+            found.append(entry)
+    return found
+
+
+def locked_message(parm: hou.Parm) -> str | None:
+    """Why *parm* cannot be written because it is locked, or None.
+
+    Houdini answers every write to a locked parm -- set(), setExpression(),
+    revertToDefaults(), deleteAllKeyframes() -- with the same generic
+    "permission error ... locked assets, takes, product permissions", and the
+    #41 hint then sent callers to revert_parameter, which fails the same way.
+    """
+    if not _is_locked(parm):
+        return None
+    message = (
+        f"'{parm.name()}' on {parm.node().path()} is locked by the node's interface "
+        f"(Parm.isLocked() is true): no value, expression or revert can be written "
+        f"to it, and override_expression / revert_parameter do not help."
+    )
+    controllers = locked_controllers(parm)
+    if controllers:
+        named = ", ".join(
+            f"{c['parm']} (now {c['value']!r}"
+            + (f", menu {c['menu']}" if c.get("menu") else "")
+            + ")"
+            for c in controllers
+        )
+        message += (
+            f" The lock is set by the callback of {named}. Set that parm with "
+            f"run_callbacks=true first -- a plain write does not run callbacks, the "
+            f"UI does -- then write '{parm.name()}'."
+        )
+    else:
+        message += " Something in the node's interface sets the lock; see get_parm_template_tree."
+    return message
+
+
+def _run_callback(parm: hou.Parm) -> dict[str, Any] | None:
+    """Run *parm*'s callback script the way the UI does after an edit.
+
+    Through callbacks.press, not pressButton(): a Python callback that raises
+    there opens Houdini's modal "Error running callback" window and holds the
+    main thread -- and this bridge -- until someone clicks OK (res_mode's
+    callback raising on a locked resolutiony did exactly that). Answers None
+    when the parm has no callback, else {"run": bool, "route": ..., and
+    "error" when it raised}.
+    """
+    if not callback_script(parm):
+        return None
+    try:
+        route = press(parm)
+    except CallbackError as exc:
+        return {"run": False, "route": "python", "error": str(exc).splitlines()[0]}
+    except Exception as exc:
+        # The Hscript route goes through pressButton(), which raises
+        # hou.OperationFailed ("callback script could not be run") -- after
+        # set() already wrote the value, so the write itself stands. Anything
+        # else unexpected lands here too, so the route is read, not assumed.
+        route = "python" if _is_python(parm) else "hscript"
+        return {"run": False, "route": route, "error": readable_message(exc)}
+    return {"run": True, "route": route}
+
+
+def _callback_report(outcome: dict[str, Any] | None) -> dict[str, Any]:
+    """Reply keys for a callback outcome: callback_run, and why not."""
+    if outcome is None:
+        return {}
+    report: dict[str, Any] = {"callback_run": outcome["run"]}
+    if "error" in outcome:
+        report["callback_error"] = outcome["error"]
+    return report
+
+
 def _expression_driven(parms: list[hou.Parm]) -> str | None:
     """A sentence naming the first of *parms* driven by an expression, or None.
 
     Houdini answers a set() on such a parameter with a generic permission
     error ("locked assets, takes, product permissions..."); resolutiony on a
     karmarendersettings is the common case, driven by the autoheight expression
-    while res_mode says so (#41).
+    while res_mode says so (#41). A LOCKED parm is named as such instead: the
+    expression hint sends callers to revert_parameter, which a lock refuses too.
     """
+    for parm in parms:
+        locked = locked_message(parm)
+        if locked:
+            return locked
     for parm in parms:
         try:
             expression = parm.expression()
@@ -298,13 +552,73 @@ def _expression_driven(parms: list[hou.Parm]) -> str | None:
     return None
 
 
+# Keys of an animation curve: bezier(), linear(), constant(), cubic(), ...
+_CURVE_FUNCTION = re.compile(r"[A-Za-z]+\(\)")
+
+
 def _expression_of(parm: hou.Parm) -> str | None:
     """The expression *parm* holds, or None when it holds a plain value."""
     try:
         expression = parm.expression()
     except Exception:
+        # hou.Parm.expression() wants exactly one key. Writing a literal to a
+        # parm whose expression sits on another frame (a File Cache's $FEND,
+        # written at frame 6) adds a second key with the same expression and
+        # changes nothing, and after that the expression could no longer be
+        # seen: the write neither landed nor was reported. Keys that all carry
+        # one plain expression are that same expression; animation curves are
+        # not, and stay "no expression" as before.
+        with contextlib.suppress(Exception):
+            texts = {key.expression() for key in parm.keyframes()}
+            if len(texts) == 1 and not _CURVE_FUNCTION.fullmatch(next(iter(texts))):
+                expression = next(iter(texts))
+                return expression or None
         return None
     return expression if isinstance(expression, str) and expression else None
+
+
+def _expression_error(parm: hou.Parm) -> str | None:
+    """The error *parm*'s expression gives when evaluated, or None.
+
+    A failing expression does not raise: eval() returns an empty value and
+    Houdini puts "Unable to evaluate expression (... (<parm path>))" on the
+    node. That message outlives the fault -- it is still there after the
+    expression is fixed, until the node cooks (measured on 22.0.429) -- so a
+    message found is checked again after a forced cook, which clears it and
+    lets an expression that still fails put it back.
+    """
+    suffix = f"{parm.path()})"
+    node = parm.node()
+
+    def current() -> str | None:
+        with contextlib.suppress(Exception):
+            parm.eval()
+        with contextlib.suppress(Exception):
+            for message in (*node.errors(), *node.warnings()):
+                if suffix in message:
+                    return message.strip()
+        return None
+
+    if current() is None:
+        return None
+    with contextlib.suppress(Exception):
+        node.cook(force=True)
+    return current()
+
+
+def _clear_expression(parm: hou.Parm) -> None:
+    """Remove *parm*'s expression without evaluating it.
+
+    deleteAllKeyframes() keeps the parm at its current value, so it evaluates
+    the expression it removes -- outside a cook, where a Ray SOP's `@N.x` or a
+    `$N` stamps "Local variable 'N' not found" on a healthy node, and that
+    warning outlives the build. A constant takes the expression's place first,
+    so the value kept is that constant; the caller's set() overwrites it.
+    """
+    with contextlib.suppress(Exception):
+        parm.setExpression("0", hou.exprLanguage.Hscript, replace_expression=True)
+    with contextlib.suppress(Exception):
+        parm.deleteAllKeyframes()
 
 
 def _values_match(requested: Any, actual: Any) -> bool:
@@ -359,31 +673,44 @@ def _raw_string(parm: hou.Parm) -> str | None:
     return None
 
 
-def _write_parm(parm: hou.Parm, value: Any, override_expression: bool = False) -> dict[str, Any]:
+def _write_parm(
+    parm: hou.Parm,
+    value: Any,
+    override_expression: bool = False,
+    run_callbacks: bool = False,
+) -> dict[str, Any]:
     """Set one parm and report honestly whether the write actually took.
 
     hou.Parm.set() on a parm that holds an expression does NOT remove the
     expression: eval() keeps answering with it, and the reply used to look
     like a success anyway, the truth only in a `new_value` nobody compared
-    against what was asked for. deleteAllKeyframes() is what clears it, which
-    is what override_expression does.
+    against what was asked for. override_expression clears it first, without
+    evaluating it (see _clear_expression).
 
     Whether the expression survived decides `expression_kept`, not whether the
     values differ: zeroing a factory `$N` that evaluates to 0 leaves the
     expression in place just the same. A String parm echoes its raw text next
     to the expanded one, since `$JOB/...` read back as an absolute path looks
     like the very mistake a caller checks for.
+
+    A locked parm is refused before anything is tried, with the parm that
+    controls the lock named; *run_callbacks* runs the parm's callback after
+    the write, as the UI does, which is what sets and clears such locks.
     """
+    locked = locked_message(parm)
+    if locked:
+        raise LockedParmError(locked)
     before = _expression_of(parm)
     through = _referenced_parm(parm) if before is not None else None
     if before is not None and override_expression:
-        with contextlib.suppress(Exception):
-            parm.deleteAllKeyframes()
+        _clear_expression(parm)
         through = None
     parm.set(value)
+    callback = _run_callback(parm) if run_callbacks else None
     after = _expression_of(parm)
     new_value = _serialize_value(parm.eval())
     info: dict[str, Any] = {"new_value": new_value}
+    info.update(_callback_report(callback))
     raw = _raw_string(parm)
     # Only when it differs: "$HIP/geo" is worth seeing, "/geo/ball" twice is not.
     if raw is not None and raw != new_value:
@@ -406,11 +733,27 @@ def _write_parm(parm: hou.Parm, value: Any, override_expression: bool = False) -
     return info
 
 
+def _write_ramp(parm: hou.Parm, value: dict, run_callbacks: bool = False) -> dict[str, Any]:
+    """Set a whole ramp; answer with what the parm holds afterwards."""
+    if locked := locked_message(parm):
+        raise LockedParmError(locked)
+    try:
+        parm.set(ramp_from_value(parm, value))
+    except hou.PermissionError:
+        reason = _expression_driven([parm])
+        if reason:
+            raise ValueError(reason) from None
+        raise
+    callback = _run_callback(parm) if run_callbacks else None
+    return {"new_value": ramp_to_dict(parm.evalAsRamp()), **_callback_report(callback)}
+
+
 def _set_tuple(
     node: hou.Node,
     parm_name: str,
     value: list | tuple,
     override_expression: bool = False,
+    run_callbacks: bool = False,
 ) -> tuple[Any | None, dict[str, Any]]:
     """Apply a list value to the parm tuple of that name; None if there is none.
 
@@ -431,6 +774,19 @@ def _set_tuple(
             f"{len(parm_tuple)} components, got {len(value)} values."
         )
     components = list(parm_tuple)
+    # {"expr": ...} on a component sets that component's expression; the
+    # others take their literal. It used to reach ParmTuple.set() and fail
+    # with the raw SWIG overload list.
+    wrapped = {
+        index: found
+        for index, component in enumerate(value)
+        if (found := _wrapped_expression(component)) is not None
+    }
+    for parm in components:
+        # Before any component is written: a tuple is one write.
+        locked = locked_message(parm)
+        if locked:
+            raise LockedParmError(locked)
     through = {
         parm.name(): target
         for parm in components
@@ -439,22 +795,30 @@ def _set_tuple(
     if override_expression:
         for parm in components:
             if _expression_of(parm) is not None:
-                with contextlib.suppress(Exception):
-                    parm.deleteAllKeyframes()
+                _clear_expression(parm)
         through = {}
     try:
-        parm_tuple.set(value)
+        if wrapped:
+            for index, parm in enumerate(components):
+                if index in wrapped:
+                    set_whole_expression(parm, *wrapped[index])
+                else:
+                    parm.set(value[index])
+        else:
+            parm_tuple.set(value)
     except hou.PermissionError:
-        reason = _expression_driven(components)
+        # Not the components this call gave an expression: those took it.
+        reason = _expression_driven([p for i, p in enumerate(components) if i not in wrapped])
         if reason:
             raise ValueError(reason) from None
         raise
+    callback = _run_callback(components[0]) if run_callbacks else None
     new_value = [_serialize_value(p.eval()) for p in components]
     kept: list[dict[str, Any]] = []
     landed_elsewhere: dict[str, str] = {}
     for index, parm in enumerate(components):
         expression = _expression_of(parm)
-        if expression is None:
+        if expression is None or index in wrapped:
             continue
         matches = _values_match(value[index], new_value[index])
         if parm.name() in through and matches:
@@ -470,7 +834,11 @@ def _set_tuple(
         if matches:
             entry["same_as_evaluated"] = True
         kept.append(entry)
-    report: dict[str, Any] = {}
+    report: dict[str, Any] = _callback_report(callback)
+    if wrapped:
+        report["expressions_set"] = {
+            components[index].name(): expression for index, (expression, _) in wrapped.items()
+        }
     raw = [_raw_string(p) for p in components]
     if any(r is not None and r != v for r, v in zip(raw, new_value, strict=False)):
         report["raw_value"] = raw
@@ -605,6 +973,7 @@ def _set_parameter(
     parm_name: str,
     value: Any,
     override_expression: bool = False,
+    run_callbacks: bool = False,
     expression_policy: str | None = None,
     return_values: str = "summary",
     max_value_chars: int = _VALUE_CHARS,
@@ -620,7 +989,13 @@ def _set_parameter(
     mode = _resolve_return_values(return_values)
     max_chars = _resolve_max_value_chars(max_value_chars)
     if isinstance(value, (list, tuple)):
-        new_value, report = _set_tuple(_resolve_node(node_path), parm_name, value, override)
+        new_value, report = _set_tuple(
+            _resolve_node(node_path),
+            parm_name,
+            value,
+            override,
+            bool(run_callbacks),
+        )
         if new_value is not None:
             result: dict[str, Any] = {
                 "node_path": node_path,
@@ -628,12 +1003,14 @@ def _set_parameter(
                 "new_value": new_value,
             }
             result.update(report)
+            if cache := dop_cache_note([_resolve_node(node_path)]):
+                result["simulation_cache"] = cache
             return _shape_reply(result, mode, max_chars)
 
     parm = _resolve_parm(node_path, parm_name)
 
     try:
-        written = _write_parm(parm, value, override)
+        written = _write_parm(parm, value, override, bool(run_callbacks))
     except hou.PermissionError:
         reason = _expression_driven([parm])
         if reason:
@@ -642,6 +1019,8 @@ def _set_parameter(
 
     result = {"node_path": node_path, "parm_name": parm_name}
     result.update(written)
+    if cache := dop_cache_note([parm.node()]):
+        result["simulation_cache"] = cache
     return _shape_reply(result, mode, max_chars)
 
 
@@ -651,26 +1030,38 @@ register_handler("parameters.set_parameter", _set_parameter)
 ###### Handler: parameters.set_parameters
 
 
+def _error_entry(name: str, exc: Exception) -> dict[str, Any]:
+    entry: dict[str, Any] = {"parm_name": name, "error": str(exc)}
+    if isinstance(exc, LockedParmError):
+        entry["locked"] = True
+    return entry
+
+
 def _set_parameters(
     node_path: str,
     params: dict[str, Any],
     override_expression: bool = False,
+    run_callbacks: bool = False,
     expression_policy: str | None = None,
     return_values: str = "summary",
     max_value_chars: int = _VALUE_CHARS,
     **_: Any,
 ) -> dict[str, Any]:
-    """Batch-set multiple parameters on a single node.
+    """Batch-set multiple parameters on a single node, in the order given.
 
+    Order matters with *run_callbacks*: a menu whose callback unlocks another
+    parm (`res_mode` before `resolutiony`) has to come first.
     expression_policy, return_values and max_value_chars as for
-    _set_parameter; they and *params* are checked before anything is written.
+    _set_parameter; they, the node and *params* are checked before anything
+    is written, the node first so a bad path is what the error names.
     """
     override = _resolve_override(override_expression, expression_policy)
     mode = _resolve_return_values(return_values)
     max_chars = _resolve_max_value_chars(max_value_chars)
+    callbacks = bool(run_callbacks)
+    node = _resolve_node(node_path)
     if not isinstance(params, dict) or not params:
         raise ValueError("'params' must be a non-empty mapping of parameter names to values")
-    node = _resolve_node(node_path)
 
     results: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -680,9 +1071,21 @@ def _set_parameters(
         # stored 0 and reported success, so the expression silently vanished.
         if isinstance(value, dict):
             parm = node.parm(name)
+            if parm is not None and is_ramp_value(value):
+                # A whole ramp at once; key by key through its multiparm
+                # (`ramp`, `ramp1pos`, `ramp1c`, ...) was the only way in.
+                try:
+                    results.append({"parm_name": name, **_write_ramp(parm, value, callbacks)})
+                except Exception as exc:
+                    errors.append(_error_entry(name, exc))
+                continue
             if "expr" not in value or parm is None:
                 problem = "no such parameter" if parm is None else 'a dict value needs "expr"'
                 errors.append({"parm_name": name, "error": f"{problem}: {value!r}"})
+                continue
+            # Named as locked before the write, as every other branch here does.
+            if locked := locked_message(parm):
+                errors.append(_error_entry(name, LockedParmError(locked)))
                 continue
             language = str(value.get("language", "hscript")).lower()
             try:
@@ -706,9 +1109,9 @@ def _set_parameters(
         # which made "prefer set_parameters" and "set a light colour" collide.
         if isinstance(value, (list, tuple)):
             try:
-                new_value, report = _set_tuple(node, name, value, override)
+                new_value, report = _set_tuple(node, name, value, override, callbacks)
             except Exception as exc:
-                errors.append({"parm_name": name, "error": str(exc)})
+                errors.append(_error_entry(name, exc))
                 continue
             if new_value is not None:
                 entry: dict[str, Any] = {"parm_name": name, "new_value": new_value}
@@ -723,10 +1126,20 @@ def _set_parameters(
             continue
         try:
             entry = {"parm_name": name}
-            entry.update(_write_parm(parm, value, override))
+            entry.update(_write_parm(parm, value, override, callbacks))
             results.append(entry)
         except Exception as exc:
-            errors.append({"parm_name": name, "error": str(exc)})
+            errors.append(_error_entry(name, exc))
+
+    # A ramp written key by key (`ramp: 3`, `ramp3pos`, `ramp3c`) was echoed
+    # straight after the count, when the new key still read t=0, black,
+    # though the same call went on to set it. Ramps answer with what they
+    # hold once the whole call is through.
+    for entry in results:
+        with contextlib.suppress(Exception):
+            ramp_parm = node.parm(entry["parm_name"])
+            if ramp_parm.parmTemplate().type() == hou.parmTemplateType.Ramp:
+                entry["new_value"] = ramp_to_dict(ramp_parm.evalAsRamp())
 
     # A batch whose `errors` is empty while a parm kept its expression reads as
     # a clean success: name it at the top level too, so a caller that only
@@ -742,6 +1155,16 @@ def _set_parameters(
         "set": results,
         "errors": errors,
     }
+    locked = [entry["parm_name"] for entry in errors if entry.get("locked")]
+    if locked:
+        reply["locked_parms"] = locked
+    not_run = {
+        entry["parm_name"]: entry.get("callback_error")
+        for entry in results
+        if entry.get("callback_run") is False
+    }
+    if not_run:
+        reply["callbacks_not_run"] = not_run
     warnings: list[str] = []
     if kept:
         reply["expressions_kept"] = kept
@@ -757,6 +1180,8 @@ def _set_parameters(
         )
     if warnings:
         reply["warning"] = " ".join(warnings)
+    if results and (cache := dop_cache_note([node])):
+        reply["simulation_cache"] = cache
     return _shape_reply(reply, mode, max_chars)
 
 
@@ -911,6 +1336,11 @@ def _revert_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any
     """Revert a parameter to its default value."""
     parm = _resolve_parm(node_path, parm_name)
 
+    # Reverting a locked parm fails with the same bare permission error as a
+    # write -- and the #41 hint used to send callers exactly here.
+    locked = locked_message(parm)
+    if locked:
+        raise LockedParmError(locked)
     # revertToDefaults() alone leaves an expression and keyframes in place
     # (measured on 22.0.368: $F*2 and two keys survived it), while this
     # reported reverted: True. Deleting the keyframes first clears both, and
@@ -926,6 +1356,15 @@ def _revert_parameter(node_path: str, parm_name: str, **_: Any) -> dict[str, Any
     }
     if (expression := _expression_of(parm)) is not None:
         result["default_expression"] = expression
+        # A default expression in the wrong language comes back too and
+        # evaluates to an empty value without raising; name its language and
+        # the error it leaves on the node.
+        with contextlib.suppress(Exception):
+            result["default_expression_language"] = (
+                str(parm.expressionLanguage()).rsplit(".", 1)[-1].lower()
+            )
+        if error := _expression_error(parm):
+            result["expression_error"] = error
     return result
 
 
@@ -1332,8 +1771,76 @@ def _parm_entry(parm: hou.Parm, include_defaults: bool) -> dict[str, Any]:
     if not data_parm and isinstance(raw, str) and raw != str(entry["value"]):
         entry["raw_value"] = raw
     if include_defaults:
-        entry["is_at_default"] = parm.isAtDefault()
+        # The same rule as non_default_only: a ramp by isAtRampDefault.
+        at_default = not _off_default(parm)
+        entry["is_at_default"] = at_default
+        # At its default the default only repeats the value: on a full popsource
+        # sweep that was 2398 -> 4429 characters for nothing new.
+        if not at_default:
+            entry.update(_default_of(parm))
     return entry
+
+
+def _default_of(parm: hou.Parm) -> dict[str, Any]:
+    """The template default of one parm component: `default`, `default_expression`.
+
+    is_at_default alone said "changed" without saying from what, so comparing
+    a few nodes against their defaults meant get_node_card per type plus
+    matching components by hand, or execute_python. A template with no default
+    (a folder, a button) answers nothing.
+    """
+    found: dict[str, Any] = {}
+    with contextlib.suppress(Exception):
+        template = parm.parmTemplate()
+        index = parm.componentIndex()
+        values = template.defaultValue()
+        # A tuple per component for Float/Int/String; a menu or a toggle has
+        # a single value.
+        if isinstance(values, (tuple, list)):
+            values = values[index] if index < len(values) else (values[0] if values else None)
+        found["default"] = _serialize_value(values)
+        with contextlib.suppress(Exception):
+            expressions = template.defaultExpression()
+            # A str on a menu or a toggle: indexing it would give one character.
+            if isinstance(expressions, str):
+                expression = expressions
+            else:
+                expression = expressions[index] if index < len(expressions) else ""
+            # Built-in toggles answer their default as the token "on"/"off",
+            # which is the value spelt out, not an expression.
+            if expression and expression not in ("on", "off"):
+                found["default_expression"] = expression
+    return found
+
+
+def _off_default(parm: hou.Parm) -> bool:
+    """Whether *parm* was changed from its default (a type's own expression is not).
+
+    A ramp and its keys answer with isAtRampDefault: measured on 22.0, a
+    fresh popcolor's ramp2pos read as changed under isAtDefault, and the ramp
+    parm itself still read as default once a key had moved.
+    """
+    try:
+        ramp = parm if parm.parmTemplate().type() == hou.parmTemplateType.Ramp else None
+        if ramp is None:
+            parent = parm.parentMultiParm()
+            if parent is not None and parent.parmTemplate().type() == hou.parmTemplateType.Ramp:
+                ramp = parent
+        if ramp is not None:
+            return not ramp.isAtRampDefault()
+        return not parm.isAtDefault()
+    except Exception:
+        return False
+
+
+def _valueless(parm: hou.Parm) -> bool:
+    """Whether *parm* is a button, a folder or another parm with no value to report."""
+    from fxhoudinimcp_server.handlers.node_handlers import _VALUELESS_PARM_TYPES
+
+    try:
+        return parm.parmTemplate().type().name() in _VALUELESS_PARM_TYPES
+    except Exception:
+        return False
 
 
 def _matches_patterns(parm: hou.Parm, lowered: list[str] | None) -> bool:
@@ -1352,6 +1859,8 @@ def _get_parameters(
     inside: str | None = None,
     recursive: bool = False,
     node_type: str | None = None,
+    include_locked_assets: bool = False,
+    non_default_only: bool = False,
     **_: Any,
 ) -> dict[str, Any]:
     """Current values for every parameter matching any of several patterns.
@@ -1369,16 +1878,37 @@ def _get_parameters(
     Args:
         node_path: Node to read.
         patterns: Substrings matched against parameter name and label. Omit for
-            every non-hidden parameter, up to the cap. Required with *inside*.
-        include_defaults: Also report whether each value is still the default.
+            every non-hidden parameter, up to the cap. Required with *inside*,
+            unless *non_default_only*.
+        include_defaults: Also report whether each value is still the default,
+            and, where it differs, the default itself (`default`, and
+            `default_expression` when the template has one).
         inside: A network to read instead of one node; answers `rows`.
         recursive: With *inside*, every descendant, not only the children.
         node_type: With *inside*, only nodes of this type name.
+        include_locked_assets: With *recursive*, also the nodes inside locked
+            HDAs (a POP solver's own file and include parameters). Off by
+            default: they buried the few real file paths of a network under
+            hundreds of rows.
+        non_default_only: Only parameters changed from their defaults, each
+            with its default beside the value. With *inside* no patterns are
+            needed then: "what was changed on these 33 nodes" was 33
+            get_node_info calls or execute_python.
     """
+    if non_default_only:
+        include_defaults = True
     if inside is not None:
         if node_path is not None:
             raise ValueError("Pass either node_path (one node) or inside (a network), not both.")
-        return _sweep_parameters(inside, patterns, include_defaults, recursive, node_type)
+        return _sweep_parameters(
+            inside,
+            patterns,
+            include_defaults,
+            recursive,
+            node_type,
+            include_locked_assets,
+            non_default_only,
+        )
     if node_path is None:
         raise ValueError("node_path is required (or inside, to read a whole network).")
     node = hou.node(node_path)
@@ -1392,7 +1922,12 @@ def _get_parameters(
     values: dict[str, Any] = {}
     matched = 0
     for parm in node.parms():
+        # A folder stores its open tab: a switched tab read as "changed".
+        if non_default_only and _valueless(parm):
+            continue
         if not _matches_patterns(parm, lowered):
+            continue
+        if non_default_only and not _off_default(parm):
             continue
         matched += 1
         if len(values) >= _GET_PARMS_CAP:
@@ -1416,6 +1951,8 @@ def _sweep_parameters(
     include_defaults: bool,
     recursive: bool,
     node_type: str | None,
+    include_locked_assets: bool = False,
+    non_default_only: bool = False,
 ) -> dict[str, Any]:
     """get_parameters over the nodes of a network, as one table of rows."""
     from fxhoudinimcp_server.handlers.node_handlers import _VALUELESS_PARM_TYPES
@@ -1425,13 +1962,42 @@ def _sweep_parameters(
         raise hou.OperationFailed(f"Node not found: {inside}")
     if isinstance(patterns, str):
         patterns = [patterns]
-    if not patterns:
+    if not patterns and not non_default_only:
         raise ValueError(
             "patterns is required with inside: every parameter of a whole network "
-            "is not an answer anyone can read. Name what to look for, e.g. ['file']."
+            "is not an answer anyone can read. Name what to look for, e.g. ['file'], "
+            "or ask for non_default_only=True."
         )
-    lowered = [p.lower() for p in patterns]
-    nodes = parent.allSubChildren() if recursive else parent.children()
+    lowered = [p.lower() for p in patterns] if patterns else None
+    # A locked asset's instance stays (its interface is the user's); what is
+    # inside it is the asset's own business -- unless the sweep was asked to
+    # start inside one.
+    asked_inside = False
+    with contextlib.suppress(Exception):
+        asked_inside = parent.isLockedHDA() or parent.isInsideLockedHDA()
+    reads_locked = include_locked_assets or asked_inside
+    # A locked asset's contents load on demand: until something syncs them,
+    # allSubChildren() answers none (a fresh popsolver: 0 of its ~670 nodes).
+    nodes = list(
+        parent.allSubChildren(sync_delayed_definition=reads_locked)
+        if recursive
+        else parent.children()
+    )
+    skipped_locked = 0
+    if recursive and not reads_locked:
+        kept = []
+        for node in nodes:
+            buried = False
+            with contextlib.suppress(Exception):
+                buried = node.isInsideLockedHDA()
+            if buried:
+                # Counted only if the sweep would have read it: node_type="file"
+                # used to report every node of every asset as skipped.
+                if not node_type or node.type().name() == node_type:
+                    skipped_locked += 1
+            else:
+                kept.append(node)
+        nodes = kept
     rows: list[dict[str, Any]] = []
     matched = 0
     scanned = 0
@@ -1448,6 +2014,8 @@ def _sweep_parameters(
                     continue
             if not _matches_patterns(parm, lowered):
                 continue
+            if non_default_only and not _off_default(parm):
+                continue
             matched += 1
             hit = True
             if len(rows) >= _SWEEP_ROW_CAP:
@@ -1461,12 +2029,23 @@ def _sweep_parameters(
         "recursive": bool(recursive),
         "node_type": node_type,
         "patterns": patterns,
+        **({"non_default_only": True} if non_default_only else {}),
         "nodes_scanned": scanned,
         "nodes_matched": nodes_matched,
         "matched": matched,
         "returned": len(rows),
         "truncated": matched > len(rows),
         "rows": rows,
+        **(
+            {
+                "skipped_inside_locked_assets": skipped_locked,
+                "note": (
+                    "Nodes inside locked HDAs were not read; include_locked_assets=True reads them."
+                ),
+            }
+            if skipped_locked
+            else {}
+        ),
     }
 
 

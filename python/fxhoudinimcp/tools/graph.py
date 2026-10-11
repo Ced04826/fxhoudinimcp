@@ -13,6 +13,7 @@ from typing import Any
 from fxhoudinimcp._sdk import Context
 
 # Internal
+from fxhoudinimcp.bridge import NO_TIMEOUT
 from fxhoudinimcp.server import _get_bridge, mcp
 
 
@@ -51,15 +52,19 @@ async def build_network(
     never a silently dropped request:
         type (required), name, parms (lists set whole parm tuples; a value
         written {"expr": "ch('../x')"} is set as an expression, with an
-        optional "language": "hscript" | "python"), expressions (or its
+        optional "language": "hscript" | "python", also as one component
+        of a list: "t": [{"expr": "$F"}, 0, 0]; a ramp takes the whole
+        ramp as {"keys", "values", "basis"}), expressions (or its
         alias exprs: a block of parm name -> expression), inputs (list of
         source names — earlier spec names, existing children, or absolute
         paths; or dicts with index or input_name / source / source_output,
         where input_name is a connector name or label as get_node_card
-        lists them; or {"indirect_input": n} to wire from connector n of
-        the parent subnet itself; or null to hold a position unconnected),
-        flags (display/render/bypass/template), color [r,g,b], comment,
-        override_expression.
+        lists them and source_output an output index or name ("v", "P");
+        or {"indirect_input": n} to wire from connector n of the parent
+        subnet itself; or null to hold a position unconnected), flags
+        (display/render/bypass/template), color [r,g,b], comment,
+        override_expression, run_callbacks. Parms are written in the order
+        given, a multiparm's count before its instances.
 
     A string aimed at a numeric parameter is caught during validation and
     answered with the {"expr": ...} spelling, instead of failing mid-build
@@ -75,8 +80,19 @@ async def build_network(
     none (a usdrender_rop) goes to its nearest input that has one, listed in
     `display_set_upstream`.
 
+    A LOCKED parm (karmarendersettings resolutiony while res_mode is
+    autoheight) takes nothing; such a spec is refused at validation, nothing
+    built, with `locked_parms` naming the menu whose callback sets the lock.
+    Houdini runs callbacks only from the UI: "run_callbacks": true on the spec
+    runs each parm's callback after its write, so {"res_mode": "manual",
+    "resolution": [1920, 1080]} builds. Validation replays a spec on a probe,
+    its callbacks included, only when it writes a parm a fresh node locks.
+
     There is no "children" key: build the subnet, then call build_network
     again with the subnet as parent_path.
+
+    Nodes built inside a DOP network come with `simulation_cache`: the
+    network to pass to reset_simulation before reading a frame it cooked.
 
     Args:
         parent_path: Network to build inside (e.g. "/obj/geo1"). A missing
@@ -119,7 +135,7 @@ async def build_network(
 
 
 @mcp.tool()
-async def verify_network(ctx: Context, parent_path: str) -> dict:
+async def verify_network(ctx: Context, parent_path: str, force_cook: bool = False) -> dict:
     """Inspect every node in a network at once — errors, warnings, flags,
     and the display node's cooked geometry counts.
 
@@ -131,11 +147,20 @@ async def verify_network(ctx: Context, parent_path: str) -> dict:
     stage (prims, cameras, lights, gprims without a material), for a COP
     network the image layer (resolution, channel ranges).
 
+    A node's errors are its LAST cook's verdict. A node that nothing has
+    cooked since its cause was fixed is reported `stale` and listed in
+    `stale_error_nodes`; pass force_cook=True to recook before judging.
+    The default cooks only the display node, so a heavy scene is left alone.
+
     Args:
         parent_path: Network to verify (e.g. "/obj/geo1").
+        force_cook: Cook the display node with force and recook every node
+            that has errors, so the verdict is about the network as it is now.
     """
     bridge = _get_bridge(ctx)
-    return await bridge.execute("graph.verify_network", {"parent_path": parent_path})
+    return await bridge.execute(
+        "graph.verify_network", {"parent_path": parent_path, "force_cook": force_cook}
+    )
 
 
 @mcp.tool()
@@ -156,6 +181,10 @@ async def get_node_card(
     be read, not that the type has none. A menu whose items a script
     computes (`loadtype` on filemerge::2.0) is read off the same probe and
     marked `menu_source: "generator"`, with the script in `menu_generator`.
+    A radio folder set (`switcher1` on an Add SOP: By Pattern / By Group)
+    is listed as a `FolderSet` parm whose menu is its folders; a default
+    that is an expression (`$F` on timeshift's `frame`) is in
+    `default_expression`; a VOP's outputs carry their `data_type`.
 
     Use this BEFORE setting parameters on a node type you have not used
     in this session — never guess parameter names. Unversioned names
@@ -166,6 +195,9 @@ async def get_node_card(
     names. Pass include_help=True when the names are not enough — when you
     are stuck on what the node actually does, what a menu token means, or
     which of several parameters governs the behaviour you want.
+
+    A menu carries `menu_labels` (same order as `menu`) whenever its labels
+    differ from its tokens: "0"/"1"/"2" = Surface Scatter/Keep Input/Volume Scatter.
 
     Args:
         node_type: Type name (e.g. "scatter", "rbdbulletsolver").
@@ -238,6 +270,12 @@ async def cook_frame_range(
     check is one call rather than 100. The frame is left where the cook ended,
     ready to screenshot.
 
+    No deadline: a heavy sim runs under Houdini's progress bar for as long as it
+    takes; wait for the verdict and call nothing else meanwhile. Stopped from
+    that bar, it answers `interrupted: true` with the frames cooked so far. A
+    node that keeps a cache across frames (Trail, SOP Solver) starts from what it
+    holds: press_button its reset (Trail: `clear`) or reset_simulation first.
+
     Args:
         node_path: Node to cook; its output is what gets measured.
         start: First frame. Defaults to the playbar start.
@@ -259,7 +297,7 @@ async def cook_frame_range(
         params["end"] = end
     if attribs is not None:
         params["attribs"] = attribs
-    return await bridge.execute("graph.cook_frame_range", params)
+    return await bridge.execute("graph.cook_frame_range", params, timeout=NO_TIMEOUT)
 
 
 @mcp.tool()

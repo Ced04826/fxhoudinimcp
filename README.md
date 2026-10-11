@@ -1,19 +1,8 @@
 <div align="center">
 
-  <img src="https://cdn.simpleicons.org/houdini/FF4713" alt="Houdini" width="80">
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="https://cdn.simpleicons.org/modelcontextprotocol/ffffff" alt="MCP" width="80">
-
-  <h3 align="center">fxhoudinimcp</h3>
-
   <p align="center">
-    The most comprehensive MCP server for SideFX Houdini.
-    <br/>
-    206 tools across 23 categories, covering every major Houdini context.
-    <br/><br/>
+    <img src="https://raw.githubusercontent.com/healkeiser/fxhoudinimcp/main/docs/images/banner.webp" alt="fxhoudinimcp: the MCP server for SideFX Houdini" width="100%">
   </p>
-
-  ##
 
   <p align="center">
     <!-- Maintenance status -->
@@ -29,9 +18,9 @@
     <a href="https://pypi.org/project/fxhoudinimcp/">
       <img src="https://img.shields.io/pypi/v/fxhoudinimcp?logo=pypi&logoColor=white&label=PyPI" alt="PyPI"/></a>&nbsp;&nbsp;
     <!-- PyPI downloads -->
-    <a href="https://pepy.tech/projects/fxhoudinimcp"><img src="https://static.pepy.tech/badge/fxhoudinimcp" alt="PyPI Downloads"></a> &nbsp;&nbsp;
+    <a href="https://pepy.tech/projects/fxhoudinimcp"><img src="https://static.pepy.tech/badge/fxhoudinimcp" alt="PyPI Downloads"></a>&nbsp;&nbsp;
     <!-- GitHub stars -->
-    <img src="https://img.shields.io/github/stars/healkeiser/fxhoudinimcp" alt="GitHub Stars"/>&nbsp;&nbsp;
+    <img src="https://img.shields.io/github/stars/healkeiser/fxhoudinimcp" alt="GitHub Stars"/>
   </p>
 
 </div>
@@ -40,11 +29,9 @@
 ## Table of Contents
 
 - [About](#about)
-- [Features](#features)
-- [Architecture](#architecture)
 - [Installation](#installation)
 - [Usage](#usage)
-- [Environment Variables](#environment-variables)
+- [Configuration](#configuration)
 - [Security](#security)
 - [Development](#development)
 - [Contact](#contact)
@@ -52,30 +39,29 @@
 <!-- ABOUT -->
 ## About
 
-A comprehensive [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) server for [SideFX Houdini](https://www.sidefx.com/). Connects AI assistants like Claude directly to Houdini's Python API, enabling natural language control over scene building, simulation setup, rendering, and more.
+An [MCP](https://modelcontextprotocol.io/) server for [SideFX Houdini](https://www.sidefx.com/): it lets an AI assistant build networks, set up simulations, inspect USD stages and render, through Houdini's own Python API. It works with any MCP client: Claude, Codex, Copilot, Gemini, Cursor, Windsurf, VS Code, Cline and others.
 
-**206 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
+**215 tools**, **8 resources**, and **9 prompts** serving **31 written workflow guides** out of the box.
 
-<!-- FEATURES -->
-## Features
-
+<!-- --8<-- [start:features] -->
 | Category | Tools | Description |
 |----------|-------|-------------|
 | **Graph Intelligence** | 6 | Atomic validated network building, network verification, node doc cards, cook profiling, frame-range cooking with per-frame evidence, cook status |
-| **Documentation** | 2 | Full-text search + page retrieval over Houdini's own shipped manual (version-exact) |
+| **Documentation** | 3 | Full-text search + page retrieval over Houdini's own shipped manual (version-exact) |
 | **Scene Management** | 10 | Open, save, import/export, scene info, connection status, undo/redo |
+| **Sessions** | 3 | Switch between open Houdini sessions, start a headless or GUI Houdini of the server's own, stop it |
 | **Node Operations** | 22 | Create, delete, copy, connect, layout, flags, network boxes, sticky notes, object transforms |
-| **Parameters** | 12 | Get/set values in bulk, expressions, keyframes, spare parameters |
-| **Geometry (SOPs)** | 14 | Points, prims, attributes, attribute statistics, volume inspection, groups, sampling, nearest-point search |
-| **LOPs/USD** | 18 | Stage inspection, prims, layers, composition, variants, lighting |
+| **Parameters** | 14 | Get/set values in bulk, expressions, keyframes, spare parameters |
+| **Geometry (SOPs)** | 16 | Points, prims, attributes, attribute statistics, volume statistics and sampling, groups, sampling, nearest-point search |
+| **LOPs/USD** | 21 | Stage inspection, prims, world transforms over frames, layers, composition, variants, lighting |
 | **DOPs** | 8 | Simulation info, DOP objects, step/reset, memory usage |
 | **PDG/TOPs** | 12 | Cook, work items, failed items and logs, schedulers, dependency graphs |
 | **COPs (Copernicus)** | 7 | Image nodes, layers, VDB data |
-| **HDAs** | 11 | Create, install, manage Digital Assets, their versions and sections |
+| **HDAs** | 13 | Create, install, manage Digital Assets, their versions and sections |
 | **Animation** | 9 | Keyframes, playbar control, frame range |
-| **Rendering** | 9 | Viewport capture, render nodes, settings, render launch |
+| **Rendering** | 10 | Viewport capture, contact sheets of a frame range without a viewport, render nodes, settings, render launch |
 | **VEX** | 5 | Create/edit wrangles, validate VEX code |
-| **Code Execution** | 6 | Python, HScript, expressions, env variables, file references, update mode |
+| **Code Execution** | 7 | Python, HScript, expressions, env variables, file references, update mode |
 | **Viewport/UI** | 14 | Pane management, viewer context, verified camera and renderer state, screenshots, error detection |
 | **Scene Context** | 8 | Network overview, cook chain, selection, scene summary, error analysis |
 | **Workflows** | 8 | One-call Pyro/RBD/FLIP/Vellum setup, SOP chains, render config |
@@ -84,22 +70,21 @@ A comprehensive [MCP](https://modelcontextprotocol.io/) (Model Context Protocol)
 | **Cache** | 4 | List, inspect, clear, write file caches |
 | **Takes** | 4 | List, create, switch takes with parameter overrides |
 | **Shelf Tools** | 3 | Find, read and run Houdini's own shelf tools (setups build_network cannot produce) |
+<!-- --8<-- [end:features] -->
 
-<!-- ARCHITECTURE -->
-## Architecture
-
+<!-- --8<-- [start:architecture] -->
 ```mermaid
 flowchart LR
     subgraph Client[" 🤖 AI Client "]
         direction TB
-        A1("Claude Desktop")
-        A2("Cursor / VS Code")
-        A3("Claude Code")
+        A1("Claude · Codex · Copilot · Gemini")
+        A2("Cursor · Windsurf · VS Code · Cline")
+        A3("any stdio MCP client")
     end
 
     subgraph MCP[" ⚡ FXHoudini MCP Server "]
         direction TB
-        B1("🔧 206 tools")
+        B1("🔧 215 tools")
         B2("📦 8 Resources")
         B3("💬 9 Prompts")
     end
@@ -131,112 +116,43 @@ flowchart LR
     class C1,C2,C3 houdiniNode
 ```
 
-Uses Houdini's built-in `hwebserver`. No custom socket servers, no rpyc. Uses `hdefereval.executeInMainThreadWithResult()` to safely run `hou.*` calls on the main thread.
+The plugin runs on Houdini's built-in `hwebserver` and executes every `hou.*` call on the main thread through `hdefereval`. The MCP server is a separate process your AI client starts; it relays tool calls to the plugin over loopback HTTP as body-free `GET /fxapi` requests: small commands ride in the query string, large ones in a single-use local temp file.
+<!-- --8<-- [end:architecture] -->
 
 <!-- INSTALLATION -->
 <!-- --8<-- [start:installation] -->
 ## Installation
 
-FXHoudini-MCP has two halves: a **Houdini plugin** that runs inside Houdini, and
-an **MCP server** that your AI client starts and which relays to it over
-loopback. Both ship in the same Python package, so one install command sets up
-both and one upgrade moves them together.
-
-### Requirements
-
-- **Houdini** 20.5+ (integration suite green on 20.5.278, 20.5.487, 20.5.613, 20.5.654, 21.0.440 and 22.0.368)
-- **Python** 3.10+, separate from the one inside Houdini
-- **MCP SDK** (`mcp` package) 1.8+, installed for you as a dependency
-
-### Install
+Requires Houdini 20.5+ (tested on 20.5, 21.0 and 22.0) and Python 3.10+ outside Houdini.
 
 ```shell
 pip install fxhoudinimcp
 python -m fxhoudinimcp install
 ```
 
-Then restart Houdini, restart your MCP client, and check the **MCP** menu in
-Houdini's menu bar.
+Restart Houdini and your MCP client. An **MCP** menu appears in Houdini's menu bar.
 
-`install` does both halves. It writes a Houdini package file pointing at this
-exact install, and registers the server with every MCP client it finds on the
-machine (Claude Code, Claude Desktop, Codex, Copilot CLI, Gemini CLI, Cursor,
-Windsurf, VS Code, Cline), using the absolute path of the Python you ran it
-with. Pass `--client` to name the ones you want instead.
-
-Use `python -m fxhoudinimcp install` rather than the bare `fxhoudinimcp install`
-if you have more than one Python. Both work, but the module form is
-self-correcting: whichever interpreter runs it is the one written into your
-client config, so if the command runs at all, the path it registers is correct.
-
-Add `--dry-run` first if you want to see every file it would touch and change
-nothing.
-
-It asks nothing and it finishes. If you have several Houdini versions, it writes
-into every packages directory it finds:
-
-```
-Houdini plugin
-  Wrote C:\Users\you\Documents\houdini21.0\packages\fxhoudinimcp.json
-  Wrote C:\Users\you\Documents\houdini22.0\packages\fxhoudinimcp.json
-```
-
-That is safe rather than lazy. The files are identical and point at the same
-plugin, so whichever directory your Houdini reads, it finds a correct one. It
-also settles the Windows case where OneDrive's Documents redirection makes a
-desktop-launched Houdini and a shell-launched one disagree: both paths get a
-file, so both work. The cost is an **MCP** menu in a Houdini version you may not
-use, which `uninstall` clears in one go.
-
-Because it never stops to ask, the same command works unchanged from a terminal,
-from Houdini's MCP menu, or from a setup script. To target one directory only:
-
-```shell
-python -m fxhoudinimcp install --houdini-dir "~/Documents/houdini22.0/packages"
-```
-
-If your MCP client already has an `fxhoudini` entry pointing at a different
-interpreter, it is repointed at this one and the old value is printed. That is
-the common case after switching Python versions or recreating a virtualenv.
+`install` sets up both halves: it writes a Houdini package file into every Houdini packages directory it finds, and registers the server with every MCP client it finds (Claude Code, Claude Desktop, Codex, Copilot CLI, Gemini CLI, Cursor, Windsurf, VS Code, Cline). Use the `python -m` form: the Python that runs it is the one written into the client config.
 
 | Flag | What it does |
 | --- | --- |
 | `--dry-run` | Report every change, make none |
-| `--houdini-dir DIR` | Which packages directory to write into |
-| `--client-only` | Register a client, leave Houdini untouched. Needs no packages directory, so it works when several exist |
-| `--client NAME` | Which client to register, repeatable: `claude-code`, `claude-desktop`, `codex`, `copilot`, `gemini`, `cursor`, `windsurf`, `vscode`, `cline`. Default `auto` takes every one detected; `none` if you wire it up yourself |
+| `--houdini-dir DIR` | Write into this packages directory only |
+| `--client-only` | Register a client, leave Houdini untouched |
+| `--client NAME` | Client to register, repeatable: `claude-code`, `claude-desktop`, `codex`, `copilot`, `gemini`, `cursor`, `windsurf`, `vscode`, `cline`. Default `auto` (every one detected); `none` to skip |
 
-Upgrading later moves both halves at once, because the plugin lives inside the
-wheel:
+An existing `fxhoudini` client entry pointing at another Python is repointed, and the old value printed.
 
-```shell
-pip install --upgrade fxhoudinimcp
-```
-
-The one thing to know: if you told Houdini to load the plugin from a **git
-clone** instead of the installed package (see [by hand](#installing-by-hand)),
-`pip install --upgrade` will not move that half. Those two halves are then
-independent, and the server warns at startup when it finds a plugin older than
-itself.
+`pip install --upgrade fxhoudinimcp` upgrades both halves, since the plugin ships inside the wheel. The exception is a plugin loaded from a git clone, which you update with git.
 
 ### Uninstalling
 
-`pip uninstall` moves neither half. The Houdini package file and the client
-registration both outlive it, and both fail quietly once the package is gone: a
-package file pointing at a plugin directory that no longer exists is skipped by
-Houdini without a word, and a stale client entry shows up only as
-"disconnected". So take the two halves out first, then the package:
+`pip uninstall` alone leaves the package file and the client entry behind, and both then fail silently. Remove them first:
 
 ```shell
 python -m fxhoudinimcp uninstall
 pip uninstall fxhoudinimcp
 ```
-
-`uninstall` lists everything it found and asks before removing any of it. Unlike
-`install` it does not need to know which Houdini you meant: every
-`fxhoudinimcp.json` it finds is a leftover, and the one you forget is exactly
-what silently overrides your next install. Narrow it with `--houdini-dir` when
-you only want one Houdini cleaned.
 
 | Flag | What it removes |
 | --- | --- |
@@ -246,107 +162,33 @@ you only want one Houdini cleaned.
 | `--client NAME` | Which client to unregister from, repeatable; same names as `install`. Default `auto` takes every one with an entry |
 | `--yes` | Skip the confirmation. Required when stdin is not a terminal |
 
-### Configuring the plugin
-
-The package file `install` writes is also where the Houdini-side settings live.
-It ships every one of them at its default, so they are all visible in one place:
-`FXHOUDINIMCP_PORT`, `FXHOUDINIMCP_BIND`, `FXHOUDINIMCP_AUTOSTART`,
-`FXHOUDINIMCP_AUTO_LAYOUT`, `FXHOUDINIMCP_PROJECT_ROOT`, `FXHOUDINIMCP_TIMEOUT`
-and `FXHOUDINIMCP_OUTPUT_GRACE` (see [Environment Variables](https://healkeiser.github.io/fxhoudinimcp/latest/how-to/configuration/#environment-variables)
-for what each does). Edit the values in place; running `install` again refreshes
-the plugin path and keeps every value you changed, along with any variable you
-added. Two things to know:
-
-- Because the package sets these explicitly, it **wins over the same variable
-  set in your shell**. Change them here, not in your environment. Houdini's
-  package format has no "only if unset" method, and it rejects JSON comments,
-  so there is no way to ship them inert. `hou.putenv` in a running session
-  still wins over both.
-- `HOUDINI_HOST`, `HOUDINI_PORT`, `MCP_TRANSPORT` and `LOG_LEVEL` do **not**
-  belong here. They are read by the MCP server process that your client
-  launches, not by Houdini, so setting them in this file has no effect --
-  configure those in your MCP client instead. If you change
-  `FXHOUDINIMCP_PORT`, set `HOUDINI_PORT` to match on the client side.
-
-Note that pinning `HOUDINI_PORT` on the client switches off the port scan. A
-second Houdini moves itself to the next free port, and the client normally finds
-it by scanning 8100-8115 and taking the lowest that answers. Pin it only when you
-want one specific session.
-
 ### Installing by hand
 
-`install` is the recommended route and the rest of this section is the manual
-equivalent, for contributors working from a clone, locked-down machines, or when
-something needs untangling. It is the same two halves.
+For a clone, a locked-down machine, or untangling a broken setup.
 
-#### 1. Point Houdini at the plugin
+**1. Point Houdini at the plugin.** Print the package file for this install, then write it:
 
 ```shell
 fxhoudinimcp houdini-package
-```
-
-That prints the package file with the plugin path filled in for *this* install
-and every Houdini-side setting at its default, plus the Houdini packages
-directories found on your machine. Write it with:
-
-```shell
 fxhoudinimcp houdini-package --write "~/Documents/houdini22.0/packages"
 ```
 
-Do not type the plugin path by hand. It lives inside the Python environment you
-installed into, so it changes if you recreate a virtualenv, switch to uv or
-pipx, or move between Python versions, and Houdini says nothing when a package
-path stops resolving. `--path-only` prints just the path for scripting.
-
-Like `install`, this deliberately does not pick a packages directory for you, and
-it warns if another `fxhoudinimcp.json` exists elsewhere, because Houdini
-processes every packages directory and lets the last one win. That is how a stale
-clone silently overrides a fresh install.
-
-**Pointing at a clone instead.** Contributors, or anyone wanting the plugin
-tracked by git, can write the package file against a checkout:
+Don't type the plugin path by hand: it moves whenever the Python environment does. To load the plugin from a clone instead, write the package file yourself (the path must end in `/houdini`):
 
 ```json
-{ "env": [ { "FXHOUDINIMCP": "C:/Users/you/code/fxhoudinimcp/houdini" } ],
-  "path": "$FXHOUDINIMCP" }
+{
+  "env": [
+    {
+      "FXHOUDINIMCP": "C:/Users/you/code/fxhoudinimcp/houdini"
+    }
+  ],
+  "path": "$FXHOUDINIMCP"
+}
 ```
 
-Forward slashes work on every platform. The path must end in `/houdini` and must
-contain `scripts/`, `MainMenuCommon.xml` and the `python3.Xlibs/` folders. Do not
-do this *and* the CLI, or the two package files will fight. Remember that
-`pip install --upgrade` cannot move a clone.
+**2. Point your MCP client at the server.** Every client runs the same command, `<python> -m fxhoudinimcp`, where `<python>` is the absolute path of the Python that has `fxhoudinimcp` (`python -c "import sys; print(sys.executable)"`). Clients don't inherit your shell's PATH, and a bare `python` just shows as "disconnected".
 
-> [!NOTE]
-> Copying `houdini/` into your Houdini preferences directory also works, but it
-> is not recommended: `pip` cannot update a copy, so the plugin drifts behind the
-> server, which is the skew the startup compatibility warning exists to catch.
-> Use a package file so there is one copy of the plugin.
-
-#### 2. Point your MCP client at the server
-
-Both examples need the **absolute path** to the Python that has `fxhoudinimcp`
-installed. Clients start their servers without your shell environment, so a bare
-`python` resolves against a PATH they may not share, and the only symptom is the
-client reporting **disconnected** with nothing explaining why. Find the path
-with:
-
-```shell
-python -c "import sys; print(sys.executable)"
-```
-
-**Claude Code** (user scope, available in every project):
-
-```shell
-claude mcp add --scope user fxhoudini -- "C:\Program Files\Python311\python.exe" -m fxhoudinimcp
-```
-
-There is no in-place update. To repoint an existing entry, remove it first:
-
-```shell
-claude mcp remove fxhoudini -s user
-```
-
-**Claude Desktop** (`claude_desktop_config.json`):
+CLI clients register it with their own command. File-based clients take this entry in their config file:
 
 ```json
 {
@@ -359,301 +201,119 @@ claude mcp remove fxhoudini -s user
 }
 ```
 
-After any change, fully quit Claude Desktop (system tray → Quit) and relaunch;
-closing the window is not enough.
-
-To scope the server to a single project instead, add a `.mcp.json` in the project
-root with the same `mcpServers` block.
-
-**Other clients.** Same command, same absolute path; only where it goes differs.
-The CLI-driven ones take the command after their own `mcp add`, the file-driven
-ones take the JSON block above in the file listed, under the key listed. Paths
-checked against each vendor's documentation in September 2026; they move.
-
 | Client | Register with | Remove with |
 | --- | --- | --- |
+| Claude Code | `claude mcp add --scope user fxhoudini -- <python> -m fxhoudinimcp` | `claude mcp remove fxhoudini -s user` |
 | Codex | `codex mcp add fxhoudini -- <python> -m fxhoudinimcp` | `codex mcp remove fxhoudini` |
 | Copilot CLI | `copilot mcp add fxhoudini -- <python> -m fxhoudinimcp` | `copilot mcp remove fxhoudini` |
 | Gemini CLI | `gemini mcp add -s user fxhoudini <python> -m fxhoudinimcp` | `gemini mcp remove -s user fxhoudini` |
+| Claude Desktop | `claude_desktop_config.json` in the app-data `Claude/` folder, key `mcpServers`; quit from the tray and relaunch | delete the entry |
 | Cursor | `~/.cursor/mcp.json`, key `mcpServers` | delete the entry |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json`, key `mcpServers` | delete the entry |
 | VS Code | user `mcp.json` (**MCP: Open User Configuration**), key `servers`, entry gets `"type": "stdio"` | delete the entry |
-| Cline | `cline_mcp_settings.json` in the extension's `globalStorage/saoudrizwan.claude-dev/settings/`, key `mcpServers` | delete the entry |
+| Cline | `~/.cline/data/settings/cline_mcp_settings.json`, key `mcpServers` | delete the entry |
 
-Anything not listed (OpenCode, Zed, Roo Code, Kiro...) speaks the same stdio
-protocol: give it `<python> -m fxhoudinimcp` as the command in whatever shape
-its config wants, and `--client none` to keep `install` out of the way.
+Any other stdio client takes `<python> -m fxhoudinimcp` as its command. `python -m fxhoudinimcp install --client-only` does this step for you.
 
-`python -m fxhoudinimcp install --client-only` does this step for you, with the
-right path already filled in, and leaves the Houdini side alone. **MCP > Connect
-a Client...** inside Houdini prints the same command along with the port that
-session actually ended up on.
+### Troubleshooting
 
-### When Houdini does not load the plugin
+**No MCP menu in Houdini.** Houdini skipped the package file without saying so. Start it with `HOUDINI_PACKAGE_VERBOSE=1` and look for `Loading:` and `Processing:` lines for `fxhoudinimcp.json`. The usual causes:
 
-No **MCP** menu means the package file was skipped, and Houdini does that
-without printing anything. Start it with the package log enabled and look for
-your file:
+- the plugin path in the file doesn't exist;
+- the file starts with a UTF-8 BOM (PowerShell's `Set-Content -Encoding UTF8` adds one);
+- another `fxhoudinimcp.json` in a later packages directory overrides it (`fxhoudinimcp houdini-package` lists them all, `uninstall` removes them);
+- the Houdini version you launched has no package file (each version reads its own preferences directory).
 
-```shell
-# Windows (PowerShell)
-$env:HOUDINI_PACKAGE_VERBOSE=1; houdini
-# Linux / macOS
-HOUDINI_PACKAGE_VERBOSE=1 houdini
-```
+On Windows, OneDrive can make a desktop-launched and a shell-launched Houdini read different preference directories; the package log shows which one is used.
 
-A working package prints both a `Loading:` and a `Processing:` line for
-`fxhoudinimcp.json`. Three ways this fails quietly:
+**The client shows "disconnected".** Its config names a bare `python`; use the absolute path.
 
-- **A path that does not exist.** Houdini skips the package and says nothing.
-  Nothing loads: no menu, no auto-start, no `fxhoudinimcp_server` module.
-- **A UTF-8 BOM.** Houdini's JSON parser rejects a leading BOM and skips the
-  whole package. On Windows, `Set-Content -Encoding UTF8` adds one; use
-  `-Encoding utf8NoBOM` (PowerShell 7+) or an editor that can save without one.
-  The file looks correct either way, which is what makes this one nasty. Both
-  `install` and `houdini-package` write without a BOM.
-- **A second `fxhoudinimcp.json`.** Houdini processes every packages directory
-  and the last one wins, so a leftover file can override a fresh install. Both
-  commands warn when they find another one. `fxhoudinimcp houdini-package` lists
-  every one it can see, and what each points at, and `fxhoudinimcp uninstall`
-  removes the lot.
-- **No package file for the Houdini you launched.** Each Houdini version reads
-  its own preference directory, so a file in `houdini21.0/packages` does nothing
-  for a Houdini 22 you start afterwards. `install` writes to every candidate for
-  exactly this reason; you only see this if you narrowed it with
-  `--houdini-dir`, or if that Houdini's `packages` directory did not exist when
-  you ran it. Create it and re-run.
+**A documented subcommand seems missing.** Check `python -m fxhoudinimcp --version`: an editable install reports the version it was created at.
 
-On Windows, note that OneDrive's Documents redirection means a desktop-launched
-Houdini and a shell-launched one can resolve different preference directories.
-The package log is what settles which one your Houdini actually reads.
-
-### Checking what you are actually running
-
-An editable install reports the version it was created at, not whatever the
-working tree has become since, so an old checkout can be running while the
-metadata claims otherwise:
-
-```shell
-python -m fxhoudinimcp --version
-```
-
-Worth checking first whenever a documented subcommand behaves as though it does
-not exist. Before 2.5.0, an unrecognised argument was ignored and the MCP server
-started instead, so `python -m fxhoudinimcp install` on an older install printed
-a warning about not reaching Houdini and then sat there, looking like a hung
-installer. It now exits with `unknown command` and the list of real ones.
+**The assistant can't reach Houdini.** `get_houdini_connection_status` lists every Houdini serving the plugin and why a connection failed.
 <!-- --8<-- [end:installation] -->
 
 <!-- USAGE -->
 ## Usage
 
-Launch Houdini normally. The plugin auto-starts once when the UI is ready (controlled by `FXHOUDINIMCP_AUTOSTART` env var). The startup script uses `uiready.py`, which stacks correctly with other Houdini packages. You can also control it manually from the **MCP** menu (Start Server, Stop Server, Connect a Client, Server Status).
+The plugin starts with Houdini's UI (`FXHOUDINIMCP_AUTOSTART`), and the **MCP** menu starts, stops and checks it. **MCP > Connect a Client...** shows the port this session actually got (a second Houdini takes the next free port), copies the command that registers the server with every client found, and lists the manual form for each client.
 
-**MCP > Connect a Client...** prints the `claude mcp add` line for the port this
-session actually ended up on, and copies it to the clipboard. That matters with
-more than one Houdini open: a second session moves itself to the next free port,
-so the configured port and the real one differ.
-
-Startup verifies that Houdini's `mcp.health` endpoint answers from the current
-Houdini process before printing that the server is ready. If your assistant
-cannot reach Houdini after an app restart, call `get_houdini_connection_status`
-for structured diagnostics, then relaunch Houdini or align `FXHOUDINIMCP_PORT`
-and `HOUDINI_PORT` if another process owns the port.
-
-Once connected, your AI assistant can:
+Then ask for things:
 
 ```
 "Create a procedural rock generator with mountain displacement"
 "Set up a Pyro simulation with a sphere source"
 "Build a USD scene with a camera, dome light, and ground plane"
-"Create an HDA from the selected subnet"
 "Debug why my scene has cooking errors"
 ```
 
-<!-- ENVIRONMENT VARIABLES -->
-## Environment Variables
+Every tool call is one undo step. Tools leave your selection, viewport camera and network editor where they were, so you can keep working in the scene while the assistant does.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HOUDINI_HOST` | `localhost` | Houdini host address |
-| `HOUDINI_PORT` | `8100` | Houdini hwebserver port |
-| `HOUDINI_TIMEOUT` | `FXHOUDINIMCP_TIMEOUT` + 15 | Seconds the MCP client waits for one command before reporting a timeout. Keep it above the plugin's deadline, and raise it alongside any `FXHOUDINIMCP_TIMEOUT_<COMMAND>` you set |
-| `FXHOUDINIMCP_PORT` | `8100` | Port for the Houdini plugin to listen on |
-| `FXHOUDINIMCP_AUTOSTART` | `1` | Set to `0` to disable auto-start |
-| `FXHOUDINIMCP_AUTO_LAYOUT` | `0` | Off by default: tools never re-arrange existing nodes. Freshly created nodes are still placed next to their inputs instead of piling up at the origin, and an explicit `position` always wins. Set to `1` to have handlers lay out the parent network after each change |
-| `FXHOUDINIMCP_BIND` | `127.0.0.1` | Address the Houdini plugin binds. Loopback by default: the bridge runs arbitrary Python in your Houdini session and has no authentication, so only widen this on a network you trust |
-| `FXHOUDINIMCP_PROJECT_ROOT` | unset | When set, hip files, imports, exports and HDA libraries must live under this directory. See [Security](#security) for what it does not cover |
-| `FXHOUDINIMCP_TIMEOUT` | `120` | Seconds a command may run before the plugin reports a timeout |
-| `FXHOUDINIMCP_TIMEOUT_<COMMAND>` | unset | Per-command override, the dotted command name uppercased with dots as underscores: `FXHOUDINIMCP_TIMEOUT_TOPS_COOK_TOP_NODE=900` |
-| `FXHOUDINIMCP_OUTPUT_GRACE` | `2` | Seconds a clean render or cache write may take to show its file before the tool reports that nothing was written. Raise it when output lands on a slow network share |
-| `FXHOUDINIMCP_TOOLSET` | `full` | Which tools the MCP server registers: `full`, or `modeling` for the modeling set in `python/fxhoudinimcp/toolsets.py`. Every registered tool's name is listed to every session. Under `modeling` the rest are reached through three gateway tools, `list_toolsets`, `describe_tools` and `call_tool`, with the same receipts; the instructions header says how many. `fxhoudinimcp.client` always reaches every tool |
-| `MCP_TRANSPORT` | `stdio` | MCP transport (`stdio` or `streamable-http`) |
-| `LOG_LEVEL` | `INFO` | Logging level |
+<!-- CONFIGURATION -->
+## Configuration
+
+<!-- --8<-- [start:environment] -->
+| Variable | Default | Read by | Description |
+|----------|---------|---------|-------------|
+| `FXHOUDINIMCP_PORT` | `8100` | Houdini | Port the plugin listens on; a second Houdini takes the next free one |
+| `FXHOUDINIMCP_BIND` | `127.0.0.1` | Houdini | Address the plugin binds. See [Security](#security) before widening it |
+| `FXHOUDINIMCP_AUTOSTART` | `1` | Houdini | `0` disables auto-start |
+| `FXHOUDINIMCP_AUTO_LAYOUT` | `0` | both | `1` lets tools re-lay-out a network after changing it. Off, only new nodes are placed |
+| `FXHOUDINIMCP_PROJECT_ROOT` | unset | Houdini | Confine hip, import, export and HDA files to this directory |
+| `FXHOUDINIMCP_TIMEOUT` | `120` | Houdini | Seconds a command may run; `write_cache`, `start_render`, `cook_frame_range` and `press_button` have no deadline |
+| `FXHOUDINIMCP_TIMEOUT_<COMMAND>` | unset | Houdini | Per-command override: `FXHOUDINIMCP_TIMEOUT_TOPS_COOK_TOP_NODE=900` |
+| `FXHOUDINIMCP_OUTPUT_GRACE` | `2` | Houdini | Seconds a render or cache may take to show its file before it counts as not written |
+| `HOUDINI_HOST` | `localhost` | client | Houdini host |
+| `HOUDINI_PORT` | scan 8100-8115 | client | Pin one Houdini port; switches off the scan |
+| `HOUDINI_TIMEOUT` | plugin timeout + 15 | client | Seconds the client waits for a command |
+| `FXHOUDINIMCP_TOOLSET` | `full` | client | `modeling` registers the modeling set in `python/fxhoudinimcp/toolsets.py`; the rest are reached through `list_toolsets`, `describe_tools` and `call_tool`. `fxhoudinimcp.client` always reaches every tool |
+| `MCP_TRANSPORT` | `stdio` | client | `stdio` or `streamable-http` |
+| `LOG_LEVEL` | `INFO` | client | Logging level |
+
+Houdini-side variables live in the package file `install` wrote, where every one sits at its default. They win over the same variables in your shell; `install` keeps your edits when it runs again. Client-side variables go in your MCP client's config.
+<!-- --8<-- [end:environment] -->
 
 <!-- SECURITY -->
 ## Security
 
-Treat a connection to this server as a shell inside your Houdini session.
-`execute_python` runs arbitrary code, and there is no authentication,
-authorization, per-tool permission model or audit log. The threat model is a
-single artist's workstation and an MCP client they trust.
+<!-- --8<-- [start:security] -->
+A connection to this server is a shell inside your Houdini session: `execute_python` runs arbitrary code, and there is no authentication or per-tool permission. It is built for one artist's workstation and an MCP client they trust.
 
-What the plugin does on its own:
-
-- **Binds to loopback.** Nothing on the network reaches the port unless you set
-  `FXHOUDINIMCP_BIND` to something wider on purpose.
-- **Refuses browsers.** A web page you have open is also on loopback, and it can
-  POST a form-encoded body to `127.0.0.1` without any CORS preflight. Any request
-  carrying an `Origin` header is refused with HTTP 403, and so is any `Host` that
-  is not a loopback name (DNS rebinding) while the bind is loopback.
-- **Confines file operations when asked.** With `FXHOUDINIMCP_PROJECT_ROOT` set,
-  the paths the handlers themselves open, save, load or install (hip files,
-  imports, exports, HDA libraries) must resolve under that directory.
-
-What it does not do, and you should know about:
-
-- The sandbox does not inspect parameter values. A file path written into a
-  File SOP or a ROP output parameter with `set_parameter` is evaluated later by
-  the node, not by the plugin. Checking it would mean inspecting every string
-  parameter on every set, and the gap is left open rather than half-closed.
-- `execute_python` and `execute_hscript` are not sandboxed at all.
-- One undo step per tool call is the recovery path for a bad change; there is
-  no confirmation flow before one.
-
-If those limits do not fit your situation, run the plugin only on disposable
-scenes, or do not run it.
+- The plugin binds to loopback unless `FXHOUDINIMCP_BIND` says otherwise.
+- Requests with an `Origin` header (a web page) or a non-loopback `Host` (DNS rebinding) are refused.
+- `FXHOUDINIMCP_PROJECT_ROOT` confines the files the tools open, save, import, export or install. It does not check paths written into parameters (a File SOP, a ROP output), and `execute_python` / `execute_hscript` are not sandboxed.
+- Recovery from a bad change is undo, one step per tool call.
+<!-- --8<-- [end:security] -->
 
 <!-- DEVELOPMENT -->
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the checks CI runs and how pull
-request titles are used. The rest of this section is the detail behind it.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for what CI checks.
 
 ```shell
-# Install dev dependencies
 pip install -e ".[dev]"
-
-# Run linter
-ruff check python/
-
-# Run tests
-pytest
-
-# Run integration tests inside a real Houdini (requires a license seat;
-# uses the newest installed Houdini, override with the HYTHON env var).
-# Works on Windows, macOS, and Linux:
-python tests/run_integration.py
-# Convenience wrappers: tests/run_integration.ps1 / tests/run_integration.sh
-
-# Contribute this machine's Houdini builds to the node-availability table and
-# regenerate the version annotations in server_instructions.md:
-python tools/gen_node_versions.py
-# Regenerate the derived search hints and the plugin-command manifest
-# (run gen_node_domains after gen_node_versions, it reads that table):
-python tools/gen_node_domains.py
+ruff check . && ruff format --check .
+pytest                                  # unit tests, hou mocked
+python tests/run_integration.py         # live suite in hython; needs a license seat, HYTHON picks the build
+python tests/integration/gui_session_check.py   # against a running GUI Houdini
+python tools/gen_node_versions.py       # add this machine's Houdini builds to the node table
+python tools/gen_node_domains.py        # after gen_node_versions
 python tools/gen_required_commands.py
-# Regenerate the node vocabulary tables in the workflow prompts. Edit the
-# groupings in tools/prompt_vocab.json, never the tables in the markdown:
-python tools/gen_prompt_vocab.py
-python tools/gen_node_versions.py --check   # verify the table against this machine
-python tools/gen_prompt_vocab.py --check    # needs no Houdini; runs in tests too
-HYTHON=/path/to/hython python tools/gen_node_versions.py   # one specific build
+python tools/gen_prompt_vocab.py        # node tables in the prompts; edit tools/prompt_vocab.json, not the markdown
 ```
 
-No node name in `prompts/markdown/` is hand-written any more. The tables come
-from `tools/prompt_vocab.json` through `gen_prompt_vocab.py`, which rejects a
-name no sampled build has and dates the ones that exist in only part of the
-20.5-22.0 range. `tests/test_prompt_vocab.py` enforces both, and also checks the
-hand-written prose around the tables, since that names nodes too, plus that every
-shipped help page the prompts cite still resolves.
+With Red Giant / Maxon Universe installed, set `HOUDINI_DISABLE_OPENFX_DEFAULT_PATH=1`, or its OpenFX plug-in crashes hython on 20.5.487 and later.
 
-### Prompt file layout
+Layout: the plugin is in `houdini/` (handlers under `scripts/python/fxhoudinimcp_server/handlers/`), the MCP server in `python/fxhoudinimcp/` (tools, bridge, prompts). Prompts are in `prompts/markdown/`: `instructions/` is sent to every client, `workflows/` holds one guide per SideFX help scope (`pyro.md` pairs with `pyro/`), `shared/` holds fragments.
 
-`prompts/markdown/` has three subdirectories, so what a file is for is visible at
-every call site (`load_markdown("workflows/pyro.md")`):
-
-- `instructions/` — what the server tells every client at connect time.
-- `workflows/` — one guide per subject, **named after the SideFX help scope it draws on**, so `pyro.md` pairs with the `pyro/` manual and `solaris.md` with `solaris/`. 31 of them.
-- `shared/` — fragments injected into the above (`housekeeping.md`, `layout_on.md`, `layout_off.md`), never served alone.
-
-Most subjects are reached through `houdini_workflow(topic)`, where `topic` is the
-scope name, so adding a subject means adding a markdown file and nothing else. `simulation_setup` dispatches on its `sim_type` argument
-through an alias map, because SideFX files FLIP under `fluid/` and RBD under
-`destruction/` while users ask for "flip" and "rbd"; anything with no specific
-guide falls back to `dyno.md`, the general dynamics one.
-
-The server searches **every** help corpus the install ships, zipped or loose. On
-a full 22.0 that is 56 scopes and 11,451 pages, including the workflow manuals
-(`pyro/`, `fluid/`, `vellum/`, `destruction/`, `model/`, `assets/`, `copy/`) and
-the unzipped ones (`copernicus/`, `mpm/`, `heightfields/`, `ml/`). It costs about
-half a second of lazy load and ~69 MB inside Houdini, and nothing in the
-assistant's context until a lookup happens.
-
-`tools/node_versions.json` accumulates. It records which builds have been
-sampled and what node types each had, so **one installed Houdini is enough**:
-your build merges into the shared evidence and the annotations are derived from
-everything sampled so far. A contributor with a single Houdini produces exactly
-the same table as someone with six. If a version has never been sampled by
-anyone, the generator says so rather than guessing, and `--check` reports only
-contradictions with the builds you actually have.
-
-That evidence file is ~1 MB and is **not** shipped. The generator also writes
-`python/fxhoudinimcp/data/sampled_versions.json`, a few hundred bytes listing
-only which versions have been sampled, which does ship: the server compares the
-connected Houdini against it at startup and warns when a version has never been
-checked, so a marker like `(21.0+)` silently covering a future 23.0 becomes
-visible instead. `get_houdini_connection_status` reports the same thing. It is
-advisory: `build_network(dry_run=True)` validates node types against the running
-Houdini and cannot go stale.
-
-If Red Giant / Maxon Universe is installed, its OpenFX plug-in crashes `hou`
-initialisation on Houdini 20.5.487 and later, so `hython` cannot start at all.
-Set `HOUDINI_DISABLE_OPENFX_DEFAULT_PATH=1` when running any of the above.
-This is a Houdini/Universe conflict, not something this repo causes.
-
-Unit tests mock `hou` and run anywhere. The integration suite in
-`tests/integration/` executes all 206 commands against live Houdini via
-`hython` — including end-to-end user scenarios (procedural modeling,
-simulation, animation, lookdev) — and prints per-command timing and
-coverage reports; it is skipped automatically when `hou` is not
-available. `tests/integration/perf_sweep.py` benchmarks handlers on
-large scenes, and `python tests/integration/bridge_e2e.py` validates the
-full HTTP transport (real hwebserver in hython driven by the MCP
-server's own bridge).
-
-### How It Works
-
-1. **Houdini Plugin** (`houdini/`): Runs inside Houdini's Python environment. Registers a body-free `GET /fxapi` URL handler; small JSON commands use the query string and large commands use a single-use local temp file. Uses `hdefereval.executeInMainThreadWithResult()` to safely execute `hou.*` calls on the main thread. On H22, route registration and serving share one dedicated owner thread because `hwebserver` state is thread-local.
-
-2. **MCP Server** (`python/fxhoudinimcp/`): A standalone Python process using FastMCP. Exposes 206 tools, 8 resources, and 9 prompts via the MCP protocol. Forwards tool calls to Houdini over HTTP.
-
-3. **Bridge** (`python/fxhoudinimcp/bridge.py`): Async HTTP client that sends commands to Houdini's hwebserver and deserializes responses. Handles connection errors and timeouts.
-
-#### What a call costs
-
-That main-thread hop in step 1 is not free, and it is the single biggest thing
-to know when driving this. `hou.*` can only run on Houdini's main thread, so
-every command is queued with `hdefereval` and waits for the next event-loop
-tick. Measured on Houdini 22.0.368 with an idle scene:
+**What a call costs.** Every command waits for a main-thread tick in Houdini, so call count, not work, sets a session's speed (Houdini 22.0.368, idle scene):
 
 | | |
 | --- | --- |
-| `health_check` (answers on the web server thread, no main-thread hop) | 0.5 ms |
-| any real command, including `list_children` on an **empty** `/obj` | ~50 ms |
-| 10 nodes created one call at a time | ~800 ms |
-| the same 10 nodes in a single round trip | ~66 ms |
-
-The floor is flat: a trivial query costs the same as a real one, because you are
-paying for the tick, not the work. So the cost of a session is set by how many
-calls it makes, not how much they each do, and batching is worth roughly an
-order of magnitude rather than being a matter of neatness. That is why the
-server instructions tell an assistant to design a whole graph and submit it as
-one `build_network`, and why `set_parameters`, `connect_nodes_batch` and
-`verify_network` exist alongside their single-item equivalents.
-
-Numbers are from one Windows machine and will move with hardware and with how
-busy Houdini is; the ratio is the durable part.
+| `health_check` (no main-thread hop) | 0.5 ms |
+| any command, even on an empty network | ~50 ms |
+| 10 nodes, one call each | ~800 ms |
+| the same 10 in one `build_network` | ~66 ms |
 
 <!-- CONTACT -->
 ## Contact

@@ -118,6 +118,39 @@ class TestExpressionsAndLinks:
         assert hou.node(box).parm("sizex").isLocked() is True
 
 
+class TestExpressionOnAnotherFrame:
+    """A literal written at frame 6 to a File Cache's f = ($FSTART, $FEND)."""
+
+    @pytest.fixture
+    def cache(self):
+        geo = hou.node("/obj").createNode("geo", "fc_host")
+        node = geo.createNode("filecache::2.0", "fc")
+        hou.setFrame(6)
+        return node
+
+    def test_the_write_that_did_not_land_is_reported(self, call, cache):
+        answer = call(
+            "parameters.set_parameter", node_path=cache.path(), parm_name="f", value=[1, 3, 1]
+        )
+
+        kept = {c["component"] for c in answer.get("expression_components", [])}
+        assert "f2" in kept, answer
+        assert answer["new_value"][1] != 3.0, "the literal was expected not to take"
+
+    def test_override_expression_makes_every_component_land(self, call, cache):
+        call("parameters.set_parameter", node_path=cache.path(), parm_name="f", value=[1, 3, 1])
+
+        call(
+            "parameters.set_parameter",
+            node_path=cache.path(),
+            parm_name="f",
+            value=[1, 3, 1],
+            override_expression=True,
+        )
+
+        assert [cache.parm(n).eval() for n in ("f1", "f2", "f3")] == [1.0, 3.0, 1.0]
+
+
 class TestSpareParameters:
     def test_create_spare_parameter_with_default(self, call, box):
         call(
@@ -172,6 +205,93 @@ class TestGetParametersBulk:
         entry = result["parameters"]["sizex"]
         assert entry["value"] == pytest.approx(7.5)
         assert entry["is_at_default"] is False
+        assert entry["default"] == pytest.approx(1.0)
+
+    def test_the_default_and_its_expression_are_reported_beside_the_value(self, call):
+        node = hou.node("/obj").createNode("null")
+        group = node.parmTemplateGroup()
+        group.append(hou.FloatParmTemplate("offset", "Offset", 3, default_value=(0, 2, 0)))
+        # A template given default expressions reports zeros from defaultValue()
+        # (22.0.429), so the expression gets its own parm.
+        group.append(hou.FloatParmTemplate("drift", "Drift", 3, default_expression=("", "$F", "")))
+        group.append(
+            hou.ToggleParmTemplate("gate", "Gate", default_value=False, default_expression="$F>1")
+        )
+        node.setParmTemplateGroup(group)
+        node.parm("offsety").set(5)
+        # The default is reported only where the value differs from it. set()
+        # leaves an expression-driven parm as it was, so the expression goes first.
+        for name, value in (("drifty", 3), ("gate", 1)):
+            node.parm(name).deleteAllKeyframes()
+            node.parm(name).set(value)
+        result = call(
+            "parameters.get_parameters",
+            node_path=node.path(),
+            patterns=["offset", "drift", "gate"],
+            include_defaults=True,
+        )
+        parms = result["parameters"]
+        assert parms["offsetx"]["is_at_default"] is True
+        assert "default" not in parms["offsetx"]
+        assert parms["offsety"]["value"] == pytest.approx(5)
+        assert parms["offsety"]["default"] == 2
+        assert "default_expression" not in parms["offsety"]
+        assert "default_expression" not in parms["driftx"]
+        assert parms["drifty"]["default_expression"] == "$F"
+        # One expression string for the whole toggle, not its first character.
+        assert parms["gate"]["default_expression"] == "$F>1"
+
+
+class TestSweepStopsAtLockedAssets:
+    """A recursive sweep read every node inside every locked asset."""
+
+    @pytest.fixture
+    def network(self, tmp_path):
+        geo = hou.node("/obj").createNode("geo", "sweep1")
+        cache = geo.createNode("file", "cache")
+        subnet = geo.createNode("subnet", "packer")
+        subnet.createNode("file", "reader")
+        library = str(tmp_path / "packer.hda").replace("\\", "/")
+        asset = subnet.createDigitalAsset(
+            name="fxh::packer_live::1.0", hda_file_name=library, description="Packer"
+        )
+        # createDigitalAsset leaves the new instance unlocked (22.0.429).
+        asset.matchCurrentDefinition()
+        yield geo, cache, asset
+        definition = asset.type().definition()
+        asset.destroy()
+        definition.destroy()
+
+    def test_the_asset_is_read_and_its_insides_are_counted(self, call, network):
+        geo, cache, asset = network
+        assert asset.isLockedHDA()
+        inside = asset.path() + "/"
+        result = call(
+            "parameters.get_parameters", inside=geo.path(), patterns=["file"], recursive=True
+        )
+        read = {row["node"] for row in result["rows"]}
+        assert cache.path() in read
+        assert not any(path.startswith(inside) for path in read), read
+        assert result["skipped_inside_locked_assets"] >= 1
+        assert "include_locked_assets" in result["note"]
+
+        everything = call(
+            "parameters.get_parameters",
+            inside=geo.path(),
+            patterns=["file"],
+            recursive=True,
+            include_locked_assets=True,
+        )
+        assert inside + "reader" in {row["node"] for row in everything["rows"]}
+        assert "skipped_inside_locked_assets" not in everything
+
+    def test_a_sweep_that_starts_inside_the_asset_reads_it(self, call, network):
+        _, _, asset = network
+        result = call(
+            "parameters.get_parameters", inside=asset.path(), patterns=["file"], recursive=True
+        )
+        assert asset.path() + "/reader" in {row["node"] for row in result["rows"]}
+        assert "skipped_inside_locked_assets" not in result
 
 
 class TestMultiparmInstanceDiscovery:
@@ -282,3 +402,24 @@ class TestParmTemplateTree:
 
         assert find(tree["entries"], "enable")["default_value"] is True
         assert find(tree["entries"], "items")["default_instances"] == 3
+
+
+class TestSimulationCache:
+    def test_a_write_inside_a_dop_network_names_the_network_to_reset(self, call, box):
+        dopnet = hou.node("/obj").createNode("dopnet")
+        created = call("nodes.create_node", parent_path=dopnet.path(), node_type="popsource")
+        assert created["simulation_cache"]["networks"] == [dopnet.path()]
+
+        data = call(
+            "parameters.set_parameter",
+            node_path=created["node_path"],
+            parm_name="impulserate",
+            value=400,
+        )
+        named = data["simulation_cache"]["networks"]
+        assert named == [dopnet.path()]
+        reset = call("dops.reset_simulation", node_path=named[0])
+        assert reset["reset_node"] == dopnet.path()
+
+        data = call("parameters.set_parameter", node_path=box, parm_name="scale", value=2.0)
+        assert "simulation_cache" not in data

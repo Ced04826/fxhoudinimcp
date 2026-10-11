@@ -24,6 +24,7 @@ from __future__ import annotations
 # Built-in
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 # Third-party
@@ -49,6 +50,7 @@ class _Parm:
         self._template = template
         self._reference = reference
         self.set_expressions: list = []
+        self.evaluated_on_clear: list = []
 
     def name(self):
         return self._name
@@ -69,12 +71,14 @@ class _Parm:
         return self._expression
 
     def deleteAllKeyframes(self):  # noqa: N802 - HOM spelling
+        # HOM keeps the parm at its current value, so it evaluates what it drops.
+        self.evaluated_on_clear.append(self._expression)
         self._expression = None
 
     def set(self, value):
         self._value = value
 
-    def setExpression(self, expression, language=None):  # noqa: N802 - HOM spelling
+    def setExpression(self, expression, language=None, replace_expression=True):  # noqa: N802 - HOM spelling
         self.set_expressions.append((expression, language))
         self._expression = expression
 
@@ -161,6 +165,14 @@ class TestApplyParmNamesWhatItCouldNotDo:
         assert report == {"expressions_removed": {"dirx": "@N.x", "diry": "@N.y", "dirz": "@N.z"}}
         assert [p._expression for p in components] == [None, None, None]
         assert [p._value for p in components] == [0.0, 1.0, 0.0]
+
+    def test_override_expression_does_not_evaluate_what_it_clears(self):
+        # deleteAllKeyframes() evaluates the expression it drops; outside a
+        # cook `@N.x` leaves "Local variable 'N' not found" on the node. A
+        # constant stands in first, so that is all that gets evaluated.
+        node, components = _ray()
+        graph._apply_parm(node, "dir", [0, 1, 0], override_expression=True)
+        assert [p.evaluated_on_clear for p in components] == [["0"], ["0"], ["0"]]
 
     def test_a_plain_parm_reports_nothing(self):
         scale = _Parm("scale", value=1.0)
@@ -267,8 +279,9 @@ def validating_build(monkeypatch):
             "tx": _shape("Float"),
             "ty": _shape("Float"),
             "tz": _shape("Float"),
+            "ramp": _shape("Ramp"),
         }
-        return _knowledge({"input", "name", "tx", "ty", "tz"}, {"t"}, shapes)
+        return _knowledge({"input", "name", "tx", "ty", "tz", "ramp"}, {"t"}, shapes)
 
     monkeypatch.setattr(graph, "_parm_names_for_type", knowledge)
     return graph.build_network
@@ -365,6 +378,69 @@ class TestExpressionsInASpec:
         assert "['tx', 'ty', 'tz']" in result["errors"][0]
 
 
+###### A ramp as one value
+
+
+RED_TO_BLUE = {"keys": [0, 1], "values": [[1, 0, 0], [0, 0, 1]], "basis": "linear"}
+
+
+class TestARampInASpec:
+    """A ramp could be set only key by key through its multiparm; a dict for
+    the whole of it was refused as an expression without 'expr'."""
+
+    def test_a_whole_ramp_validates(self, validating_build, monkeypatch):
+        monkeypatch.setattr(hou, "rampBasis", SimpleNamespace(Linear="Linear"))
+        result = validating_build(
+            "/obj", [{"type": "switch", "parms": {"ramp": RED_TO_BLUE}}], dry_run=True
+        )
+        assert result["valid"] is True, result["errors"]
+
+    def test_a_dry_run_refuses_a_ramp_the_build_would(self, validating_build, monkeypatch):
+        # It answered valid for an unknown basis; the build then rolled back.
+        monkeypatch.setattr(hou, "rampBasis", SimpleNamespace(Linear="Linear"))
+        bad = {**RED_TO_BLUE, "basis": "smooth"}
+        result = validating_build(
+            "/obj", [{"type": "switch", "parms": {"ramp": bad}}], dry_run=True
+        )
+        assert result["valid"] is False
+        assert "unknown ramp basis 'smooth'" in "\n".join(result["errors"])
+
+    def test_a_ramp_on_a_parm_that_is_not_one_is_refused(self, validating_build):
+        result = validating_build(
+            "/obj", [{"type": "switch", "parms": {"tx": RED_TO_BLUE}}], dry_run=True
+        )
+        assert result["valid"] is False
+        assert "'tx' is Float, not a ramp" in "\n".join(result["errors"])
+
+    def test_a_ramp_on_a_parm_that_does_not_exist_is_named(self, validating_build):
+        result = validating_build(
+            "/obj", [{"type": "switch", "parms": {"rmap": RED_TO_BLUE}}], dry_run=True
+        )
+        assert result["valid"] is False
+        assert "parm 'rmap' does not exist" in "\n".join(result["errors"])
+
+    def test_the_build_sets_a_hou_ramp(self, monkeypatch):
+        class Ramp:
+            def __init__(self, basis, keys, values):
+                self.args = (basis, keys, values)
+
+        monkeypatch.setattr(hou, "parmTemplateType", SimpleNamespace(Ramp="Ramp"))
+        monkeypatch.setattr(hou, "rampParmType", SimpleNamespace(Color="Color"))
+        monkeypatch.setattr(hou, "rampBasis", SimpleNamespace(Linear="LIN"))
+        monkeypatch.setattr(hou, "Ramp", Ramp)
+        parm = MagicMock()
+        parm.parmTemplate.return_value = SimpleNamespace(
+            type=lambda: "Ramp", parmType=lambda: "Color"
+        )
+        graph._set_parm_value("ramp", parm, None, RED_TO_BLUE)
+        (written,) = parm.set.call_args.args
+        assert written.args == (
+            ("LIN", "LIN"),
+            (0.0, 1.0),
+            ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        )
+
+
 ###### Literals over factory expressions
 
 
@@ -459,6 +535,7 @@ class TestTheBuildSaysWhatDidNotTake:
         assert "expressions_kept" not in result and "warning" not in result
         assert set(result["created"][0]["expressions_removed"]) == {"dirx", "diry", "dirz"}
         assert [p._value for p in components] == [0.0, 1.0, 0.0]
+        assert [p.evaluated_on_clear for p in components] == [["0"], ["0"], ["0"]]
 
     def test_an_expr_value_is_set_as_an_expression_in_its_language(self, building, monkeypatch):
         node_type = MagicMock()
@@ -489,3 +566,48 @@ class TestTheBuildSaysWhatDidNotTake:
         assert switch_input.set_expressions == [("hou.frame() % 2", hou.exprLanguage.Python)]
         assert seed.set_expressions == [("$F", None)]
         assert switch_input._value == 0.0  # the wrapper was never set() as a value
+
+
+class _Component:
+    def __init__(self, name):
+        self._name = name
+        self.value = None
+
+    def name(self):
+        return self._name
+
+    def set(self, value):
+        self.value = value
+
+
+class TestAnExpressionComponent:
+    """{"expr": ...} as one component of a list passed the dry run and failed the build."""
+
+    def test_the_build_writes_one_component_as_an_expression(self, monkeypatch):
+        expressions = {}
+        monkeypatch.setattr(
+            graph,
+            "set_whole_expression",
+            lambda parm, expression, language=None: expressions.update({parm.name(): expression}),
+        )
+        parm_tuple = [_Component("tx"), _Component("ty"), _Component("tz")]
+        wrapped = graph._set_parm_value("t", None, parm_tuple, [{"expr": "$F"}, 0, 2])
+        assert expressions == {"tx": "$F"}
+        assert [c.value for c in parm_tuple] == [None, 0.0, 2.0]
+        assert wrapped == {"tx"}
+
+    def test_a_plain_list_is_one_tuple_write_as_before(self):
+        parm_tuple = MagicMock()
+        parm_tuple.__len__.return_value = 3
+        assert graph._set_parm_value("t", None, parm_tuple, [1, 2, 3]) == set()
+        parm_tuple.set.assert_called_once_with([1.0, 2.0, 3.0])
+
+    def test_the_dry_run_refuses_a_malformed_component(self, validating_build):
+        spec = {"type": "switch", "name": "sw", "parms": {"t": [{"exp": "$F"}, 0, 0]}}
+        result = validating_build("/obj", [spec], dry_run=True)
+        assert result["valid"] is False
+        assert any("parm 't' component 0" in e for e in result["errors"])
+
+    def test_the_dry_run_takes_a_wellformed_component(self, validating_build):
+        spec = {"type": "switch", "name": "sw", "parms": {"t": [{"expr": "$F"}, 0, 0]}}
+        assert validating_build("/obj", [spec], dry_run=True)["valid"] is True

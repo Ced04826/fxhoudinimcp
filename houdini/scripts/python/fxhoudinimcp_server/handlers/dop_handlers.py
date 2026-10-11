@@ -8,7 +8,9 @@ stepping, resetting, and memory usage.
 from __future__ import annotations
 
 # Built-in
+import contextlib
 import logging
+from typing import Any
 
 # Third-party
 import hou
@@ -40,6 +42,141 @@ def _get_simulation(node_path: str) -> hou.DopSimulation:
             f"Node '{node_path}' does not have a simulation. Ensure it is a DOP network node."
         )
     return sim
+
+
+def _reset_button_owner(node: hou.Node) -> hou.Node | None:
+    """The node whose Reset Simulation button resets *node*'s simulation.
+
+    That is *node* itself or its nearest parent with a "resimulate" parm (the
+    DOP network, or a SOP-level solver such as a POP Network), None if none.
+    """
+    owner = node
+    while owner is not None and owner.parm("resimulate") is None:
+        owner = owner.parent()
+    return owner
+
+
+# A write through HOM into a node inside a DOP network leaves the frames the
+# simulation already cooked as they were. Measured on 22.0.429: a POP
+# source's impulserate 100 -> 400, then 50, then 250, and frame 25 still held
+# 100 particles however long the wait and whichever frames were visited in
+# between; the same with a bare parm.set() and hou.setFrame(). Only a reset
+# of the simulation brought the new value.
+_DOP_CACHE_NOTE = (
+    "Frames this simulation cooked before this edit may still hold the old "
+    "result: an edit inside a DOP network, or upstream of a simulation, does not "
+    "reset its cache. Call reset_simulation(node_path=<network>) before reading "
+    "such a frame. Leave the memory cache (cacheenabled) on: it is what keeps "
+    "the cooked frames, and turning it off is not the fix."
+)
+
+# How many nodes downstream of an edit are looked at for a simulation that
+# reads it. The walk follows wires and references, and a scene rarely needs
+# more; a bigger one gets no note rather than a slow write.
+_DOWNSTREAM_LIMIT = 500
+
+# Deeper than any network nests; bounds the walks up the parents.
+_MAX_DEPTH = 64
+
+
+def _inside_dop(node: hou.Node) -> bool:
+    """Whether *node* is a DOP or sits anywhere inside one (a SOP Solver's SOPs)."""
+    for _ in range(_MAX_DEPTH):
+        if node is None:
+            return False
+        if node.type().category() == hou.dopNodeTypeCategory():
+            return True
+        node = node.parent()
+    return False
+
+
+def _simulation_to_reset(node: hou.Node) -> hou.Node | None:
+    """_reset_button_owner, lifted out of locked assets to the instance a user can press.
+
+    A Vellum Solver SOP keeps its DOP network inside the asset; reset_simulation
+    is given the solver, not /obj/.../vellumsolver1/dopnet1.
+    """
+    owner = _reset_button_owner(node)
+    for _ in range(_MAX_DEPTH):
+        buried = False
+        with contextlib.suppress(Exception):
+            buried = owner is not None and owner.isInsideLockedHDA() is True
+        if not buried:
+            break
+        lifted = _reset_button_owner(owner.parent())
+        if lifted is None:
+            break  # no Reset promoted above: the network itself is still pressable
+        owner = lifted
+    return owner
+
+
+def _downstream(node: hou.Node) -> list[hou.Node]:
+    """Nodes that read *node*, by wire or by reference, up to _DOWNSTREAM_LIMIT.
+
+    A node inside a DOP network is listed but not followed: what reads the
+    simulation reads the network (a DOP Import names it), not its insides.
+    Nor are a node's own contents, which depend on it and say nothing about
+    who reads it -- an HDA's insides were most of the walk before (22.0.429).
+    """
+    seen = {node.path()}
+    queue, found = [node], []
+    while queue and len(seen) < _DOWNSTREAM_LIMIT:
+        current = queue.pop(0)
+        inside = current.path() + "/"
+        neighbours: list = []
+        with contextlib.suppress(Exception):
+            neighbours = list(current.outputs()) + list(current.dependents())
+        with contextlib.suppress(Exception):
+            # The node a subnet outputs: what reads the subnet reads it.
+            # Measured on 22.0: a grid inside a subnet feeding a Vellum
+            # Solver had no note.
+            parent = current.parent()
+            if not neighbours and (
+                current.type().name() == "output" or parent.displayNode() == current
+            ):
+                neighbours.append(parent)
+        for other in neighbours:
+            path = other.path()
+            if path in seen or path.startswith(inside):
+                continue
+            seen.add(path)
+            found.append(other)
+            if not _inside_dop(other):
+                queue.append(other)
+    return found
+
+
+def dop_cache_note(nodes: Any, rewired: bool = False) -> dict[str, Any] | None:
+    """The simulations an edit of *nodes* leaves with stale cooked frames, or None.
+
+    ``networks`` are the nodes reset_simulation presses for them, so any of
+    them can be passed to it as is. Measured on 22.0.429, each of these left
+    frame 25 stale until a reset: a node inside a DOP network (a SOP Solver's
+    own SOPs too), a box a POP Source reads by path, a grid upstream of a
+    Vellum Solver SOP. A solver's own parameter re-simulates by itself, so
+    the edited node is never its own reason -- unless *rewired*: its inputs
+    changed, and those do not. Measured on 22.0: a Vellum Solver rewired
+    from cloth A to cloth B still showed A at frame 10 until a reset.
+    """
+    networks: list[str] = []
+
+    def add(owner: hou.Node | None) -> None:
+        if owner is not None and owner.path() not in networks:
+            networks.append(owner.path())
+
+    for node in nodes or ():
+        with contextlib.suppress(Exception):
+            if _inside_dop(node):
+                add(_simulation_to_reset(node))
+                continue
+            if rewired and node.parm("resimulate") is not None:
+                add(_simulation_to_reset(node))
+            for reader in _downstream(node):
+                if _inside_dop(reader) or reader.parm("resimulate") is not None:
+                    add(_simulation_to_reset(reader))
+    if not networks:
+        return None
+    return {"networks": networks, "note": _DOP_CACHE_NOTE}
 
 
 def _subdata_tree(data: hou.DopData, depth: int = 0, max_depth: int = 4) -> list[dict]:
@@ -279,42 +416,59 @@ def _get_dop_field(
     }
 
 
+def _relationship_names(obj_records: dict, record_type: str) -> list:
+    """Relationship names an object lists under one of its Rel* records."""
+    found = obj_records.get(record_type)
+    if found is None:
+        return []
+    if isinstance(found, dict):
+        found = [found]
+    return [f.get("relname") for f in found if isinstance(f, dict) and f.get("relname")]
+
+
 def _get_dop_relationships(node_path: str) -> dict:
-    """List relationships between DOP objects."""
+    """List relationships between DOP objects.
+
+    Relationships belong to the simulation, not to an object (``hou.DopObject``
+    has no ``relationships()``), so they come from ``sim.relationships()`` and
+    each object's ``RelInGroup``/``RelInAffectors`` records say who is in them.
+    """
     sim = _get_simulation(node_path)
-    objects = sim.objects()
+
+    members: dict = {}
+    for obj in sim.objects() or []:
+        try:
+            recs = _records_to_dict(obj)
+        except (hou.OperationFailed, hou.ObjectWasDeleted, AttributeError) as e:
+            logger.debug("Could not read records for object: %s", e)
+            continue
+        for key, bucket in (("RelInGroup", "group"), ("RelInAffectors", "affectors")):
+            for relname in _relationship_names(recs, key):
+                members.setdefault(relname, {"group": [], "affectors": []})[bucket].append(
+                    obj.name()
+                )
 
     relationships = []
-    if objects is not None:
-        for obj in objects:
+    for rel in sim.relationships() or []:
+        try:
+            entry = {"name": rel.name()}
             try:
-                rels = obj.relationships()
-                if rels is None:
-                    continue
-                for rel in rels:
-                    entry = {
-                        "name": rel.name(),
-                    }
-                    try:
-                        entry["type"] = rel.dataType()
-                    except (hou.OperationFailed, AttributeError) as e:
-                        logger.debug("Could not read relationship data_type: %s", e)
-                        entry["type"] = "unknown"
-                    try:
-                        entry["records"] = _records_to_dict(rel)
-                    except (hou.OperationFailed, AttributeError) as e:
-                        logger.debug("Could not read relationship records: %s", e)
-                        entry["records"] = {}
-                    # Try to find objects involved
-                    try:
-                        entry["object_names"] = [o.name() for o in rel.objects()]
-                    except (hou.OperationFailed, AttributeError) as e:
-                        logger.debug("Could not read relationship objects: %s", e)
-                        entry["source_object"] = obj.name()
-                    relationships.append(entry)
-            except (hou.OperationFailed, hou.ObjectWasDeleted, AttributeError) as e:
-                logger.debug("Could not read relationships for object: %s", e)
-                continue
+                entry["type"] = rel.dataType()
+            except (hou.OperationFailed, AttributeError) as e:
+                logger.debug("Could not read relationship data_type: %s", e)
+                entry["type"] = "unknown"
+            try:
+                entry["records"] = _records_to_dict(rel)
+            except (hou.OperationFailed, AttributeError) as e:
+                logger.debug("Could not read relationship records: %s", e)
+                entry["records"] = {}
+            found = members.get(entry["name"], {"group": [], "affectors": []})
+            entry["objects_in_group"] = found["group"]
+            entry["objects_in_affectors"] = found["affectors"]
+            relationships.append(entry)
+        except (hou.OperationFailed, hou.ObjectWasDeleted) as e:
+            logger.debug("Could not read a relationship: %s", e)
+            continue
 
     return {
         "node_path": node_path,
@@ -353,9 +507,7 @@ def _reset_simulation(node_path: str) -> dict:
     # and this reported simulation_reset after only moving the frame. The
     # reset is the network's own Reset Simulation button ("resimulate", also
     # the name on the SOP-level solvers).
-    owner = node
-    while owner is not None and owner.parm("resimulate") is None:
-        owner = owner.parent()
+    owner = _reset_button_owner(node)
     if owner is None:
         raise ValueError(f"No Reset Simulation button on {node_path} or any of its parents.")
     owner.parm("resimulate").pressButton()
