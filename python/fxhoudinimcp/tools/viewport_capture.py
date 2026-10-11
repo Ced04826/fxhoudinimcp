@@ -41,6 +41,7 @@ async def capture_viewport(
     min_edge_px: float = 6.0,
     replay: str | None = None,
     lighting: str | None = None,
+    uv: bool | str | None = None,
 ) -> dict:
     """Capture what the Scene Viewer shows, from several views in one call,
     each framed so the target is whole and fills the image.
@@ -87,6 +88,15 @@ async def capture_viewport(
     min_edge_px a warning says the wiring cannot be read there, and
     close_up_hints gives boxes around the densest places to shoot next.
 
+    Every capture shows the wiring (smooth_wire) and back faces in their
+    tint, so a part or patch facing the wrong way stands out; uv=True adds
+    the UV boundaries and the UV checker. These are set alike on the edited
+    model, other objects and selected objects, so a target drawn through the
+    proxy looks the same as one drawn in its network, and they, the grid and
+    the gnomons (hidden) are put back and read back afterwards
+    (`display_restored`) whatever restore_view says. No script of your own
+    around the call is needed for any of it.
+
     Surfaces are lit from the camera by default (lighting="headlight"): a
     face turned to the camera is bright from any side, a face seen edge-on
     darker but never so dark that the wire lines vanish, so the wiring of an
@@ -117,10 +127,12 @@ async def capture_viewport(
         bbox: World-space box to frame, [xmin, ymin, zmin, xmax, ymax, zmax].
             With targets: frames this box only, the targets are what is
             drawn.
-        shading: Shading for the capture, e.g. "smooth_wire" to see the
-            wiring, "wire", "smooth", "flat_wire", "hidden_line". Applied to
-            the edited object, other objects and selected objects, and
-            restored afterwards. None keeps the viewer's shading.
+        shading: Default "smooth_wire" (the wiring over shaded faces). Also
+            "wire", "smooth", "flat", "flat_wire", "hidden_line", "matcap",
+            "matcap_wire", or "viewport" for the viewer's own.
+        uv: False (default): no UV display. True: UV island boundaries and
+            the UV checker texture. "boundaries" or "checker" for one of
+            them. Textures are switched on for the checker.
         max_size: Long side of each image in pixels, 256-4096.
         margin: Empty border on each side, as a fraction of the image.
         prefix: File name prefix.
@@ -196,7 +208,8 @@ async def capture_viewport(
     from an earlier call under the prefix), replay_targets ("recorded" or
     "given"), close_up_hints (boxes with point counts, when edges are too
     short), sheet (path, pixels, columns, rows), overlays (legend), lighting
-    (mode, matcap, restored) and warnings. success is false when an image is missing or blank where the
+    (mode, matcap, restored), display (shading, backfaces, uv_boundaries,
+    uv_checker the images were drawn with), display_restored and warnings. success is false when an image is missing or blank where the
     target is, a target is not fully in frame or not drawn, or the viewer
     could not be restored; problems says which.
     """
@@ -230,6 +243,7 @@ async def capture_viewport(
         ("sheet_columns", sheet_columns),
         ("replay", replay),
         ("lighting", lighting),
+        ("uv", uv),
     ):
         if value is not None:
             params[key] = value

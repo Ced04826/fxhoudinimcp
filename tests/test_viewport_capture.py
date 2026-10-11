@@ -192,6 +192,8 @@ class TestHandlerRefusesBeforeTouchingTheViewer:
             ({"shading": "glossy"}, "unknown shading"),
             ({"views": ["front", {"direction": "front"}]}, "unique"),
             ({"bbox": [0, 0, 0, 1, 1]}, "bbox"),
+            ({"uv": "seams"}, "uv must be"),
+            ({"uv": 1}, "uv must be"),
         ],
     )
     def test_bad_arguments(self, kwargs, message, monkeypatch):
@@ -202,7 +204,139 @@ class TestHandlerRefusesBeforeTouchingTheViewer:
         touched.assert_not_called()
 
 
+class _Enum:
+    """A stand-in hou enum value: compares by name, as the real ones do."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def name(self):
+        return self._name
+
+    def __eq__(self, other):
+        return isinstance(other, _Enum) and other._name == self._name
+
+    def __hash__(self):
+        return hash(self._name)
+
+
+class TestDisplayOptions:
+    """What every capture draws, whichever way the target is drawn.
+
+    The proxy object is drawn with the scene object's display set and a
+    target in its own network with the edited model's: the options are
+    written on all three sets alike, and textures go on with the checker,
+    because with them off the checker draws nothing and the model is white
+    (measured on 22.0.368).
+    """
+
+    @pytest.fixture(autouse=True)
+    def enums(self, monkeypatch):
+        monkeypatch.setattr(vc.hou, "glShadingType", MagicMock(SmoothWire=_Enum("SmoothWire")))
+        monkeypatch.setattr(vc.hou, "boundaryDisplay", MagicMock(On=_Enum("On"), Off=_Enum("Off")))
+        monkeypatch.setattr(vc.hou, "viewportGridRuler", MagicMock(Hide=_Enum("Hide")))
+
+    def _found(self):
+        sets = {
+            name: {
+                "shading": _Enum("Smooth"),
+                "backfaces": False,
+                "uv_boundaries": _Enum("ViewUV"),
+                "uv_checker": name == "DisplayModel",
+            }
+            for name in vc._SHADED_SETS
+        }
+        return {
+            "sets": sets,
+            "guides": {"OriginGnomon": True, "FloatingGnomon": True},
+            "textures": False,
+            "ortho_grid": True,
+            "ortho_ruler": _Enum("Show"),
+            "reference_plane": True,
+        }
+
+    @pytest.mark.parametrize(
+        "uv, expected",
+        [
+            (None, (False, False)),
+            (False, (False, False)),
+            (True, (True, True)),
+            ("boundaries", (True, False)),
+            ("Checker", (False, True)),
+        ],
+    )
+    def test_uv_choices(self, uv, expected):
+        assert vc.parse_uv(uv) == expected
+
+    def test_the_default_is_wiring_and_back_faces_on_every_set(self):
+        wanted = vc._capture_display(self._found(), "smooth_wire", vc.parse_uv(None))
+        for name in vc._SHADED_SETS:
+            assert wanted["sets"][name] == {
+                "shading": _Enum("SmoothWire"),
+                "backfaces": True,
+                "uv_boundaries": _Enum("Off"),
+                "uv_checker": False,
+            }
+        # Textures are the viewer's business unless the checker needs them.
+        assert "textures" not in wanted
+        assert wanted["guides"] == {"OriginGnomon": False, "FloatingGnomon": False}
+        assert wanted["ortho_grid"] is False and wanted["reference_plane"] is False
+
+    def test_the_checker_brings_the_textures_with_it(self):
+        wanted = vc._capture_display(self._found(), "smooth_wire", vc.parse_uv(True))
+        assert wanted["textures"] is True
+        assert all(s["uv_checker"] for s in wanted["sets"].values())
+        assert all(s["uv_boundaries"] == _Enum("On") for s in wanted["sets"].values())
+
+    def test_viewport_shading_keeps_each_sets_own(self):
+        found = self._found()
+        wanted = vc._capture_display(found, "viewport", vc.parse_uv(None))
+        assert wanted["sets"]["SceneObject"]["shading"] == _Enum("Smooth")
+
+    def test_an_option_this_houdini_lacks_is_neither_set_nor_restored(self):
+        found = self._found()
+        del found["sets"]["SelectedObject"]["uv_checker"]
+        del found["reference_plane"]
+        wanted = vc._capture_display(found, "smooth_wire", vc.parse_uv(True))
+        assert "uv_checker" not in wanted["sets"]["SelectedObject"]
+        assert "reference_plane" not in wanted
+
+    def test_differences_are_named(self):
+        found = self._found()
+        now = self._found()
+        now["textures"] = True
+        now["sets"]["DisplayModel"]["uv_checker"] = False
+        now["guides"]["OriginGnomon"] = False
+        assert vc._display_differences(found, now) == [
+            "DisplayModel uv_checker is False, was True",
+            "textures is True, was False",
+            "guide OriginGnomon is False, was True",
+        ]
+        assert vc._display_differences(found, self._found()) == []
+
+    def test_the_receipt_names_the_edited_models_options(self):
+        wanted = vc._capture_display(self._found(), "smooth_wire", vc.parse_uv("checker"))
+        assert vc._display_receipt(wanted) == {
+            "shading": "SmoothWire",
+            "backfaces": True,
+            "uv_boundaries": False,
+            "uv_checker": True,
+            "textures": True,
+        }
+
+
 class TestToolWrappers:
+    @pytest.mark.asyncio
+    async def test_capture_viewport_sends_uv_only_when_given(self, mock_ctx, mock_bridge):
+        from fxhoudinimcp.tools.viewport_capture import capture_viewport
+
+        await capture_viewport(mock_ctx, "C:/tmp/shots", uv=True)
+        _command, params = mock_bridge.execute.call_args.args
+        assert params["uv"] is True
+        await capture_viewport(mock_ctx, "C:/tmp/shots")
+        _command, params = mock_bridge.execute.call_args.args
+        assert "uv" not in params and "shading" not in params
+
     @pytest.mark.asyncio
     async def test_capture_viewport_sends_only_what_was_given(self, mock_ctx, mock_bridge):
         from fxhoudinimcp.tools.viewport_capture import capture_viewport

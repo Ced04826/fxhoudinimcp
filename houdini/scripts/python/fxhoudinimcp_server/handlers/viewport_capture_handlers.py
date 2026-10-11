@@ -41,6 +41,7 @@ from fxhoudinimcp_server.dispatcher import register_handler
 from fxhoudinimcp_server.handlers import viewport_capture_extras as extras
 from fxhoudinimcp_server.handlers.rendering_handlers import _find_flipbook_output
 from fxhoudinimcp_server.handlers.viewport_handlers import _find_scene_viewer, _no_mplay
+from fxhoudinimcp_server.ui import selection_hidden
 
 ###### Constants
 
@@ -71,6 +72,27 @@ _SHADING_NAMES = {
 # and setting only SceneObject, as set_viewport_display does, left it wired
 # while the tool reported smooth.
 _SHADED_SETS = ("DisplayModel", "SceneObject", "SelectedObject")
+
+# Shading when the call names none. A review shot is for the wiring, and the
+# viewer's own shading (Smooth, as often as not) left most shots without a
+# single edge; "viewport" keeps the viewer's.
+_DEFAULT_SHADING = "smooth_wire"
+
+# uv -> (UV boundaries, UV checker). Both are display-set options the artist
+# sets on the edited model only, and a proxy object is drawn with the scene
+# object's set, so every capture writes the same values on all _SHADED_SETS:
+# what the image shows does not depend on how the target was drawn.
+_UV_CHOICES = {
+    "none": (False, False),
+    "boundaries": (True, False),
+    "checker": (False, True),
+    "all": (True, True),
+}
+
+# Scene furniture hidden for the shot: the grid and ruler of an ortho view,
+# the reference plane, the gnomons. Executors hid them with scripts of their
+# own around each capture, some across two calls.
+_HIDDEN_GUIDES = ("OriginGnomon", "FloatingGnomon")
 
 # An image wider than 8:1 is a strip nobody can read; past that the target
 # gets extra margin on the short side instead.
@@ -522,14 +544,14 @@ def _close(a: Any, b: Any, tolerance: float = 1e-5) -> bool:
     return abs(float(a) - float(b)) <= tolerance * max(1.0, abs(float(a)))
 
 
-def _save_state(viewport) -> dict[str, Any]:
+def _save_state(scene_viewer, viewport) -> dict[str, Any]:
     state: dict[str, Any] = {
         "type": viewport.type(),
         "camera": _read_camera(viewport),
         "camera_node": None,
         "camera_path": None,
         "locked": False,
-        "shading": {},
+        "display": _read_display(scene_viewer, viewport),
         # The camera of every view type this call switches to, as found.
         "visited": {},
     }
@@ -539,11 +561,6 @@ def _save_state(viewport) -> dict[str, Any]:
         state["camera_path"] = viewport.cameraPath() or None
     with contextlib.suppress(Exception):
         state["locked"] = bool(viewport.isCameraLockedToView())
-    settings = viewport.settings()
-    for name in _SHADED_SETS:
-        with contextlib.suppress(Exception):
-            display_set = settings.displaySet(getattr(hou.displaySetType, name))
-            state["shading"][name] = display_set.shadedMode()
     return state
 
 
@@ -585,12 +602,6 @@ def _restore_state(viewport, state: dict[str, Any], base_camera: dict[str, Any])
                 viewport.lockCameraToView(True)
         except Exception as exc:  # noqa: BLE001 - reported
             problems.append(f"camera {state['camera_path']}: {exc}")
-    settings = viewport.settings()
-    for name, mode in state["shading"].items():
-        try:
-            settings.displaySet(getattr(hou.displaySetType, name)).setShadedMode(mode)
-        except Exception as exc:  # noqa: BLE001 - reported
-            problems.append(f"{name} shading: {exc}")
     return problems
 
 
@@ -607,39 +618,178 @@ def _restore_mismatches(viewport, state: dict[str, Any]) -> list[str]:
         now = viewport.cameraPath() or None
     if now != (state["camera_path"] or None):
         mismatches.append(f"looking through {now}, was {state['camera_path']}")
-    settings = viewport.settings()
-    for name, mode in state["shading"].items():
-        with contextlib.suppress(Exception):
-            current = settings.displaySet(getattr(hou.displaySetType, name)).shadedMode()
-            if current != mode:
-                mismatches.append(f"{name} shading is {current.name()}, was {mode.name()}")
     return mismatches
 
 
-def _apply_shading(viewport, shading: str) -> None:
-    """Set *shading* on the display sets that draw the model; read it back."""
-    token = _SHADING_NAMES[str(shading).lower()]
-    mode = getattr(hou.glShadingType, token)
-    settings = viewport.settings()
-    wrong: dict[str, str] = {}
-    for name in _SHADED_SETS:
-        display_set = settings.displaySet(getattr(hou.displaySetType, name))
-        display_set.setShadedMode(mode)
-        if display_set.shadedMode() != mode:
-            wrong[name] = display_set.shadedMode().name()
-    if wrong:
-        raise RuntimeError(f"asked for {token} shading, the viewport reports {wrong}")
+###### Display options: wiring, back faces, UV, scene furniture
 
 
-def _current_shading(viewport) -> dict[str, str]:
+def parse_uv(uv: Any) -> tuple[bool, bool]:
+    """``uv`` -> (UV boundaries, UV checker); see _UV_CHOICES."""
+    if uv is None or uv is False:
+        return _UV_CHOICES["none"]
+    if uv is True:
+        return _UV_CHOICES["all"]
+    if isinstance(uv, str) and uv.lower() in _UV_CHOICES:
+        return _UV_CHOICES[uv.lower()]
+    raise ValueError(f"uv must be true, false or one of {sorted(_UV_CHOICES)}, not {uv!r}")
+
+
+def _display_sets(viewport) -> list[tuple[str, Any]]:
     settings = viewport.settings()
-    shading: dict[str, str] = {}
-    for name in _SHADED_SETS:
+    return [(name, settings.displaySet(getattr(hou.displaySetType, name))) for name in _SHADED_SETS]
+
+
+def _read_display(scene_viewer, viewport) -> dict[str, Any]:
+    """Every display option a capture sets, as the viewer has it.
+
+    Read field by field: an option this Houdini lacks is left out, and then
+    neither set nor put back.
+    """
+    display: dict[str, Any] = {"sets": {}, "guides": {}}
+    for name, display_set in _display_sets(viewport):
+        found: dict[str, Any] = {}
+        for key, reader in (
+            ("shading", "shadedMode"),
+            ("backfaces", "isShowingPrimBackfaces"),
+            ("uv_boundaries", "uvBoundaryMode"),
+            ("uv_checker", "isUsingUVMap"),
+        ):
+            with contextlib.suppress(Exception):
+                found[key] = getattr(display_set, reader)()
+        display["sets"][name] = found
+    settings = viewport.settings()
+    for key, reader in (
+        ("textures", settings.displayTextures),
+        ("ortho_grid", settings.displayOrthoGrid),
+        ("ortho_ruler", settings.orthoRuler),
+        ("reference_plane", lambda: scene_viewer.referencePlane().isVisible()),
+    ):
         with contextlib.suppress(Exception):
-            shading[name] = (
-                settings.displaySet(getattr(hou.displaySetType, name)).shadedMode().name()
+            display[key] = reader()
+    for guide in _HIDDEN_GUIDES:
+        with contextlib.suppress(Exception):
+            display["guides"][guide] = bool(
+                settings.guideEnabled(getattr(hou.viewportGuide, guide))
             )
-    return shading
+    return display
+
+
+def _write_display(scene_viewer, viewport, display: dict[str, Any]) -> list[str]:
+    """Write *display* (as _read_display shapes it); returns what failed."""
+    problems: list[str] = []
+    sets = dict(_display_sets(viewport))
+    for name, found in display["sets"].items():
+        display_set = sets[name]
+        for key, writer in (
+            ("shading", "setShadedMode"),
+            ("backfaces", "showPrimBackfaces"),
+            ("uv_boundaries", "setUVBoundaryMode"),
+            ("uv_checker", "useUVMap"),
+        ):
+            if key in found:
+                try:
+                    getattr(display_set, writer)(found[key])
+                except Exception as exc:  # noqa: BLE001 - reported
+                    problems.append(f"{name} {key}: {exc}")
+    settings = viewport.settings()
+    for key, write in (
+        ("textures", settings.setDisplayTextures),
+        ("ortho_grid", settings.setDisplayOrthoGrid),
+        ("ortho_ruler", settings.setOrthoRuler),
+        ("reference_plane", lambda on: scene_viewer.referencePlane().setIsVisible(on)),
+    ):
+        if key in display:
+            try:
+                write(display[key])
+            except Exception as exc:  # noqa: BLE001 - reported
+                problems.append(f"{key}: {exc}")
+    for guide, on in display["guides"].items():
+        try:
+            settings.enableGuide(getattr(hou.viewportGuide, guide), on)
+        except Exception as exc:  # noqa: BLE001 - reported
+            problems.append(f"guide {guide}: {exc}")
+    return problems
+
+
+def _display_differences(wanted: dict[str, Any], now: dict[str, Any]) -> list[str]:
+    """Every option of *wanted* that *now* holds otherwise, by name."""
+
+    def shown(value: Any) -> Any:
+        return value.name() if hasattr(value, "name") and callable(value.name) else value
+
+    out: list[str] = []
+    for name, found in wanted["sets"].items():
+        for key, value in found.items():
+            current = now["sets"].get(name, {}).get(key)
+            if current != value:
+                out.append(f"{name} {key} is {shown(current)}, was {shown(value)}")
+    for key in ("textures", "ortho_grid", "ortho_ruler", "reference_plane"):
+        if key in wanted and now.get(key) != wanted[key]:
+            out.append(f"{key} is {shown(now.get(key))}, was {shown(wanted[key])}")
+    for guide, on in wanted["guides"].items():
+        if now["guides"].get(guide) != on:
+            out.append(f"guide {guide} is {now['guides'].get(guide)}, was {on}")
+    return out
+
+
+def _capture_display(found: dict[str, Any], shading: str, uv: tuple[bool, bool]) -> dict:
+    """The display options of a capture, from the viewer's (*found*).
+
+    Every set draws the shading asked for (the viewer's own with
+    "viewport"), back faces in their tint -- a face turned the wrong way is
+    then a coloured patch -- and the UV boundaries and checker as *uv* says.
+    Textures are switched on with the checker: with them off the checker
+    draws nothing and the model comes out white, however the set is set.
+    Ortho grid and ruler, the reference plane and the gnomons are hidden.
+    """
+    boundaries, checker = uv
+    mode = None
+    if shading != "viewport":
+        mode = getattr(hou.glShadingType, _SHADING_NAMES[shading])
+    wanted: dict[str, Any] = {"sets": {}, "guides": {}}
+    for name, options in found["sets"].items():
+        values = {
+            "shading": mode if mode is not None else options.get("shading"),
+            "backfaces": True,
+            "uv_boundaries": hou.boundaryDisplay.On if boundaries else hou.boundaryDisplay.Off,
+            "uv_checker": checker,
+        }
+        wanted["sets"][name] = {k: v for k, v in values.items() if k in options}
+    if checker and "textures" in found:
+        wanted["textures"] = True
+    for key, value in (
+        ("ortho_grid", False),
+        ("ortho_ruler", getattr(hou.viewportGridRuler, "Hide", None)),
+        ("reference_plane", False),
+    ):
+        if key in found and value is not None:
+            wanted[key] = value
+    wanted["guides"] = dict.fromkeys(found["guides"], False)
+    return wanted
+
+
+def _apply_display(scene_viewer, viewport, wanted: dict[str, Any]) -> None:
+    """Write the capture's display options and read them back; raise if any did not take."""
+    problems = _write_display(scene_viewer, viewport, wanted)
+    problems += _display_differences(wanted, _read_display(scene_viewer, viewport))
+    if problems:
+        raise RuntimeError(f"the viewport did not take the capture's display options: {problems}")
+
+
+def _display_receipt(display: dict[str, Any]) -> dict[str, Any]:
+    """What the images were drawn with, for the receipt (the edited model's set)."""
+    model = display["sets"].get("DisplayModel", {})
+
+    def shown(value: Any) -> Any:
+        return value.name() if hasattr(value, "name") and callable(value.name) else value
+
+    receipt = {key: shown(value) for key, value in model.items()}
+    if "uv_boundaries" in receipt:
+        receipt["uv_boundaries"] = receipt["uv_boundaries"] == "On"
+    if "textures" in display:
+        receipt["textures"] = display["textures"]
+    return receipt
 
 
 def _adopt_camera_view(viewport, camera_node) -> dict[str, Any] | None:
@@ -716,7 +866,9 @@ def _flipbook(
         # other displayed objects at /obj and their ghosts inside a SOP
         # network, and full paths match objects nested in subnets.
         settings.visibleObjects(" ".join(visible))
-    scene_viewer.flipbook(viewport, settings)
+    # A selected object or proxy drew its selection outline into the image.
+    with selection_hidden():
+        scene_viewer.flipbook(viewport, settings)
     return _find_flipbook_output(path, frame)
 
 
@@ -1336,6 +1488,7 @@ def capture_viewport(
     min_edge_px: float = 6.0,
     replay: str | None = None,
     lighting: str | None = None,
+    uv: Any = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Flipbook the Scene Viewer from one or more views, framed on a target.
@@ -1364,6 +1517,14 @@ def capture_viewport(
     The zebra overlay is a MaterialX material on the proxy, evaluated per
     pixel on the mesh's own normals; material display is on for it.
     Default material, matcap and material display are put back and read back.
+
+    Every capture draws the same display options however the target is drawn
+    (see _capture_display): shading (default smooth_wire, "viewport" keeps
+    the viewer's), back faces tinted, UV boundaries and checker as *uv* says
+    (True, "boundaries", "checker"; default neither), no grid or gnomon. They
+    are set on the edited model's, the scene objects' and the selected
+    objects' display sets alike -- a proxy is drawn with the scene object's
+    -- and put back and read back whatever restore_view says.
     """
     started = time.perf_counter()
     if not isinstance(max_size, int) or isinstance(max_size, bool) or not 256 <= max_size <= 4096:
@@ -1402,12 +1563,18 @@ def capture_viewport(
         shading = record.get("shading") if shading is None else shading
         isolate = record.get("isolate", isolate)
         lighting = record.get("lighting") if lighting is None else lighting
+        uv = record.get("uv") if uv is None else uv
     lighting = "headlight" if lighting is None else str(lighting).lower()
     if lighting not in _LIGHTING:
         raise ValueError(f"lighting must be one of {list(_LIGHTING)}, not {lighting!r}")
     overlays = extras.parse_overlays(overlays)
-    if shading is not None and str(shading).lower() not in _SHADING_NAMES:
-        raise ValueError(f"unknown shading {shading!r}; use one of {sorted(_SHADING_NAMES)}")
+    shading = _DEFAULT_SHADING if shading is None else str(shading).lower()
+    if shading != "viewport" and shading not in _SHADING_NAMES:
+        raise ValueError(
+            f"unknown shading {shading!r}; use one of {sorted(_SHADING_NAMES)} or 'viewport'"
+        )
+    uv_choice = parse_uv(uv)
+    uv = next(name for name, pair in _UV_CHOICES.items() if pair == uv_choice)
     region = extras.parse_region(region)
     if compare is not None:
         source = hou.node(str(compare))
@@ -1470,7 +1637,7 @@ def capture_viewport(
     scene_viewer = _find_scene_viewer(pane_name)
     viewport = scene_viewer.curViewport()
     size = viewport.size()
-    state = _save_state(viewport)
+    state = _save_state(scene_viewer, viewport)
     base = state["camera"]
     viewer_network = scene_viewer.pwd().path()
     moved_flags: dict[str, str | None] = {}
@@ -1496,6 +1663,29 @@ def capture_viewport(
     # a headlight or zebra capture whatever restore_view says.
     look = _read_look(viewport)
     look_changed = False
+    display_wanted = _capture_display(state["display"], shading, uv_choice)
+    display_changed = False
+    model = state["display"]["sets"].get("DisplayModel", {})
+    if state["display"].get("textures") is False and model.get("uv_checker"):
+        # How a viewer ends up white with the checker on: textures were
+        # switched off (by a capture script, measured on 22.0.368) and never
+        # back on. The checker toggle alone cannot bring it back.
+        result["warnings"].append(
+            f"Viewport {viewport.name()} has textures off (settings().displayTextures() is "
+            f"False) while the edited model's UV checker is on, so the model draws white "
+            f"and the checker cannot show there, whatever the checker toggle says. "
+            f"settings().setDisplayTextures(True) on that viewport brings it back; the hip "
+            f"keeps it once saved. This capture turns textures on only for uv=True or "
+            f"'checker', and leaves the viewer as it found it."
+        )
+    if os.path.normcase(str(look.get("matcap") or "")).startswith(os.path.normcase(_MATCAP_DIR)):
+        # The look is put back as found, so a headlight left behind by an
+        # earlier run would be put back too.
+        result["warnings"].append(
+            f"The viewer's default material is already this tool's headlight matcap "
+            f"({look['matcap']}), left by an earlier run; it is put back as found. "
+            f"Display Options > Material > Default material sets it back."
+        )
     use_zebra = "zebra" in overlays
     result["lighting"] = {"mode": lighting}
     if use_zebra:
@@ -1529,9 +1719,9 @@ def capture_viewport(
                     f"{detached} is not a camera object whose view could be copied; "
                     f"'current' views use the viewport's own camera"
                 )
-        if shading is not None:
-            _apply_shading(viewport, shading)
-        result["shading"] = _current_shading(viewport)
+        display_changed = True
+        _apply_display(scene_viewer, viewport, display_wanted)
+        result["display"] = _display_receipt(display_wanted)
         for spec, name, (corners, described, framed_by, rfacts, shape), stored in zip(
             specs, names, per_view, fixed, strict=True
         ):
@@ -1665,6 +1855,18 @@ def capture_viewport(
         )
         if restore_view:
             restore_problems = _restore_state(viewport, state, base) + restore_problems
+        if display_changed:
+            # Whatever restore_view says: these are the viewer's options, not
+            # its view, and a checker or textures left off read as a broken
+            # viewport to the artist.
+            display_problems = _write_display(scene_viewer, viewport, state["display"])
+            display_problems += _display_differences(
+                state["display"], _read_display(scene_viewer, viewport)
+            )
+            result["display_restored"] = not display_problems
+            if display_problems:
+                result["display_restore_mismatches"] = display_problems
+            restore_problems += display_problems
         if look_changed:
             look_problems = _restore_look(viewport, look) + _look_mismatches(viewport, look)
             result["lighting"]["restored"] = not look_problems
@@ -1681,6 +1883,7 @@ def capture_viewport(
             "shading": shading,
             "lighting": lighting,
             "isolate": isolate,
+            "uv": uv,
         }
         shots_out, earlier = _merge_shot_list(shots_path, shot_list, settings)
         extras.write_shot_list(
@@ -1877,7 +2080,7 @@ def _make_sheet(
 
 # Settings a replay applies to every shot of a list. Shots from two calls can
 # share one list only when these match.
-_SHOT_SETTINGS = ("compare", "overlays", "zebra", "shading", "lighting", "isolate")
+_SHOT_SETTINGS = ("compare", "overlays", "zebra", "shading", "lighting", "isolate", "uv")
 
 
 def _merge_shot_list(path: str, shots: list, settings: dict[str, Any]) -> tuple[list, dict]:
