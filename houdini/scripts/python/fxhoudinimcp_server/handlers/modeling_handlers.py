@@ -2916,7 +2916,8 @@ def _get_uv_report(
     for tri in triangles:
         label = labels[tri.face_index]
         island_area[label] = island_area.get(label, 0.0) + gm.signed_triangle_area_2d(*tri.uv)
-    mirrored_islands = sum(1 for area in island_area.values() if area < 0.0)
+    # Positive = counter-clockwise in UV against Houdini's clockwise winding: mirrored.
+    mirrored_islands = sum(1 for area in island_area.values() if area > 0.0)
 
     # Faces excluded here are faces nothing below has looked at, so the
     # overlap block carries the fact too: a consumer reading only

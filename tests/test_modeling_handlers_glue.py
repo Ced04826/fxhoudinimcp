@@ -791,15 +791,17 @@ TWO_QUADS_POINTS = [
 TWO_QUADS_FACES = [[0, 1, 2, 3], [1, 4, 5, 2]]
 
 # Corner UVs in vertex order: face 0 is vertices 0-3, face 1 is vertices 4-7.
+# Clockwise in UV like the clockwise winding Houdini uses: not mirrored
+# (UV Flatten on a grid gives every face negative signed UV area).
 SIDE_BY_SIDE_UV = [
-    (0.0, 0.0),
-    (0.5, 0.0),
-    (0.5, 1.0),
     (0.0, 1.0),
-    (0.5, 0.0),
-    (1.0, 0.0),
-    (1.0, 1.0),
     (0.5, 1.0),
+    (0.5, 0.0),
+    (0.0, 0.0),
+    (0.5, 1.0),
+    (1.0, 1.0),
+    (1.0, 0.0),
+    (0.5, 0.0),
 ]
 
 
@@ -817,14 +819,14 @@ REVERSED_FACE_1 = [0, 1, 2, 3, 4, 7, 6, 5]
 # corners sit in the order they were copied, which is REVERSED_FACE_1.
 MIRROR_FACES = [[0, 1, 2, 3], [4, 5, 2, 1]]
 MIRROR_UV = [
-    (0.0, 0.0),
-    (1.0, 0.0),
-    (1.0, 1.0),
-    (0.0, 1.0),
-    (0.0, 0.0),
     (0.0, 1.0),
     (1.0, 1.0),
     (1.0, 0.0),
+    (0.0, 0.0),
+    (0.0, 1.0),
+    (0.0, 0.0),
+    (1.0, 0.0),
+    (1.0, 1.0),
 ]
 
 #   A strip of three unit quads, mapped side by side into thirds of the tile.
@@ -844,7 +846,7 @@ STRIP_POINTS = [
 ]
 STRIP_FACES = [[0, 1, 2, 3], [1, 4, 5, 2], [4, 6, 7, 5]]
 STRIP_UV = [
-    (column / 3.0 + du / 3.0, dv)
+    (column / 3.0 + du / 3.0, 1.0 - dv)
     for column in range(3)
     for du, dv in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
 ]
@@ -886,14 +888,14 @@ class TestUVReportGlue:
         per corner -- which is what a vertex attribute means -- it is two.
         """
         seamed = list(SIDE_BY_SIDE_UV)
-        seamed[4:8] = [(0.7, 0.0), (1.2, 0.0), (1.2, 1.0), (0.7, 1.0)]
+        seamed[4:8] = [(0.7, 1.0), (1.2, 1.0), (1.2, 0.0), (0.7, 0.0)]
         path = houdini("/obj/geo1/uv", two_quads(vertex_uv=seamed))
         report = mh._get_uv_report(node_path=path)
         assert report["counts"]["islands"] == 2
         assert report["overlaps"]["pairs"] == 0
 
     def test_a_point_attribute_is_used_and_named(self, houdini):
-        point_uv = [(p[0] / 2.0, p[2]) for p in TWO_QUADS_POINTS]
+        point_uv = [(p[0] / 2.0, 1.0 - p[2]) for p in TWO_QUADS_POINTS]
         path = houdini("/obj/geo1/uv", two_quads(point_uv=point_uv))
         report = mh._get_uv_report(node_path=path)
         assert report["uv"]["owner"] == "point"
@@ -918,8 +920,8 @@ class TestUVReportGlue:
     def test_allow_stacking_still_reports_a_partial_overlap(self, houdini):
         """The requirement that matters: forgiving stacks must not forgive a fold."""
         folded = list(SIDE_BY_SIDE_UV)
-        folded[4] = (0.2, 0.0)  # face 1 slid back over face 0
-        folded[7] = (0.2, 1.0)
+        folded[4] = (0.2, 1.0)  # face 1 slid back over face 0
+        folded[7] = (0.2, 0.0)
         path = houdini("/obj/geo1/uv", two_quads(vertex_uv=folded))
         report = mh._get_uv_report(node_path=path, allow_stacking=True)
         assert report["overlaps"]["pairs"] > 0
@@ -928,7 +930,7 @@ class TestUVReportGlue:
 
     def test_a_mirrored_face_is_reported_without_being_called_a_fault(self, houdini):
         mirrored = list(SIDE_BY_SIDE_UV)
-        mirrored[4:8] = [(1.0, 0.0), (0.5, 0.0), (0.5, 1.0), (1.0, 1.0)]
+        mirrored[4:8] = [(1.0, 1.0), (0.5, 1.0), (0.5, 0.0), (1.0, 0.0)]
         path = houdini("/obj/geo1/uv", two_quads(vertex_uv=mirrored))
         report = mh._get_uv_report(node_path=path)
         assert report["winding"]["mirrored_triangles"] == 2
@@ -1156,7 +1158,7 @@ class TestUVReportGlue:
         assert report["anisotropy"]["max"] == approx(3.0, 1e-6)
 
     def test_a_point_uv_is_unaffected_by_vertex_order(self, houdini):
-        point_uv = [(p[0] / 2.0, p[2]) for p in TWO_QUADS_POINTS]
+        point_uv = [(p[0] / 2.0, 1.0 - p[2]) for p in TWO_QUADS_POINTS]
         geometry = two_quads(point_uv=point_uv, memory_order=REVERSED_FACE_1)
         report = mh._get_uv_report(node_path=houdini("/obj/geo1/uv", geometry))
         assert report["uv"]["owner"] == "point"
@@ -1231,7 +1233,7 @@ class TestUVReportGlue:
         assert moved_print["uv"] == fingerprint["uv"]
 
     def test_a_point_uv_is_fingerprinted_too(self, houdini):
-        point_uv = [(p[0] / 2.0, p[2]) for p in TWO_QUADS_POINTS]
+        point_uv = [(p[0] / 2.0, 1.0 - p[2]) for p in TWO_QUADS_POINTS]
         report = mh._get_uv_report(node_path=houdini("/obj/geo1/uv", two_quads(point_uv=point_uv)))
         assert len(report["fingerprint"]["uv"]) == 8
 

@@ -55,13 +55,63 @@ def _rpc_payload(func_name: str, **kwargs: Any) -> str:
     return json.dumps([func_name, [], kwargs], separators=(",", ":"))
 
 
+def _windows_path(value: str) -> str:
+    """``/c/Users/x`` (Git Bash, MSYS) as ``C:\\Users\\x``; anything else unchanged."""
+    if len(value) >= 3 and value[0] == "/" and value[1].isalpha() and value[2] == "/":
+        return value[1].upper() + ":\\" + value[3:].replace("/", "\\")
+    if len(value) == 2 and value[0] == "/" and value[1].isalpha():
+        return value[1].upper() + ":\\"
+    return value
+
+
+def _tunnel_root() -> Path:
+    """The system temp directory Houdini also reads tunnel files from.
+
+    ``tempfile.gettempdir()`` quietly falls back to the current directory when
+    no candidate is writable. Houdini accepts files only under its own temp
+    directory, so that fallback surfaced as ``Paths don't have the same
+    drive`` with no hint of the cause (10-21: a low-integrity client process
+    under a sandbox label could not write %TEMP%; a Git Bash ``TMPDIR=/c/...``
+    is not a Windows path either). On Windows the candidates are TMPDIR, TEMP,
+    TMP and LOCALAPPDATA\\Temp with MSYS paths converted; the first writable
+    one wins, and none writable is an error that names the cause.
+    """
+    if os.name != "nt":
+        return Path(tempfile.gettempdir())
+    tried: list[str] = []
+    candidates = [os.environ.get(name, "") for name in ("TMPDIR", "TEMP", "TMP")]
+    if os.environ.get("LOCALAPPDATA"):
+        candidates.append(os.path.join(os.environ["LOCALAPPDATA"], "Temp"))
+    for raw in candidates:
+        if not raw:
+            continue
+        root = Path(_windows_path(raw))
+        if str(root) in tried:
+            continue
+        tried.append(str(root))
+        try:
+            fd, probe = tempfile.mkstemp(prefix="probe-", dir=root)
+        except OSError:
+            continue
+        os.close(fd)
+        Path(probe).unlink(missing_ok=True)
+        return root
+    raise ConnectionError(
+        "No writable temp directory for the fxhoudinimcp file tunnel (used for payloads over "
+        f"{INLINE_RPC_LIMIT} bytes or containing + % & ?). Tried: {', '.join(tried) or 'none set'}. "
+        "Houdini reads tunnel files only from its own temp directory, so this process must be "
+        "able to write there: check that it is not running at low integrity (a sandbox label on "
+        "the folder holding python.exe) and that TEMP/TMP/TMPDIR are Windows paths."
+    )
+
+
 def _rpc_query(payload: str) -> tuple[dict[str, str], Path | None]:
     """Return query parameters and an optional single-use payload file."""
     inline_safe = not any(ch in payload for ch in _INLINE_UNSAFE)
     if inline_safe and len(urlencode({"json": payload})) <= INLINE_RPC_LIMIT:
         return {"json": payload}, None
 
-    directory = Path(tempfile.gettempdir()) / TUNNEL_DIRECTORY
+    directory = _tunnel_root() / TUNNEL_DIRECTORY
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, filename = tempfile.mkstemp(prefix="rpc-", suffix=".json", dir=directory)
     path = Path(filename)

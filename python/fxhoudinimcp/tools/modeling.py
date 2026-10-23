@@ -237,7 +237,10 @@ async def get_uv_report(
     zero area and never appear. allow_stacking forgives only pairs whose three
     corners coincide (deliberately stacked shells) and cannot hide a partial
     overlap; stacked pairs are counted either way. Mirrored winding is
-    reported, not judged. uv_area is the sum of triangle areas, not a union.
+    reported, not judged: a triangle counts as mirrored when it runs
+    counter-clockwise in UV against Houdini's clockwise face winding, so UV
+    Flatten's own output reads 0 and a U-flipped copy reads all of its
+    triangles. uv_area is the sum of triangle areas, not a union.
     Distortion comes as two numbers: density (texel scale against this mesh's
     own mean) and anisotropy (the ratio of the mapping's singular values, which
     catches a shape squashed along one axis at unchanged area); means and p95

@@ -146,3 +146,17 @@ def test_fxapi_refuses_a_browser_before_touching_the_payload(monkeypatch):
 )
 def test_bare_host(host, bare):
     assert _bare_host(host) == bare
+
+
+@pytest.mark.skipif(os.name != "nt", reason="drive letters")
+def test_a_tunnel_file_on_another_drive_names_both_paths(tmp_path, monkeypatch):
+    """commonpath raised "Paths don't have the same drive" and nothing else (10-21)."""
+    from fxhoudinimcp_server import hwebserver_app
+
+    other = tmp_path / "rpc-x.json"
+    other.write_text("[]", encoding="utf-8")
+    drive = "Q:\\" if not str(tmp_path).upper().startswith("Q") else "R:\\"
+    monkeypatch.setattr(hwebserver_app.tempfile, "gettempdir", lambda: drive)
+    monkeypatch.setattr(hwebserver_app.Path, "resolve", lambda self, strict=False: self)
+    with pytest.raises(ValueError, match="is not Houdini's"):
+        hwebserver_app._read_tunnel_file(str(other))

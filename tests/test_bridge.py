@@ -415,3 +415,46 @@ class TestFindServers:
         from fxhoudinimcp.bridge import PORT_SEARCH_RANGE
 
         assert PORT_SEARCH_RANGE == 16
+
+
+class TestTunnelRoot:
+    """10-21: an unwritable %TEMP% made tempfile fall back to the working
+    directory, and Houdini refused the file with "Paths don't have the same
+    drive". The client now picks a writable system temp itself or says why not."""
+
+    def test_msys_paths_become_windows_paths(self):
+        from fxhoudinimcp.bridge import _windows_path
+
+        assert _windows_path("/c/Users/x/AppData/Local/Temp") == "C:\\Users\\x\\AppData\\Local\\Temp"
+        assert _windows_path("/d") == "D:\\"
+        assert _windows_path("C:\\Temp") == "C:\\Temp"
+        assert _windows_path("/tmp") == "/tmp"
+
+    @pytest.mark.skipif(__import__("os").name != "nt", reason="Windows candidate list")
+    def test_an_unwritable_candidate_is_skipped(self, tmp_path, monkeypatch):
+        from fxhoudinimcp import bridge
+
+        monkeypatch.setenv("TMPDIR", "/q/no/such/dir")
+        monkeypatch.setenv("TEMP", str(tmp_path))
+        monkeypatch.setenv("TMP", str(tmp_path))
+        assert bridge._tunnel_root() == tmp_path
+        assert list(tmp_path.iterdir()) == []  # the probe file is gone
+
+    @pytest.mark.skipif(__import__("os").name != "nt", reason="Windows candidate list")
+    def test_no_writable_candidate_is_an_error_naming_the_cause(self, monkeypatch):
+        from fxhoudinimcp import bridge
+
+        for name in ("TMPDIR", "TEMP", "TMP", "LOCALAPPDATA"):
+            monkeypatch.setenv(name, "Q:\\no\\such\\dir")
+        with pytest.raises(ConnectionError, match="low integrity"):
+            bridge._tunnel_root()
+
+    def test_large_payload_goes_to_the_chosen_root(self, tmp_path, monkeypatch):
+        from fxhoudinimcp import bridge
+
+        monkeypatch.setattr(bridge, "_tunnel_root", lambda: tmp_path)
+        params, path = _rpc_query(_rpc_payload("mcp.execute", code="x" * 5000))
+        try:
+            assert path.parent == tmp_path / "fxhoudinimcp"
+        finally:
+            path.unlink(missing_ok=True)

@@ -168,8 +168,15 @@ def _read_tunnel_file(filename: str) -> str:
     """Read and delete a payload file, refusing paths outside our temp root."""
     root = (Path(tempfile.gettempdir()) / TUNNEL_DIRECTORY).resolve()
     path = Path(filename).resolve(strict=True)
-    if os.path.commonpath((str(root), str(path))) != str(root):
-        raise ValueError("Payload file is outside the fxhoudinimcp temp directory")
+    try:
+        inside = os.path.commonpath((str(root), str(path))) == str(root)
+    except ValueError:  # different drives: commonpath says only "Paths don't have the same drive"
+        inside = False
+    if not inside:
+        raise ValueError(
+            f"Payload file {path} is outside the fxhoudinimcp temp directory {root}: "
+            "the client's temp directory is not Houdini's (unwritable TEMP, or a non-Windows TMPDIR)"
+        )
     if path.suffix != ".json" or not path.name.startswith("rpc-"):
         raise ValueError("Payload file name is not an fxhoudinimcp RPC file")
     try:

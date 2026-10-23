@@ -79,3 +79,23 @@ class TestCommandLine:
         assert client.main(["get_node_info", f"@{args_file}"]) == 0
         assert seen == {"tool": "get_node_info", "arguments": {"node_path": "/obj/geo1"}}
         assert json.loads(capsys.readouterr().out) == {"ok": True}
+
+
+
+def test_cli_prints_utf8_whatever_the_console_code_page(monkeypatch, capsys):
+    """10-22: stdout was GBK, a caller reading the pipe as UTF-8 failed on CJK."""
+    calls = []
+
+    class _Out:
+        def reconfigure(self, **kw):
+            calls.append(kw)
+
+        def write(self, text):
+            return len(text)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(client.sys, "stdout", _Out())
+    client._utf8_stdout()
+    assert calls == [{"encoding": "utf-8"}]

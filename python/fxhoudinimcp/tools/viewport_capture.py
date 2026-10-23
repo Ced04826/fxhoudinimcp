@@ -65,16 +65,21 @@ async def capture_viewport(
     in: the capture points it at the SOP targets' network (follow_targets),
     and a target that is not that network's display node (or targets in
     several networks) is drawn through a temporary proxy object at /obj --
-    an Object Merge of the targets, removed after the shot -- so no display
-    flag anywhere moves. show_target moves the flag onto the target instead.
+    an Object Merge of the targets, removed after the shot, shot from inside
+    the proxy -- so no display flag anywhere moves. show_target moves the flag onto the target instead.
     `drawn` says how (`via`: viewer or proxy) and `targets_drawn` whether
     each target is in the image. Network, flags and camera are put back
     afterwards.
 
     At /obj every displayed object is drawn, and inside a SOP network the
-    other objects are ghosted over the one being edited. isolate draws only
-    the targets' objects, through the flipbook's own object mask: nothing in
-    the scene or the viewer changes.
+    other objects are drawn or ghosted over the one being edited. isolate
+    draws only the targets' objects: the viewer is switched to Hide Other
+    Objects (vieweroption -a 0) for the call and every shot is drawn from
+    inside an object's SOP network (the proxy or the target's own), with the
+    flipbook's object mask on top; afterwards the mode is set to Show All
+    (22.0 has no getter for the mode it had) and `other_objects` in the
+    receipt says both. The viewer's tool is switched to View for the shots
+    (a transform handle was drawn into the image) and put back.
 
     Reading wiring: look at an orbit sheet (orbit=True, 16 cells) to find
     suspect places, then shoot close-ups there: region + clip, the "facing"
@@ -146,7 +151,8 @@ async def capture_viewport(
             targets; without node targets nothing is hidden. False draws
             everything the viewer shows, for context. A list of node paths
             draws those objects (a SOP path means its object), e.g. the body
-            and a wheel together.
+            and a wheel together; a list naming objects other than the
+            targets' own keeps the viewer's Show All and relies on the mask.
         region: Where to shoot, instead of bbox: {"center": [x,y,z],
             "radius": r}, {"bbox": [...]}, {"group": name} (primitive group,
             else point group) or {"prims": [numbers]}; group and prims read
@@ -155,8 +161,11 @@ async def capture_viewport(
             faces crossing the boundary are cut at it, faces inside are
             whole, so the near side of the part does not hide the far side.
             Done in the proxy object; your nodes are untouched.
-        compare: A source SOP shot with exactly the same camera; each view
-            also gets <name>_compare.png, SOURCE left and RESULT right.
+        compare: A source SOP shot with exactly the same camera, from inside
+            its own proxy so neither the result nor the target's object is
+            drawn over it; each view also gets <name>_compare.png, SOURCE left
+            and RESULT right, and the sheet puts one pair per row (columns 1
+            unless sheet_columns is given) for all views on one image.
         overlays: Any of "triangles" (blue), "ngons" (magenta), "poles"
             (interior points with other than 4 edges: 3 cyan, 5+ orange),
             "stretch" (face aspect, grey to red at 4:1), "zebra" (bands of
@@ -209,7 +218,9 @@ async def capture_viewport(
     "given"), close_up_hints (boxes with point counts, when edges are too
     short), sheet (path, pixels, columns, rows), overlays (legend), lighting
     (mode, matcap, restored), display (shading, backfaces, uv_boundaries,
-    uv_checker the images were drawn with), display_restored and warnings. success is false when an image is missing or blank where the
+    uv_checker the images were drawn with), display_restored,
+    other_objects (during, after), viewer_tool (before, restored) and
+    warnings. success is false when an image is missing or blank where the
     target is, a target is not fully in frame or not drawn, or the viewer
     could not be restored; problems says which.
     """

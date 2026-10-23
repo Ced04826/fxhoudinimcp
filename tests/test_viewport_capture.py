@@ -423,9 +423,78 @@ class TestTargetsAreDrawn:
         facts = vc._show_targets(viewer, ["/obj/geo1/net/mid"], True, False, moved, proxies)
         assert made == [["/obj/geo1/net/mid"]]
         assert proxies == ["/obj/__fxmcp_capture_proxy"]
-        assert facts["via"] == "proxy" and facts["network"] == "/obj"
+        # Drawn from inside the proxy, where Hide Other Objects takes effect
+        # (at /obj it does nothing, and other displayed objects were drawn).
+        assert facts["via"] == "proxy"
+        assert viewer.setPwd.call_args.args[0] is proxy
         assert facts["targets_drawn"] == {"/obj/geo1/net/mid": True}
         assert moved == {}, "no display flag is moved"
+
+    def test_the_viewer_leaves_a_proxy_before_it_is_destroyed(self, monkeypatch):
+        net = self._network("/obj/geo1/net")
+        inside = self._network("/obj/__fxmcp_capture_proxy")
+        proxy = MagicMock()
+        order = []
+        proxy.destroy.side_effect = lambda: order.append("destroy")
+        nodes = {"/obj/geo1/net": net, "/obj/__fxmcp_capture_proxy": proxy}
+        monkeypatch.setattr(vc.hou, "node", lambda path: nodes.get(path))
+        monkeypatch.setattr(vc.hou, "undos", MagicMock())
+        viewer = MagicMock()
+        viewer._pwd = inside
+        viewer.pwd.side_effect = lambda: viewer._pwd
+
+        def go(node):
+            order.append("leave")
+            viewer._pwd = node
+
+        viewer.setPwd.side_effect = go
+        vc._restore_targets(viewer, "/obj/geo1/net", {}, False, ["/obj/__fxmcp_capture_proxy"])
+        assert order[:2] == ["leave", "destroy"]
+
+
+class TestOtherObjects:
+    """Hide Other Objects for isolated shots (user 10-22)."""
+
+    def test_the_mode_is_set_by_vieweroption_on_this_viewer(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(vc.hou, "hscript", lambda cmd: calls.append(cmd) or ("", ""))
+        desktop = MagicMock()
+        desktop.name.return_value = "Build"
+        monkeypatch.setattr(vc.hou.ui, "curDesktop", lambda: desktop)
+        viewer = MagicMock()
+        viewer.name.return_value = "panetab1"
+        assert vc._set_other_objects(viewer, "hide") is None
+        assert vc._set_other_objects(viewer, "show") is None
+        assert calls == ["vieweroption -a 0 Build.panetab1.world", "vieweroption -a 1 Build.panetab1.world"]
+
+    def test_an_hscript_error_is_returned(self, monkeypatch):
+        monkeypatch.setattr(vc.hou, "hscript", lambda cmd: ("", "Unknown viewer"))
+        assert vc._set_other_objects(MagicMock(), "hide") == "Unknown viewer"
+
+    def test_which_isolate_values_may_hide_others(self, monkeypatch):
+        obj = MagicMock()
+        obj.path.return_value = "/obj/piece"
+        obj.type.return_value.category.return_value.name.return_value = "Object"
+        sop = MagicMock()
+        sop.type.return_value.category.return_value.name.return_value = "Sop"
+        sop.parent.return_value = obj
+        monkeypatch.setattr(vc.hou, "node", lambda path: sop if path == "/obj/piece/v1/out" else None)
+        described = ["/obj/piece/v1/out"]
+        assert vc._hides_others(True, described)
+        assert not vc._hides_others(False, described)
+        assert vc._hides_others(["/obj/piece"], described)
+        assert not vc._hides_others(["/obj/piece", "/obj/table"], described)
+
+    def test_the_view_tool_is_entered_and_put_back(self):
+        viewer = MagicMock()
+        state = {"now": "geo"}
+        viewer.currentState.side_effect = lambda: state["now"]
+        viewer.enterViewState.side_effect = lambda: state.update(now="view")
+        viewer.setCurrentState.side_effect = lambda name: state.update(now=name)
+        assert vc._enter_view_state(viewer) == "geo"
+        assert state["now"] == "view"
+        assert vc._restore_view_state(viewer, "geo") == []
+        assert state["now"] == "geo"
 
     def test_no_targets_need_no_drawing_check(self):
         facts = vc._show_targets(MagicMock(), [], True, False, {})

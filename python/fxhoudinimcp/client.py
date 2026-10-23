@@ -23,6 +23,11 @@ From a shell, one call, the result printed as JSON:
     python -m fxhoudinimcp.client capture_viewport '{"output_dir": "C:/tmp/shots"}'
     python -m fxhoudinimcp.client execute_python @args.json
 
+The printed JSON is UTF-8. Code with CJK text reaches Houdini intact through
+both the inline and the file path (checked 10-23); give it as @file.json (or
+from Python) rather than a JSON argument on a PowerShell or bash command line,
+where the shell's own quoting and code page mangle quotes and CJK first.
+
 The connection follows the server's own rules: HOUDINI_HOST, HOUDINI_PORT
 (pinned) or a scan for the first serving Houdini from 8100, and the same
 timeouts.
@@ -180,8 +185,21 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("arguments must be a JSON object")
     with connect() as houdini:
         result = houdini.call(argv[0], **arguments)
+    _utf8_stdout()
     print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
     return 0
+
+
+def _utf8_stdout() -> None:
+    """Print UTF-8 whatever the console code page: on a Chinese Windows stdout
+    defaulted to GBK, and a caller reading the pipe as UTF-8 (subprocess with
+    encoding="utf-8") failed on the first CJK character of a result (10-22)."""
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        try:
+            reconfigure(encoding="utf-8")
+        except (ValueError, OSError):
+            pass
 
 
 if __name__ == "__main__":

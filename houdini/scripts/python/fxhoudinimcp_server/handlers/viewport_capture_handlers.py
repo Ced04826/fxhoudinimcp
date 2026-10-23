@@ -882,6 +882,75 @@ def _owning_object(node):
     return None
 
 
+# vieweroption -a: how the viewer draws the objects it is not inside (0 hide,
+# 1 show all, 2 ghost). Display flags alone do not isolate a shot: /obj may
+# have any number of objects with the display flag on, and they were drawn
+# over the target (user 10-22; SNACK01 v1, HARDWARE05 v2, SNACK08 v2). The
+# mode only acts while the viewer is inside an object's SOP network, which is
+# why every isolated shot is drawn from inside one (the proxy, or the target's
+# own network). 22.0 has no HOM or HScript getter for the mode, so it is put
+# back to Show All, the viewer's default, and the receipt says so.
+_OTHER_OBJECTS = {"hide": 0, "show": 1, "ghost": 2}
+_OTHER_OBJECTS_AFTER = "show"
+
+
+def _viewer_hscript_name(scene_viewer) -> str:
+    return f"{hou.ui.curDesktop().name()}.{scene_viewer.name()}.world"
+
+
+def _set_other_objects(scene_viewer, mode: str) -> str | None:
+    """Set the viewer's other-objects mode; an error text, or None when it took."""
+    try:
+        _, error = hou.hscript(
+            f"vieweroption -a {_OTHER_OBJECTS[mode]} {_viewer_hscript_name(scene_viewer)}"
+        )
+    except Exception as exc:  # noqa: BLE001 - reported
+        return f"{type(exc).__name__}: {exc}"
+    return (error or "").strip() or None
+
+
+def _hides_others(isolate: bool | list[str], described: list[str]) -> bool:
+    """Whether a shot can use Hide Other Objects without hiding what it should show.
+
+    isolate=True always; a list only when it names nothing but the targets'
+    own objects (an extra object listed would be hidden by the mode)."""
+    if isolate is True:
+        return True
+    if isolate is False:
+        return False
+    owners = set()
+    for path in described:
+        owner = _owning_object(hou.node(path)) if hou.node(path) is not None else None
+        if owner is not None:
+            owners.add(owner.path())
+    return bool(owners) and set(isolate) <= owners
+
+
+def _enter_view_state(scene_viewer) -> str | None:
+    """Switch the viewer to its view tool for the shots; the tool it had, or None.
+
+    With a transform tool active at /obj its handle was drawn into the image
+    (SNACK08 v2, 10-22)."""
+    try:
+        before = scene_viewer.currentState()
+    except Exception:  # noqa: BLE001 - no state to read, nothing to put back
+        return None
+    with contextlib.suppress(Exception):
+        scene_viewer.enterViewState()
+    return before
+
+
+def _restore_view_state(scene_viewer, before: str | None) -> list[str]:
+    if before is None:
+        return []
+    now = None
+    with contextlib.suppress(Exception):
+        if scene_viewer.currentState() != before:
+            scene_viewer.setCurrentState(before)
+        now = scene_viewer.currentState()
+    return [] if now == before else [f"the viewer's tool is {now}, was {before}"]
+
+
 def _parse_isolate(isolate: Any) -> bool | list[str]:
     """True/False, or the object paths to show; node paths map to their object."""
     if isinstance(isolate, bool):
@@ -1297,7 +1366,7 @@ def _show_targets(
     that is its network's display node is drawn there as the artist sees it.
     Any other SOP target -- upstream of the display flag, or in a network
     other than the one the viewer can follow -- is drawn through a temporary
-    proxy object (see _make_proxy), with the viewer at /obj for the shot,
+    proxy object (see _make_proxy), with the viewer inside the proxy for the shot,
     unless show_target moves the display flag onto it instead. force_proxy
     (a clip, overlays or a comparison, which live in the proxy's chain)
     always takes the proxy. Without a proxy list (proxies=None) such a target
@@ -1333,7 +1402,9 @@ def _show_targets(
         # and at /obj the natively drawn ones would disappear too.
         proxy, proxy_facts = _make_proxy(sops, chain)
         proxies.append(proxy.path())
-        scene_viewer.setPwd(hou.node("/obj"))
+        # From inside the proxy, so Hide Other Objects can take every other
+        # object out of the shot (at /obj the mode does nothing).
+        scene_viewer.setPwd(proxy)
         network = scene_viewer.pwd()
         whole = proxy_facts["proxy_points"] == proxy_facts["target_points"]
         for node in sops:
@@ -1360,6 +1431,11 @@ def _restore_targets(
     capture_viewport): on 22.0.368 setPwd rewrites the viewport camera.
     """
     problems: list[str] = []
+    with contextlib.suppress(Exception):
+        here = scene_viewer.pwd().path()
+        if any(here == path or here.startswith(path + "/") for path in proxies):
+            # Never leave the viewer inside a node about to be destroyed.
+            scene_viewer.setPwd(hou.node(viewer_network))
     for path in proxies:
         with hou.undos.disabler(), contextlib.suppress(Exception):
             node = hou.node(path)
@@ -1663,6 +1739,8 @@ def capture_viewport(
     # a headlight or zebra capture whatever restore_view says.
     look = _read_look(viewport)
     look_changed = False
+    other_objects_set = False
+    view_tool = None
     display_wanted = _capture_display(state["display"], shading, uv_choice)
     display_changed = False
     model = state["display"]["sets"].get("DisplayModel", {})
@@ -1722,6 +1800,21 @@ def capture_viewport(
         display_changed = True
         _apply_display(scene_viewer, viewport, display_wanted)
         result["display"] = _display_receipt(display_wanted)
+        view_tool = _enter_view_state(scene_viewer)
+        result["viewer_tool"] = {"before": view_tool}
+        all_described = sorted({p for _, d, _, _, _ in per_view for p in d})
+        if _hides_others(isolate, all_described):
+            mode_error = _set_other_objects(scene_viewer, "hide")
+            other_objects_set = mode_error is None
+            result["other_objects"] = {"during": "hide" if other_objects_set else None}
+            if mode_error:
+                result["warnings"].append(f"Hide Other Objects could not be set: {mode_error}")
+        else:
+            result["other_objects"] = {
+                "during": None,
+                "why": "isolate is False" if isolate is False
+                else f"isolate lists objects other than the targets' own: {isolate}",
+            }
         for spec, name, (corners, described, framed_by, rfacts, shape), stored in zip(
             specs, names, per_view, fixed, strict=True
         ):
@@ -1867,6 +1960,19 @@ def capture_viewport(
             if display_problems:
                 result["display_restore_mismatches"] = display_problems
             restore_problems += display_problems
+        if other_objects_set:
+            mode_error = _set_other_objects(scene_viewer, _OTHER_OBJECTS_AFTER)
+            result["other_objects"].update(
+                after=_OTHER_OBJECTS_AFTER if mode_error is None else None,
+                note="22.0 has no getter for the mode the viewer had; it is set back to "
+                "Show All (vieweroption -a 1)",
+            )
+            if mode_error:
+                restore_problems.append(f"the viewer's other-objects mode not put back: {mode_error}")
+        tool_problems = _restore_view_state(scene_viewer, view_tool)
+        if "viewer_tool" in result:
+            result["viewer_tool"]["restored"] = not tool_problems
+        restore_problems += tool_problems
         if look_changed:
             look_problems = _restore_look(viewport, look) + _look_mismatches(viewport, look)
             result["lighting"]["restored"] = not look_problems
@@ -1910,6 +2016,10 @@ def capture_viewport(
         result["replayed"] = replay
         result["replay_targets"] = replay_targets
 
+    if compare and sheet_columns is None:
+        # One SOURCE | RESULT pair per row: the views of a comparison read
+        # down one column instead of a grid of pairs.
+        sheet_columns = 1
     _make_sheet(
         result, output_dir, stem, sheet, sheet_columns, sheet_max, compare, overlays, min_edge_px
     )
@@ -1983,12 +2093,17 @@ def _shoot_compare(scene_viewer, viewport, shot, compare, chain, isolate, stem, 
     source_path = source_path.replace("\\", "/")
     pair: dict[str, Any] = {"source": compare}
     proxy = None
+    before = scene_viewer.pwd().path()
     try:
         proxy, facts = _make_proxy([hou.node(compare)], chain)
-        if scene_viewer.pwd().path() != "/obj":
-            scene_viewer.setPwd(hou.node("/obj"))
-            # setPwd rewrites the camera: put this shot's camera back.
-            _write_camera(viewport, shot["_camera"])
+        # Inside the source's proxy, with Hide Other Objects on, neither the
+        # result's proxy nor the object holding the target is drawn: the
+        # piece subnet's own output0 was drawn over the source (SNACK08 v2,
+        # source_drawn_fraction 0.76 with it, 0.56 without).
+        scene_viewer.setPwd(proxy)
+        pair["drawn_in"] = scene_viewer.pwd().path()
+        # setPwd rewrites the camera: put this shot's camera back.
+        _write_camera(viewport, shot["_camera"])
         visible = [proxy.path()] if isolate is not False else None
         written, pixel, _ = _flipbook_checked(
             scene_viewer, viewport, source_path, out_w, out_h, visible, rect
@@ -2014,6 +2129,9 @@ def _shoot_compare(scene_viewer, viewport, shot, compare, chain, isolate, stem, 
     except Exception as exc:  # noqa: BLE001 - reported as a problem
         pair["problem"] = f"compare failed: {type(exc).__name__}: {exc}"
     finally:
+        with contextlib.suppress(Exception):
+            if scene_viewer.pwd().path() != before and hou.node(before) is not None:
+                scene_viewer.setPwd(hou.node(before))
         if proxy is not None:
             with hou.undos.disabler(), contextlib.suppress(Exception):
                 proxy.destroy()

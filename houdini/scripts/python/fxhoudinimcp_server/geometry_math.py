@@ -1073,7 +1073,10 @@ def uv_distortion_stats(triangles: Sequence[UVTriangle], *, threshold: float | N
     for tri in triangles:
         signed = signed_triangle_area_2d(*tri.uv)
         uv_area += abs(signed)
-        if signed < 0.0:
+        # Houdini winds polygons clockwise seen from the front, so an unmirrored
+        # mapping runs clockwise in UV as well: negative signed area. UV Flatten
+        # on a grid gives every face negative area (measured on 22.0.368, 10-23).
+        if signed > 0.0:
             mirrored += 1
         surface = triangle_area_3d(*tri.world)
         world_area += surface
